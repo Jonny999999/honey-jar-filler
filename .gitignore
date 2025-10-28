@@ -1,0 +1,38 @@
+# ESP-IDF default build directory
+build
+sdkconfig.old
+dependencies.lock
+
+# VIM files
+*.swp
+*.swo
+**/.cache
+
+# VS-code
+settings.json
+
+# drawio files
+*.bkp
+
+# freecad backup files
+*.FCStd1
+*.FCStd2
+*.FCBak
+# stl files are usually temporary
+*.stl
+
+# kicad 
+# backup files
+pcb_*/*backups/
+*auto_saved_files*
+*sch.lck
+
+
+# other
+octave-workspace
+del
+screenshots
+
+
+# project specific
+cad/parts/import_raw
