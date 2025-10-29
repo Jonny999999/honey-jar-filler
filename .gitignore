@@ -25,7 +25,10 @@ settings.json
 # backup files
 pcb_*/*backups/
 *auto_saved_files*
-*sch.lck
+*kicad_sch.lck
+*kicad_pcb.lck
+*.kicad_prl
+fp-info-cache
 
 
 # other
