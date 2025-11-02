@@ -495,11 +495,21 @@
 			(embedded_fonts no)
 		)
 	)
+	(text "switch to GND"
+		(exclude_from_sim no)
+		(at 54.356 41.402 0)
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+		)
+		(uuid "aa24fbc3-1918-45df-bff6-45084afa4663")
+	)
 	(junction
-		(at 63.5 36.83)
+		(at 64.77 36.83)
 		(diameter 0)
 		(color 0 0 0 0)
-		(uuid "5434fda5-7e1d-47a8-baf4-33497e259923")
+		(uuid "95deca43-a236-4c1d-8eda-7bba5f39f984")
 	)
 	(junction
 		(at 82.55 36.83)
@@ -509,13 +519,23 @@
 	)
 	(wire
 		(pts
-			(xy 58.42 36.83) (xy 63.5 36.83)
+			(xy 58.42 36.83) (xy 64.77 36.83)
 		)
 		(stroke
 			(width 0)
 			(type default)
 		)
 		(uuid "1e45571d-ab87-488a-876f-eb57e4647e63")
+	)
+	(wire
+		(pts
+			(xy 64.77 36.83) (xy 69.85 36.83)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "35f20ae5-dc96-412a-aebd-82332c16d254")
 	)
 	(wire
 		(pts
@@ -529,23 +549,13 @@
 	)
 	(wire
 		(pts
-			(xy 63.5 33.02) (xy 63.5 36.83)
+			(xy 64.77 33.02) (xy 64.77 36.83)
 		)
 		(stroke
 			(width 0)
 			(type default)
 		)
 		(uuid "6d7785b7-b394-4f7c-914e-fd7e57d55613")
-	)
-	(wire
-		(pts
-			(xy 63.5 36.83) (xy 69.85 36.83)
-		)
-		(stroke
-			(width 0)
-			(type default)
-		)
-		(uuid "7fca7100-d452-4c30-a67b-aa6be3e29135")
 	)
 	(wire
 		(pts
@@ -559,6 +569,16 @@
 	)
 	(wire
 		(pts
+			(xy 64.77 24.13) (xy 63.5 24.13)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "ce5beb7f-9490-4f13-9a69-1f8d1a528476")
+	)
+	(wire
+		(pts
 			(xy 82.55 36.83) (xy 95.25 36.83)
 		)
 		(stroke
@@ -569,7 +589,7 @@
 	)
 	(wire
 		(pts
-			(xy 63.5 24.13) (xy 63.5 25.4)
+			(xy 64.77 24.13) (xy 64.77 25.4)
 		)
 		(stroke
 			(width 0)
@@ -811,7 +831,7 @@
 				(justify left)
 			)
 		)
-		(property "Footprint" "Resistor_THT:R_Axial_DIN0207_L6.3mm_D2.5mm_P2.54mm_Vertical"
+		(property "Footprint" "Resistor_THT:R_Axial_DIN0207_L6.3mm_D2.5mm_P10.16mm_Horizontal"
 			(at 73.66 38.608 90)
 			(effects
 				(font
@@ -961,7 +981,7 @@
 	)
 	(symbol
 		(lib_id "Device:R")
-		(at 63.5 29.21 0)
+		(at 64.77 29.21 0)
 		(unit 1)
 		(exclude_from_sim no)
 		(in_bom yes)
@@ -969,7 +989,7 @@
 		(dnp no)
 		(uuid "b0a56561-42d4-4095-9bfd-6214fade8e23")
 		(property "Reference" "R11"
-			(at 67.818 30.734 90)
+			(at 69.088 30.734 90)
 			(effects
 				(font
 					(size 1.27 1.27)
@@ -978,7 +998,7 @@
 			)
 		)
 		(property "Value" "10k"
-			(at 65.786 30.988 90)
+			(at 67.056 30.988 90)
 			(effects
 				(font
 					(size 1.27 1.27)
@@ -986,8 +1006,8 @@
 				(justify left)
 			)
 		)
-		(property "Footprint" "Resistor_THT:R_Axial_DIN0207_L6.3mm_D2.5mm_P2.54mm_Vertical"
-			(at 61.722 29.21 90)
+		(property "Footprint" "Resistor_THT:R_Axial_DIN0207_L6.3mm_D2.5mm_P10.16mm_Horizontal"
+			(at 62.992 29.21 90)
 			(effects
 				(font
 					(size 1.27 1.27)
@@ -996,7 +1016,7 @@
 			)
 		)
 		(property "Datasheet" "~"
-			(at 63.5 29.21 0)
+			(at 64.77 29.21 0)
 			(effects
 				(font
 					(size 1.27 1.27)
@@ -1005,7 +1025,7 @@
 			)
 		)
 		(property "Description" "Resistor"
-			(at 63.5 29.21 0)
+			(at 64.77 29.21 0)
 			(effects
 				(font
 					(size 1.27 1.27)
