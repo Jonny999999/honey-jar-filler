@@ -37,5 +37,14 @@ del
 screenshots
 
 
-# project specific
+# === project specific ===
+# cad
 cad/parts/import_raw
+**/export/*.stl
+
+# kicad exports
+**/export/**/*.gbr
+**/export/**/*.drl
+**/export/**/*.dxf
+
+**/pcb2gcode/out
