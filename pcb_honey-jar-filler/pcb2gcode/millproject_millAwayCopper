@@ -48,32 +48,32 @@ zsafe=1.800 #2.6 seems unnecessary high
 # ============================
 # ========= milling ==========
 # ============================
-mill-diameters=2mm, 0.8mm, 0.4mm # note: ran a second time for front using 2mm bit only
+mill-diameters=1.5mm, 0.4mm # note: ran second time for back: 1mm only (no text)
 isolation-width=200 # mill away copper that is no track or plane in gerber file
-# extremely large so entire relay area is milled
+                    # extremely large so entire relay area is milled
 
 
 # Mill options
 extra-passes=0
-mill-feed=300 #stichel 30-60: 400mm/min   default 600mm/min
+mill-feed=100
+# tested mill-feed values:
+  # 0.4mm: 80
+  # 1.5mm: 200
 mill-speed=20000
-mill-vertfeed=200
-# pcb_analog-matrix-selector: zone clearance: 0.5, track clearance 0.3 => offset 0.25
+mill-vertfeed=150 # there is an extreme amount of lifts... -> dont set this too slow
 
 # additional offset that is actually exactly fulfilled (except smallest mill is too large)
-offset=0.11
+offset=0.15
 voronoi=false
-#zwork=-0.2000 #using 60degree cutter resulted in ~0.42mm line
-#zwork=-0.300 #using 45degree cutter resulted in ~0.4mm line
-#zwork=-0.400 #using 30degree cutter calculates to ~0.2mm line
 
-zwork=-0.200
-mill-infeed=0.5 #maximum cutting depth per pass (multiple passes when zwork larger)
+zwork=-0.150
+mill-infeed=0.08 #note: ran second time for back: 0.2 (no text all in one go) 
 
 
 
 
-# Note: outline and drill output is not actually used, this config is for millAwayCopper only
+
+# Note: outline and drill output is not actually used here, this config is for millAwayCopper only
 
 # Outline options
 bridges=1.0000
