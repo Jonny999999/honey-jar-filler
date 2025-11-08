@@ -60,7 +60,7 @@ mill-vertfeed=200
 voronoi=false
 ######################################################
 #offset=-0.149 #text line width is 0.3 so offset -0.14 is minimun otherwise crash
-offset=-0.04 #text line width is 0.1 so offset -0.049 is minimun otherwise crash
+offset=-0.045 #text line width is 0.1 so offset -0.049 is minimun otherwise crash
 #zwork=-0.2000 #using 60degree cutter resulted in ~0.42mm line
 #zwork=-0.300 #using 45degree cutter resulted in ~0.4mm line
 #zwork=-0.400 #using 30degree cutter calculates to ~0.2mm line

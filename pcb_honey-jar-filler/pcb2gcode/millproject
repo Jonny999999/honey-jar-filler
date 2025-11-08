@@ -75,7 +75,8 @@ nog81=false
 nog91-1=true
 onedrill=false
 zdrill=-1.950 #1.75 slightly too short
-drills-available=0.8, 1, 1.2, 1.5, 1.8, 2, 2.5, 3
+# drills-available=0.8, 1, 1.2, 1.5, 1.8, 2, 2.5, 3 # actually available drills
+drills-available=0.8, 1, 1.5, 2
 
 
 # Outline options
@@ -89,7 +90,7 @@ cut-vertfeed=60
 cutter-diameter=1.0000
 fill-outline=true
 zbridges=-0.6000
-zcut=-1.9000 #actual: 1.7
+zcut=-1.8000 #actual: 1.7
 
 
 # Autoleveller options
