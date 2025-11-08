@@ -20565,7 +20565,7 @@
 				)
 			)
 		)
-		(property "Value" "Relay_LEG-xxF"
+		(property "Value" "Relay_LEG-12"
 			(at 274.32 37.846 0)
 			(effects
 				(font
@@ -21935,7 +21935,7 @@
 				)
 			)
 		)
-		(property "Value" "Relay_LEG-xxF"
+		(property "Value" "Relay_LEG-12"
 			(at 359.41 38.1 0)
 			(effects
 				(font
