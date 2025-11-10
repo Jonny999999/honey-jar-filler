@@ -6,6 +6,7 @@
 #include "sdkconfig.h"
 #include "nvs_flash.h"
 #include "nvs.h"
+#include "encoder.h"
 
 #include "config.h"
 #include "iotest.h"
@@ -73,7 +74,7 @@ void gpio_init_all(void)
 
 
 
-// Simple consumer: blocks for new samples and logs them
+// Task for consuming hx711 readout queue and log the new samples
 static void task_scale_log_readouts(void *arg)
 {
     QueueHandle_t queue_hx711_readouts = (QueueHandle_t)arg;
@@ -88,6 +89,42 @@ static void task_scale_log_readouts(void *arg)
 }
 
 
+// Task for consuming encoder queue and logging all events
+static void task_enc_consumer(void *arg)
+{
+    static const char *TAG = "encoder_consumer";
+    QueueHandle_t q = (QueueHandle_t)arg;
+    rotary_encoder_event_t ev;
+
+    int32_t position = 0; // simple local pos accumulator
+
+    for (;;) {
+        if (xQueueReceive(q, &ev, portMAX_DELAY) != pdPASS) continue;
+        switch (ev.type) {
+        case RE_ET_CHANGED:
+            position += ev.diff; // diff is +-1 per step (or more if accelerated)
+            ESP_LOGI(TAG, "STEP %+d  pos=%ld", (int)ev.diff, (long)position);
+            break;
+        case RE_ET_BTN_PRESSED:
+            ESP_LOGI(TAG, "BTN: pressed");
+            break;
+        case RE_ET_BTN_LONG_PRESSED:
+            ESP_LOGI(TAG, "BTN: long pressed");
+            break;
+        case RE_ET_BTN_RELEASED:
+            ESP_LOGI(TAG, "BTN: released");
+            break;
+        case RE_ET_BTN_CLICKED:
+            ESP_LOGI(TAG, "BTN: clicked");
+            break;
+        default:
+            break;
+        }
+    }
+}
+
+
+
 
 void app_main(void)
 {
@@ -98,18 +135,18 @@ void app_main(void)
         ESP_ERROR_CHECK(nvs_flash_init());
     }
 
-    // === init all gpios ===
+    //=== init all gpios ===
     gpio_init_all();
 
 
     // === start IO-test tasks ===
-    xTaskCreatePinnedToCore(iotest_input_monitor_task, "in_mon", 4096, NULL, 1, NULL, 1); // core=1, prio=1
+    //xTaskCreatePinnedToCore(iotest_input_monitor_task, "in_mon", 4096, NULL, 1, NULL, 1); // core=1, prio=1
     //xTaskCreatePinnedToCore(iotest_output_toggler_task, "out_chase", 4096, NULL, 5, NULL, tskNO_AFFINITY);
     ESP_LOGI(TAG, "I/O test running: inputs are logged on change; outputs chaser is active.");
 
 
 
-    // === HX711 scale ===
+    //=== HX711 scale ===
     // init HX711 wrapper
     static scale_hx711_t scale;
     ESP_ERROR_CHECK(scale_hx711_init(&scale));
@@ -134,9 +171,36 @@ void app_main(void)
                                            &queue_hx711_readouts));
 
     // start task consuming/logging all readouts
-    xTaskCreatePinnedToCore(task_scale_log_readouts, "scale_cons", 4096, (void*)queue_hx711_readouts, 2, NULL, 1);
+    //xTaskCreatePinnedToCore(task_scale_log_readouts, "scale_cons", 4096, (void*)queue_hx711_readouts, 2, NULL, 1);
 
 
+
+
+
+    //=== Rotary Encoder ===
+    // Create the events queue 
+    static QueueHandle_t s_enc_queue = NULL;
+    s_enc_queue = xQueueCreate(16, sizeof(rotary_encoder_event_t));
+    assert(s_enc_queue);
+
+    // Init the encoder library with that queue
+    ESP_ERROR_CHECK(rotary_encoder_init(s_enc_queue));
+
+    // Describe encoder pins (button optional)
+    static rotary_encoder_t enc = {
+        .pin_a  = CONFIG_ENCODER_A_GPIO,      // e.g. GPIO36
+        .pin_b  = CONFIG_ENCODER_B_GPIO,      // e.g. GPIO39
+        .pin_btn= CONFIG_ENCODER_SW_GPIO,     // e.g. GPIO34, or >=GPIO_NUM_MAX if none
+    };
+    // Register encoder
+    ESP_ERROR_CHECK(rotary_encoder_add(&enc));
+
+    // (Optional) Acceleration for faster turning feel
+    //ESP_ERROR_CHECK(rotary_encoder_enable_acceleration(&enc, 400));
+
+    // Start consumer task
+    xTaskCreatePinnedToCore(task_enc_consumer, "enc_consumer", 3072,
+                            s_enc_queue, 4, NULL, 1);
 
 
 
