@@ -1,10 +1,13 @@
 #pragma once
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include <stdbool.h>
 #include <stdint.h>
 #include "esp_err.h"
 #include "hx711.h"   // external HX711 component
-#include "sdkconfig.h"
 
 // Define GPIO pins the module is connected
 #ifndef CONFIG_HX711_DT_GPIO
@@ -22,7 +25,32 @@ typedef struct {
     int32_t offset_raw;  // tare offset (raw counts at empty)
     float   scale_cpg;   // counts per gram
     bool    calibrated;  // true after scale is known
+    SemaphoreHandle_t mtx;
 } scale_hx711_t;
+
+
+// One sample pushed by the polling task
+typedef struct {
+    int32_t raw;
+    float   grams;
+    bool    valid;     // true if calibrated
+    int64_t ts_us;     // esp_timer_get_time()
+} scale_sample_t;
+
+
+
+
+// Start background polling; creates a queue and a task that writes into it.
+// - samples_avg: how many HX711 samples to average each read (e.g., 8 or 16)
+// - period: FreeRTOS ticks between published samples (e.g., pdMS_TO_TICKS(200))
+// - queue_len: usually 1–4. Use 1 for “latest only” behavior.
+// Returns a QueueHandle_t in *out_queue to receive scale_sample_t.
+esp_err_t scale_hx711_start_poll(scale_hx711_t *s,
+                                 uint16_t samples_avg,
+                                 TickType_t period,
+                                 UBaseType_t queue_len,
+                                 QueueHandle_t *out_queue);
+
 
 
 /**

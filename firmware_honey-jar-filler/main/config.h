@@ -8,8 +8,8 @@
 //===== Input GPIO pins =====
 //===========================
 // all inputs are active LOW (switches wired to pull input to GND)
-#define CONFIG_ENCODER_A_GPIO     GPIO_NUM_36
-#define CONFIG_ENCODER_B_GPIO     GPIO_NUM_39
+#define CONFIG_ENCODER_A_GPIO     GPIO_NUM_36  // board pullup desoldered for encoder module to work
+#define CONFIG_ENCODER_B_GPIO     GPIO_NUM_39  // board pullup desoldered for encoder module to work
 #define CONFIG_ENCODER_SW_GPIO    GPIO_NUM_34
 
 #define CONFIG_POS_SWITCH_GPIO    GPIO_NUM_35
@@ -43,3 +43,6 @@
 //=======================================
 #define CONFIG_HX711_DT_GPIO        GPIO_NUM_12
 #define CONFIG_HX711_SCK_GPIO       GPIO_NUM_13
+
+#define CONFIG_HX711_POLL_INTERVAL_MS 2000 //AVG vs INTERVAL: consider one readout takes ~90ms 
+#define CONFIG_HX711_AVG_SAMPLE_COUNT 16

@@ -4,6 +4,8 @@
 #include "driver/gpio.h"
 #include "esp_log.h"
 #include "sdkconfig.h"
+#include "nvs_flash.h"
+#include "nvs.h"
 
 #include "config.h"
 #include "iotest.h"
@@ -68,50 +70,74 @@ void gpio_init_all(void)
     ESP_LOGI(TAG, "GPIOs configured.");
 }
 
+
+
+
+// Simple consumer: blocks for new samples and logs them
+static void task_scale_log_readouts(void *arg)
+{
+    QueueHandle_t queue_hx711_readouts = (QueueHandle_t)arg;
+    scale_sample_t s;
+
+    while(1){
+        if (xQueueReceive(queue_hx711_readouts, &s, portMAX_DELAY) == pdPASS) {
+            ESP_LOGI("scale_consumer", "received new measurement: t=%lld ms  raw=%" PRId32 "  %.2f g %s",
+                     (long long)s.ts_us/1000, s.raw, s.grams, s.valid ? "" : "(not-calibrated!)");
+        }
+    }
+}
+
+
+
 void app_main(void)
 {
+    // init nvs
+    esp_err_t r = nvs_flash_init();
+    if (r == ESP_ERR_NVS_NO_FREE_PAGES || r == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ESP_ERROR_CHECK(nvs_flash_init());
+    }
 
-    // 1) init all gpios
+    // === init all gpios ===
     gpio_init_all();
 
-    // 2) start tasks
+
+    // === start IO-test tasks ===
     xTaskCreatePinnedToCore(iotest_input_monitor_task, "in_mon", 4096, NULL, 1, NULL, 1); // core=1, prio=1
     //xTaskCreatePinnedToCore(iotest_output_toggler_task, "out_chase", 4096, NULL, 5, NULL, tskNO_AFFINITY);
     ESP_LOGI(TAG, "I/O test running: inputs are logged on change; outputs chaser is active.");
 
 
+
+    // === HX711 scale ===
     // init HX711 wrapper
     static scale_hx711_t scale;
     ESP_ERROR_CHECK(scale_hx711_init(&scale));
 
-    // 1) TARE with empty bucket / no jar
-    ESP_ERROR_CHECK(scale_hx711_tare(&scale, 16));  // avg 16 samples
-
-    // 2) Put known calibration weight (e.g. 500 g) on load cell
-    //    then run once:
+#ifdef SCALE_RUN_CALIBRATION //TODO: trigger this with UI
+    // 1. zero readout (determine offset)
+    printf("calibration: tare in 2 seconds... -> remove weight from scale\n");
+    vTaskDelay(pdMS_TO_TICKS(2000));
+    ESP_ERROR_CHECK(scale_hx711_tare(&scale, 16));
+    // 2. calibrate (determine scale)
     printf("calibrating to 500g in 2 seconds... -> pace weight\n");
     vTaskDelay(pdMS_TO_TICKS(2000));
     ESP_ERROR_CHECK(scale_hx711_calibrate(&scale, 500.0f, 16));
-    // After this, scale.calibrated = true
+#endif
 
-    // 3) Periodic read loop
-    while (1) {
-        int32_t raw;
-        float grams;
-        bool valid;
+    // start producer - constantly reads HX711 and updates a queue
+    QueueHandle_t queue_hx711_readouts = NULL;
+    ESP_ERROR_CHECK(scale_hx711_start_poll(&scale,
+                                           CONFIG_HX711_AVG_SAMPLE_COUNT, //samples_avg
+                                           pdMS_TO_TICKS(CONFIG_HX711_POLL_INTERVAL_MS), //sample period
+                                           1,    // queue length - “latest only"
+                                           &queue_hx711_readouts));
 
-        if (scale_hx711_read_grams(&scale, 8, &raw, &grams, &valid) == ESP_OK) {
-            if (valid) {
-                ESP_LOGI(TAG, "raw=%" PRId32 "  weight=%.2f g", raw, grams);
-            } else {
-                ESP_LOGI(TAG, "raw=%" PRId32 "  weight(unscaled)=%.2f g (not calibrated)", raw, grams);
-            }
-        } else {
-            ESP_LOGE(TAG, "HX read failed");
-        }
+    // start task consuming/logging all readouts
+    xTaskCreatePinnedToCore(task_scale_log_readouts, "scale_cons", 4096, (void*)queue_hx711_readouts, 2, NULL, 1);
 
-        vTaskDelay(pdMS_TO_TICKS(500));
-    }
+
+
 
 
     while (1) {
