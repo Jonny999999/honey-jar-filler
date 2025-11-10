@@ -648,7 +648,7 @@
 				(justify left)
 			)
 		)
-		(property "Value" "100n"
+		(property "Value" "\\${C_filter}"
 			(at 86.36 45.7199 0)
 			(effects
 				(font
@@ -822,8 +822,8 @@
 				(justify left)
 			)
 		)
-		(property "Value" "4k7"
-			(at 75.438 34.544 90)
+		(property "Value" "\\${R_series}"
+			(at 78.74 34.29 90)
 			(effects
 				(font
 					(size 1.27 1.27)
@@ -997,7 +997,7 @@
 				(justify left)
 			)
 		)
-		(property "Value" "10k"
+		(property "Value" "\\${R_pullup}"
 			(at 67.056 30.988 90)
 			(effects
 				(font

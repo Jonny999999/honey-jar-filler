@@ -456,7 +456,7 @@
       "no_connect_dangling": "warning",
       "pin_not_connected": "error",
       "pin_not_driven": "error",
-      "pin_to_pin": "warning",
+      "pin_to_pin": "error",
       "power_pin_not_driven": "error",
       "same_local_global_label": "warning",
       "similar_label_and_power": "warning",
@@ -689,5 +689,9 @@
       "Digital-Input-Filter5"
     ]
   ],
-  "text_variables": {}
+  "text_variables": {
+    "C_filter": "100n",
+    "R_pullup": "10k",
+    "R_series": "2k2"
+  }
 }
