@@ -7,6 +7,7 @@
 
 #include "config.h"
 #include "iotest.h"
+#include "scale_hx711.h"
 
 static const char *TAG = "main";
 
@@ -77,6 +78,41 @@ void app_main(void)
     xTaskCreatePinnedToCore(iotest_input_monitor_task, "in_mon", 4096, NULL, 1, NULL, 1); // core=1, prio=1
     //xTaskCreatePinnedToCore(iotest_output_toggler_task, "out_chase", 4096, NULL, 5, NULL, tskNO_AFFINITY);
     ESP_LOGI(TAG, "I/O test running: inputs are logged on change; outputs chaser is active.");
+
+
+    // init HX711 wrapper
+    static scale_hx711_t scale;
+    ESP_ERROR_CHECK(scale_hx711_init(&scale));
+
+    // 1) TARE with empty bucket / no jar
+    ESP_ERROR_CHECK(scale_hx711_tare(&scale, 16));  // avg 16 samples
+
+    // 2) Put known calibration weight (e.g. 500 g) on load cell
+    //    then run once:
+    printf("calibrating to 500g in 2 seconds... -> pace weight\n");
+    vTaskDelay(pdMS_TO_TICKS(2000));
+    ESP_ERROR_CHECK(scale_hx711_calibrate(&scale, 500.0f, 16));
+    // After this, scale.calibrated = true
+
+    // 3) Periodic read loop
+    while (1) {
+        int32_t raw;
+        float grams;
+        bool valid;
+
+        if (scale_hx711_read_grams(&scale, 8, &raw, &grams, &valid) == ESP_OK) {
+            if (valid) {
+                ESP_LOGI(TAG, "raw=%" PRId32 "  weight=%.2f g", raw, grams);
+            } else {
+                ESP_LOGI(TAG, "raw=%" PRId32 "  weight(unscaled)=%.2f g (not calibrated)", raw, grams);
+            }
+        } else {
+            ESP_LOGE(TAG, "HX read failed");
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+
 
     while (1) {
         vTaskDelay(portMAX_DELAY);

@@ -38,3 +38,8 @@
 
 
  
+//=======================================
+//==== HX711 24 bit ADC (load-cell) =====
+//=======================================
+#define CONFIG_HX711_DT_GPIO        GPIO_NUM_12
+#define CONFIG_HX711_SCK_GPIO       GPIO_NUM_13
