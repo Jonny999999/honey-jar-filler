@@ -2,6 +2,7 @@
 build
 sdkconfig.old
 dependencies.lock
+managed_components
 
 # VIM files
 *.swp
