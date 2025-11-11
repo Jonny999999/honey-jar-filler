@@ -46,3 +46,12 @@
 
 #define CONFIG_HX711_POLL_INTERVAL_MS 2000 //AVG vs INTERVAL: consider one readout takes ~90ms 
 #define CONFIG_HX711_AVG_SAMPLE_COUNT 16
+
+
+
+
+//===============================
+//====== I2C OLED Display =======
+//===============================
+#define CONFIG_DISPLAY_SDA_GPIO     GPIO_NUM_21
+#define CONFIG_DISPLAY_SCL_GPIO     GPIO_NUM_22
