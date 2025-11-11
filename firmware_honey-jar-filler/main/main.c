@@ -2,11 +2,13 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/gpio.h"
+#include "driver/i2c_master.h"
 #include "esp_log.h"
 #include "sdkconfig.h"
 #include "nvs_flash.h"
 #include "nvs.h"
 #include "encoder.h"
+#include "ssd1306.h"
 
 #include "config.h"
 #include "iotest.h"
@@ -89,6 +91,7 @@ static void task_scale_log_readouts(void *arg)
 }
 
 
+
 // Task for consuming encoder queue and logging all events
 static void task_enc_consumer(void *arg)
 {
@@ -125,28 +128,118 @@ static void task_enc_consumer(void *arg)
 
 
 
+// Task for testing the display - shows encoder + scale values
+#define LINE2PIXEL(n) ((n)*8)
+#define DISPLAY_UPDATE_INTERVAL_MS 200
+
+typedef struct {
+    ssd1306_handle_t disp;
+    QueueHandle_t    q_scale;  // scale_sample_t
+    QueueHandle_t    q_enc;    // rotary_encoder_event_t
+} disp_args_t;
+
+static void task_display(void *arg)
+{
+    disp_args_t cfg = *(disp_args_t*)arg;
+    vPortFree(arg);
+
+    // simple local state
+    float   grams = 0.f;
+    bool    valid = false;
+    int32_t enc_pos = 0;
+    int8_t  enc_delta = 0;   // per-frame delta
+    uint8_t btn = 0xFF;      // 0xFF = n/a, 0=UP, 1=DOWN
+    uint8_t lastLine = 0;
+
+    const TickType_t period = pdMS_TO_TICKS(DISPLAY_UPDATE_INTERVAL_MS);
+    TickType_t last = xTaskGetTickCount();
+
+    while(1) {
+        //--- drain queues (show freshest data each frame) ---
+        // get last scale readout
+        scale_sample_t smp;
+        while (cfg.q_scale && xQueueReceive(cfg.q_scale, &smp, 1) == pdPASS) {
+            grams = smp.grams;
+            valid = smp.valid;
+        }
+
+        // get last encoder event
+        rotary_encoder_event_t ev;
+        enc_delta = 0;
+        while (cfg.q_enc && xQueueReceive(cfg.q_enc, &ev, 1) == pdPASS) {
+            switch (ev.type) {
+                case RE_ET_CHANGED:        enc_pos += ev.diff; enc_delta += (int8_t)ev.diff; break;
+                case RE_ET_BTN_PRESSED:    btn = 1; break;
+                case RE_ET_BTN_RELEASED:   btn = 0; break;
+                case RE_ET_BTN_LONG_PRESSED: btn = 1; break;
+                default: break;
+            }
+        }
+
+        //--- draw display content ---
+        lastLine = 0;
+        char line1[24], line2[32];
+        // clear framebuffer:
+        ssd1306_clear(cfg.disp);
+
+        // title:
+        ssd1306_draw_text_scaled(cfg.disp, 0, LINE2PIXEL(lastLine), "Honey Filler", true, 2);
+        lastLine += 2;
+        // weight:
+        if (valid) snprintf(line1, sizeof(line1), "%.1f g", grams);
+        else       snprintf(line1, sizeof(line1), "--.- g");
+        ssd1306_draw_text_scaled(cfg.disp, 0, LINE2PIXEL(lastLine), line1, true, 3); // big
+        lastLine += 3;
+        // encoder data:
+        snprintf(line2, sizeof(line2), "Enc:%ld (%+d)  Btn:%s",
+                 (long)enc_pos, enc_delta,
+                 (btn==0xFF) ? "-" : (btn ? "DOWN" : "UP"));
+        ssd1306_draw_text(cfg.disp, 0, LINE2PIXEL(lastLine), line2, true);
+        lastLine += 2;
+
+        // flush framebuffer, update display
+        ssd1306_display(cfg.disp);
+
+        vTaskDelayUntil(&last, period);
+    }
+}
+
+
+
+
+
 
 void app_main(void)
 {
-    // init nvs
+    //=======================
+    //=== Queues (shared) ===
+    //=======================
+    // define queues used across multiple tasks
+    QueueHandle_t queue_hx711_readouts = NULL;   // created by scale_hx711_start_poll(...)
+    static QueueHandle_t queue_encoder_events = NULL;     // created here, used by encoder & UI
+    queue_encoder_events = xQueueCreate(16, sizeof(rotary_encoder_event_t));
+    assert(queue_encoder_events);
+
+
+    //==================
+    //==== init nvs ====
+    //==================
     esp_err_t r = nvs_flash_init();
     if (r == ESP_ERR_NVS_NO_FREE_PAGES || r == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
         ESP_ERROR_CHECK(nvs_flash_init());
     }
 
-    //=== init all gpios ===
+
+    //=============================
+    //=== init Digital IO gpios ===
+    //=============================
     gpio_init_all();
 
 
-    // === start IO-test tasks ===
-    //xTaskCreatePinnedToCore(iotest_input_monitor_task, "in_mon", 4096, NULL, 1, NULL, 1); // core=1, prio=1
-    //xTaskCreatePinnedToCore(iotest_output_toggler_task, "out_chase", 4096, NULL, 5, NULL, tskNO_AFFINITY);
-    ESP_LOGI(TAG, "I/O test running: inputs are logged on change; outputs chaser is active.");
-
-
-
+    //===================
     //=== HX711 scale ===
+    //===================
     // init HX711 wrapper
     static scale_hx711_t scale;
     ESP_ERROR_CHECK(scale_hx711_init(&scale));
@@ -162,29 +255,13 @@ void app_main(void)
     ESP_ERROR_CHECK(scale_hx711_calibrate(&scale, 500.0f, 16));
 #endif
 
-    // start producer - constantly reads HX711 and updates a queue
-    QueueHandle_t queue_hx711_readouts = NULL;
-    ESP_ERROR_CHECK(scale_hx711_start_poll(&scale,
-                                           CONFIG_HX711_AVG_SAMPLE_COUNT, //samples_avg
-                                           pdMS_TO_TICKS(CONFIG_HX711_POLL_INTERVAL_MS), //sample period
-                                           1,    // queue length - “latest only"
-                                           &queue_hx711_readouts));
-
-    // start task consuming/logging all readouts
-    //xTaskCreatePinnedToCore(task_scale_log_readouts, "scale_cons", 4096, (void*)queue_hx711_readouts, 2, NULL, 1);
 
 
-
-
-
+    //======================
     //=== Rotary Encoder ===
-    // Create the events queue 
-    static QueueHandle_t s_enc_queue = NULL;
-    s_enc_queue = xQueueCreate(16, sizeof(rotary_encoder_event_t));
-    assert(s_enc_queue);
-
+    //======================
     // Init the encoder library with that queue
-    ESP_ERROR_CHECK(rotary_encoder_init(s_enc_queue));
+    ESP_ERROR_CHECK(rotary_encoder_init(queue_encoder_events));
 
     // Describe encoder pins (button optional)
     static rotary_encoder_t enc = {
@@ -198,9 +275,78 @@ void app_main(void)
     // (Optional) Acceleration for faster turning feel
     //ESP_ERROR_CHECK(rotary_encoder_enable_acceleration(&enc, 400));
 
-    // Start consumer task
-    xTaskCreatePinnedToCore(task_enc_consumer, "enc_consumer", 3072,
-                            s_enc_queue, 4, NULL, 1);
+
+
+
+    //===============
+    //=== Display ===
+    //===============
+    i2c_master_bus_config_t bus_cfg = {
+        .i2c_port = I2C_NUM_0,
+        .sda_io_num = CONFIG_DISPLAY_SDA_GPIO,
+        .scl_io_num = CONFIG_DISPLAY_SCL_GPIO,
+        .clk_source = I2C_CLK_SRC_DEFAULT,
+        .glitch_ignore_cnt = 7,
+        .flags.enable_internal_pullup = true,
+    };
+    i2c_master_bus_handle_t bus_handle;
+    i2c_new_master_bus(&bus_cfg, &bus_handle);
+    ssd1306_config_t cfg = {
+        .bus = SSD1306_I2C,
+        .width = 128,
+        .height = 64,
+        .iface.i2c = {
+            .port = I2C_NUM_0,
+            .addr = 0x3C,
+            .rst_gpio = GPIO_NUM_NC,
+        },
+    };
+    ssd1306_handle_t disp;
+    ssd1306_new_i2c(&cfg, &disp);
+    ssd1306_clear(disp);
+    ssd1306_draw_text(disp, 0, 0, "INITIALIZED", true);
+    ssd1306_display(disp);
+    //ssd1306_draw_text_scaled(disp, 0, 4, "SSD1306 I2C", true, 2);
+
+
+
+
+    //=======================
+    //=== Start all tasks ===
+    //=======================
+    //--- IO-test tasks ---
+    #if DEBUG_RUN_IOTEST
+    xTaskCreatePinnedToCore(iotest_input_monitor_task, "in_mon", 4096, NULL, 1, NULL, 1); // core=1, prio=1
+    xTaskCreatePinnedToCore(iotest_output_toggler_task, "out_chase", 4096, NULL, 5, NULL, tskNO_AFFINITY);
+    #endif
+
+    //--- weight scale task ---
+    // start producer - constantly reads HX711 and updates a queue
+    ESP_ERROR_CHECK(scale_hx711_start_poll(
+        &scale,
+        CONFIG_HX711_AVG_SAMPLE_COUNT, //samples_avg
+        pdMS_TO_TICKS(CONFIG_HX711_POLL_INTERVAL_MS), //sample period
+        1,    // queue length - “latest only"
+        &queue_hx711_readouts));
+    // simple task consuming/logging all readouts
+    #if DEBUG_LOG_SCALE_READOUTS
+    xTaskCreatePinnedToCore(task_scale_log_readouts, "scale_cons", 4096, (void*)queue_hx711_readouts, 2, NULL, 1);
+    #endif
+
+    //--- encoder log task---
+    // simple task to consume and log encoder events
+    #if DEBUG_LOG_ENCODER_EVENTS
+    xTaskCreatePinnedToCore(task_enc_consumer, "enc_consumer", 3072, queue_encoder_events, 4, NULL, 1);
+    #endif
+
+    //--- display task ---
+    // notes: task conflicts with debug logging tasks above since those take out the events from queue already
+    disp_args_t *args = pvPortMalloc(sizeof(*args));
+    args->disp    = disp;
+    args->q_scale = queue_hx711_readouts;     // recommend queue_len = 1 (latest sample)
+    args->q_enc   = queue_encoder_events; // from rotary_encoder_init()
+    xTaskCreatePinnedToCore(task_display, "ui_display", 4096, args, 4, NULL, 1);
+
 
 
 
