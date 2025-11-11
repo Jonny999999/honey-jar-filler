@@ -9,6 +9,8 @@
 #include "nvs.h"
 #include "encoder.h"
 #include "ssd1306.h"
+#include "iot_servo.h"
+#include "driver/ledc.h"
 
 #include "config.h"
 #include "iotest.h"
@@ -48,7 +50,7 @@ void gpio_init_all(void)
         | BIT64(CONFIG_OPEN_DRAIN_RESERVE_GPIO) // NOTE: currently push-pull
         | BIT64(CONFIG_RELAY_MOTOR_GPIO)
         | BIT64(CONFIG_RELAY_230V_GPIO)         // GPIO2 kept LOW at boot
-        | BIT64(CONFIG_SERVO_PWM_GPIO)          // LEDC will re-own later
+        //| BIT64(CONFIG_SERVO_PWM_GPIO)          // LEDC will re-own later
         | BIT64(CONFIG_SERVO_ENABLE_GPIO);
 
     io.pin_bit_mask   = output_mask;
@@ -67,7 +69,7 @@ void gpio_init_all(void)
     gpio_set_level(CONFIG_OPEN_DRAIN_RESERVE_GPIO, 0);
     gpio_set_level(CONFIG_RELAY_MOTOR_GPIO, 0);
     gpio_set_level(CONFIG_RELAY_230V_GPIO, 0);  // keep LOW for strap safety
-    gpio_set_level(CONFIG_SERVO_PWM_GPIO, 0);   // will be LEDC later
+    //gpio_set_level(CONFIG_SERVO_PWM_GPIO, 0);   // will be LEDC later
     gpio_set_level(CONFIG_SERVO_ENABLE_GPIO, 0);
 
     ESP_LOGI(TAG, "GPIOs configured.");
@@ -207,6 +209,19 @@ static void task_display(void *arg)
 
 
 
+static void task_servoTest(void *arg)
+{
+    while(1){
+    float angle = 90.0f; // center
+    ESP_ERROR_CHECK(iot_servo_write_angle(LEDC_LOW_SPEED_MODE, /*channel=*/0, angle));
+    vTaskDelay(pdMS_TO_TICKS(2000));
+    angle = 0.0f;
+    ESP_ERROR_CHECK(iot_servo_write_angle(LEDC_LOW_SPEED_MODE, /*channel=*/0, angle));
+    vTaskDelay(pdMS_TO_TICKS(2000));
+    }
+    //read back the last set angle (calculated)
+    //ESP_ERROR_CHECK(iot_servo_read_angle(LEDC_LOW_SPEED_MODE, 0, &angle));
+}
 
 
 void app_main(void)
@@ -311,6 +326,34 @@ void app_main(void)
 
 
 
+    //===============
+    //==== Servo ====
+    //===============
+    // enable servo power
+    gpio_set_level(CONFIG_SERVO_ENABLE_GPIO, 1);
+    // configure your servo
+    servo_config_t servo_cfg = {
+        .max_angle = 180,     // degrees
+        .min_width_us = 500,  // 0°
+        .max_width_us = 2500, // 180°
+        .freq = 50,           // 50 Hz standard
+        .timer_number = LEDC_TIMER_0,
+        .channels = {
+            .servo_pin = {CONFIG_SERVO_PWM_GPIO}, // your GPIO
+            .ch = {LEDC_CHANNEL_0},               // channel
+        }, // -> this servo is channel 0
+        .channel_number = 1,
+    };
+    // init servo
+    ESP_ERROR_CHECK(iot_servo_init(LEDC_LOW_SPEED_MODE, &servo_cfg));
+    // operate servo:
+    //ESP_ERROR_CHECK(iot_servo_write_angle(LEDC_LOW_SPEED_MODE, /*channel=*/0, angle));
+
+
+
+
+
+
     //=======================
     //=== Start all tasks ===
     //=======================
@@ -346,6 +389,15 @@ void app_main(void)
     args->q_scale = queue_hx711_readouts;     // recommend queue_len = 1 (latest sample)
     args->q_enc   = queue_encoder_events; // from rotary_encoder_init()
     xTaskCreatePinnedToCore(task_display, "ui_display", 4096, args, 4, NULL, 1);
+
+    //--- servo test task ---
+    #if DEBUG_RUN_SERVO_TEST
+    xTaskCreatePinnedToCore(task_servoTest, "enc_consumer", 3072, queue_encoder_events, 4, NULL, 1);
+    #endif
+
+
+
+
 
 
 

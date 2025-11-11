@@ -33,8 +33,6 @@
 #define CONFIG_RELAY_MOTOR_GPIO     GPIO_NUM_27
 #define CONFIG_RELAY_230V_GPIO      GPIO_NUM_2
 
-#define CONFIG_SERVO_PWM_GPIO       GPIO_NUM_4  // Servo PWM Signal: directly connected to terminal (no pulldown present)
-#define CONFIG_SERVO_ENABLE_GPIO    GPIO_NUM_16  // P-MOSFET Enable supply for Servo (outputs 12V when HIGH)
 
 
  
@@ -55,3 +53,12 @@
 //===============================
 #define CONFIG_DISPLAY_SDA_GPIO     GPIO_NUM_21
 #define CONFIG_DISPLAY_SCL_GPIO     GPIO_NUM_22
+
+
+
+
+//=======================
+//======== Servo ========
+//=======================
+#define CONFIG_SERVO_PWM_GPIO       GPIO_NUM_4  // Servo PWM Signal: directly connected to terminal (no pulldown present)
+#define CONFIG_SERVO_ENABLE_GPIO    GPIO_NUM_16  // P-MOSFET Enable supply for Servo (outputs 12V when HIGH)
