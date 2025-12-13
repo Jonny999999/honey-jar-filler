@@ -1,16 +1,20 @@
+# OS and editor noise
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+**/.cache
+.vscode/
+settings.json
+.idea/
+*.log
+
 # ESP-IDF default build directory
 build
 sdkconfig.old
 dependencies.lock
 managed_components
-
-# VIM files
-*.swp
-*.swo
-**/.cache
-
-# VS-code
-settings.json
 
 # drawio files
 *.bkp
