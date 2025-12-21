@@ -45,7 +45,8 @@ screenshots
 # === project specific ===
 # cad
 cad/parts/import_raw
-**/export/*.stl
+**/exports/**/*.stl
+**/exports/**/*.3mf
 
 # kicad exports
 **/export/**/*.gbr
