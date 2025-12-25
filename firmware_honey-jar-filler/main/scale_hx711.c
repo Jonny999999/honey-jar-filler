@@ -15,6 +15,41 @@
 
 static const char *TAG = "scale_hx711";
 
+// Latest snapshot storage (guarded by mutex to avoid torn reads).
+static SemaphoreHandle_t s_latest_mtx;
+static scale_latest_t s_latest;
+
+void scale_latest_set(const scale_latest_t *s)
+{
+    if (!s) return;
+
+    if (!s_latest_mtx) {
+        s_latest_mtx = xSemaphoreCreateMutex();
+        if (!s_latest_mtx) {
+            s_latest = *s;
+            return;
+        }
+    }
+
+    if (xSemaphoreTake(s_latest_mtx, portMAX_DELAY) != pdPASS) return;
+    s_latest = *s;
+    xSemaphoreGive(s_latest_mtx);
+}
+
+void scale_latest_get(scale_latest_t *out)
+{
+    if (!out) return;
+
+    if (!s_latest_mtx) {
+        *out = s_latest;
+        return;
+    }
+
+    if (xSemaphoreTake(s_latest_mtx, portMAX_DELAY) != pdPASS) return;
+    *out = s_latest;
+    xSemaphoreGive(s_latest_mtx);
+}
+
 
 static inline bool scale_lock(scale_hx711_t *s, uint32_t timeout_ms)
 {
@@ -292,11 +327,20 @@ static void task_scale_poll(void *arg)
 
         int32_t raw = 0; float g = 0.0f; bool ok = false;
         if (scale_hx711_read_grams(cfg.s, cfg.samples_avg, &raw, &g, &ok) == ESP_OK) {
+            int64_t ts = esp_timer_get_time();
+            scale_latest_t latest = {
+                .raw = raw,
+                .grams = g,
+                .valid = ok,
+                .ts_us = ts
+            };
+            scale_latest_set(&latest);
+
             scale_sample_t msg = {
                 .raw = raw,
                 .grams = g,
                 .valid = ok,
-                .ts_us = esp_timer_get_time()
+                .ts_us = ts
             };
             if (xQueueSend(cfg.q, &msg, 0) != pdPASS) {
                 // if queue_len == 1 this overwrites; otherwise it's a no-op

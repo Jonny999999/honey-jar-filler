@@ -37,6 +37,17 @@ typedef struct {
     int64_t ts_us;     // esp_timer_get_time()
 } scale_sample_t;
 
+// Fast-path snapshot of the latest readout (for UI/FSM).
+typedef struct {
+    int32_t raw;
+    float   grams;
+    bool    valid;
+    int64_t ts_us;
+} scale_latest_t;
+
+// Store or fetch the latest readout snapshot (thread-safe).
+void  scale_latest_set(const scale_latest_t *s);
+void  scale_latest_get(scale_latest_t *out);
 
 
 
