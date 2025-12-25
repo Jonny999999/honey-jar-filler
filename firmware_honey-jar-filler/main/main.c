@@ -78,7 +78,7 @@ void gpio_init_all(void)
 
 
 
-// Task for consuming hx711 readout queue and log the new samples
+// Task: log each HX711 scale readout.
 static void task_scale_log_readouts(void *arg)
 {
     QueueHandle_t queue_hx711_readouts = (QueueHandle_t)arg;
@@ -94,7 +94,7 @@ static void task_scale_log_readouts(void *arg)
 
 
 
-// Task for consuming encoder queue and logging all events
+// Task: log encoder events and button state.
 static void task_enc_consumer(void *arg)
 {
     static const char *TAG = "encoder_consumer";
@@ -130,7 +130,7 @@ static void task_enc_consumer(void *arg)
 
 
 
-// Task for testing the display - shows encoder + scale values
+// Task: show encoder and scale values on the display.
 #define LINE2PIXEL(n) ((n)*8)
 #define DISPLAY_UPDATE_INTERVAL_MS 200
 
@@ -209,6 +209,7 @@ static void task_display(void *arg)
 
 
 
+// Task: simple servo sweep test.
 static void task_servoTest(void *arg)
 {
     while(1){
@@ -222,6 +223,150 @@ static void task_servoTest(void *arg)
     //read back the last set angle (calculated)
     //ESP_ERROR_CHECK(iot_servo_read_angle(LEDC_LOW_SPEED_MODE, 0, &angle));
 }
+
+
+
+
+static void buzzer_beep(uint8_t count, uint32_t on_ms, uint32_t off_ms)
+{
+    for (uint8_t i = 0; i < count; ++i) {
+        gpio_set_level(CONFIG_BUZZER_GPIO, 1);
+        vTaskDelay(pdMS_TO_TICKS(on_ms));
+        gpio_set_level(CONFIG_BUZZER_GPIO, 0);
+        if (i + 1 < count) {
+            vTaskDelay(pdMS_TO_TICKS(off_ms));
+        }
+    }
+}
+
+static void buzzer_pulse(uint32_t on_ms)
+{
+    gpio_set_level(CONFIG_BUZZER_GPIO, 1);
+    vTaskDelay(pdMS_TO_TICKS(on_ms));
+    gpio_set_level(CONFIG_BUZZER_GPIO, 0);
+}
+
+
+
+
+// Task: button-triggered hardware test sequence (LED, relay, servo, buzzer).
+static void task_hardware_test(void *arg)
+{
+    const TickType_t poll = pdMS_TO_TICKS(10);
+    const TickType_t relay_timeout = pdMS_TO_TICKS(5000);
+    const int servo_cycles = 1;
+    const float servo_fwd = 90.0f;
+    const float servo_back = 0.0f;
+
+    buzzer_beep(3, 100, 100);
+
+    while (1) {
+        // wait for BUTTON_1 press (active LOW)
+        while (gpio_get_level(CONFIG_BUTTON_1_GPIO) != 0) {
+            vTaskDelay(poll);
+        }
+        vTaskDelay(pdMS_TO_TICKS(30));
+        if (gpio_get_level(CONFIG_BUTTON_1_GPIO) != 0) {
+            continue;
+        }
+
+        gpio_set_level(CONFIG_LED1_GPIO, 1);
+        gpio_set_level(CONFIG_LED2_GPIO, 1);
+        buzzer_beep(1, 100, 100);
+
+        gpio_set_level(CONFIG_RELAY_MOTOR_GPIO, 1);
+        TickType_t start = xTaskGetTickCount();
+        TickType_t low_start = 0;
+        bool seen_high = false;
+        bool low_seen = false;
+        const TickType_t low_stable_time = pdMS_TO_TICKS(50);
+        while (1) {
+            int lvl = gpio_get_level(CONFIG_POS_SWITCH_GPIO);
+            if (lvl != 0) {
+                seen_high = true;
+                low_seen = false;
+            } else if (seen_high) {
+                if (!low_seen) {
+                    low_seen = true;
+                    low_start = xTaskGetTickCount();
+                } else if ((xTaskGetTickCount() - low_start) >= low_stable_time) {
+                    break; // falling edge detected (debounced)
+                }
+            }
+            if ((xTaskGetTickCount() - start) >= relay_timeout) {
+                break;
+            }
+            vTaskDelay(poll);
+        }
+        gpio_set_level(CONFIG_RELAY_MOTOR_GPIO, 0);
+
+        for (int i = 0; i < servo_cycles; ++i) {
+            ESP_ERROR_CHECK(iot_servo_write_angle(LEDC_LOW_SPEED_MODE, /*channel=*/0, servo_fwd));
+            vTaskDelay(pdMS_TO_TICKS(500));
+            ESP_ERROR_CHECK(iot_servo_write_angle(LEDC_LOW_SPEED_MODE, /*channel=*/0, servo_back));
+            vTaskDelay(pdMS_TO_TICKS(500));
+        }
+
+        buzzer_beep(2, 100, 100);
+        gpio_set_level(CONFIG_LED1_GPIO, 0);
+        gpio_set_level(CONFIG_LED2_GPIO, 0);
+
+        // wait for release to avoid re-triggering immediately
+        while (gpio_get_level(CONFIG_BUTTON_1_GPIO) == 0) {
+            vTaskDelay(poll);
+        }
+        vTaskDelay(pdMS_TO_TICKS(30));
+    }
+}
+
+
+
+
+
+// Task: toggle motor with button and beep on POS switch edges.
+static void task_pos_switch_test(void *arg)
+{
+    const TickType_t poll = pdMS_TO_TICKS(10);
+    const TickType_t debounce = pdMS_TO_TICKS(30);
+    const uint32_t beep_short_ms = 60;
+    const uint32_t beep_long_ms = 120;
+
+    bool enabled = false;
+    int last_btn = gpio_get_level(CONFIG_BUTTON_1_GPIO);
+    int last_pos = gpio_get_level(CONFIG_POS_SWITCH_GPIO);
+
+    gpio_set_level(CONFIG_RELAY_MOTOR_GPIO, 0);
+
+    while (1) {
+        int btn = gpio_get_level(CONFIG_BUTTON_1_GPIO);
+        if (last_btn != 0 && btn == 0) {
+            vTaskDelay(debounce);
+            if (gpio_get_level(CONFIG_BUTTON_1_GPIO) == 0) {
+                enabled = !enabled;
+                gpio_set_level(CONFIG_RELAY_MOTOR_GPIO, enabled ? 1 : 0);
+                while (gpio_get_level(CONFIG_BUTTON_1_GPIO) == 0) {
+                    vTaskDelay(poll);
+                }
+            }
+        }
+        last_btn = btn;
+
+        {
+            int pos = gpio_get_level(CONFIG_POS_SWITCH_GPIO);
+            if (pos != last_pos) {
+                buzzer_pulse(pos ? beep_short_ms : beep_long_ms);
+                last_pos = pos;
+            }
+        }
+
+        vTaskDelay(poll);
+    }
+}
+
+
+
+
+
 
 
 void app_main(void)
@@ -391,8 +536,21 @@ void app_main(void)
     xTaskCreatePinnedToCore(task_display, "ui_display", 4096, args, 4, NULL, 1);
 
     //--- servo test task ---
+#define DEBUG_RUN_SERVO_TEST 0
     #if DEBUG_RUN_SERVO_TEST
-    xTaskCreatePinnedToCore(task_servoTest, "enc_consumer", 3072, queue_encoder_events, 4, NULL, 1);
+    xTaskCreatePinnedToCore(task_servoTest, "servo_test", 3072, queue_encoder_events, 4, NULL, 1);
+    #endif
+
+    //--- hardware test task ---
+#define DEBUG_RUN_HARDWARE_TEST 1
+    #if DEBUG_RUN_HARDWARE_TEST
+    xTaskCreatePinnedToCore(task_hardware_test, "hw_test", 4096, NULL, 4, NULL, 1);
+    #endif
+
+    //--- pos switch edge + toggle motor test task ---
+#define DEBUG_RUN_POS_SWITCH_EDGE_TEST 0
+    #if DEBUG_RUN_POS_SWITC_EDGE_TEST
+    xTaskCreatePinnedToCore(task_pos_switch_test, "motor_edge_test", 3072, NULL, 4, NULL, 1);
     #endif
 
 
