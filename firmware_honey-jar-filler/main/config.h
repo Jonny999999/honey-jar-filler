@@ -42,8 +42,8 @@
 #define CONFIG_HX711_DT_GPIO        GPIO_NUM_12
 #define CONFIG_HX711_SCK_GPIO       GPIO_NUM_13
 
-#define CONFIG_HX711_POLL_INTERVAL_MS 2000 //AVG vs INTERVAL: consider one readout takes ~90ms 
-#define CONFIG_HX711_AVG_SAMPLE_COUNT 16
+#define CONFIG_HX711_POLL_INTERVAL_MS 400 //AVG vs INTERVAL: consider one readout takes ~90ms 
+#define CONFIG_HX711_AVG_SAMPLE_COUNT 4
 
 
 
