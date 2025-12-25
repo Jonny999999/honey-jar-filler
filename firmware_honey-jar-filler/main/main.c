@@ -11,6 +11,8 @@
 #include "ssd1306.h"
 #include "iot_servo.h"
 #include "driver/ledc.h"
+#include "motor.h"
+#include "gate.h"
 
 #include "config.h"
 #include "iotest.h"
@@ -158,11 +160,19 @@ static void task_display(void *arg)
 
     while(1) {
         //--- drain queues (show freshest data each frame) ---
-        // get last scale readout
+        // get last scale readout from queue (if used)
         scale_sample_t smp;
         while (cfg.q_scale && xQueueReceive(cfg.q_scale, &smp, 1) == pdPASS) {
             grams = smp.grams;
             valid = smp.valid;
+        }
+
+        // also read the latest snapshot (fast-path, no queue)
+        scale_latest_t latest;
+        scale_latest_get(&latest);
+        if (latest.ts_us != 0) {
+            grams = latest.grams;
+            valid = latest.valid;
         }
 
         // get last encoder event
@@ -213,15 +223,13 @@ static void task_display(void *arg)
 static void task_servoTest(void *arg)
 {
     while(1){
-    float angle = 90.0f; // center
-    ESP_ERROR_CHECK(iot_servo_write_angle(LEDC_LOW_SPEED_MODE, /*channel=*/0, angle));
-    vTaskDelay(pdMS_TO_TICKS(2000));
-    angle = 0.0f;
-    ESP_ERROR_CHECK(iot_servo_write_angle(LEDC_LOW_SPEED_MODE, /*channel=*/0, angle));
-    vTaskDelay(pdMS_TO_TICKS(2000));
+        float angle = 90.0f; // center
+        ESP_ERROR_CHECK(gate_set(angle));
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        ESP_ERROR_CHECK(gate_close());
+        vTaskDelay(pdMS_TO_TICKS(2000));
     }
     //read back the last set angle (calculated)
-    //ESP_ERROR_CHECK(iot_servo_read_angle(LEDC_LOW_SPEED_MODE, 0, &angle));
 }
 
 
@@ -396,6 +404,11 @@ void app_main(void)
     //=============================
     gpio_init_all();
 
+    //===================
+    //=== Motor relay ===
+    //===================
+    motor_init(CONFIG_RELAY_MOTOR_GPIO);
+
 
     //===================
     //=== HX711 scale ===
@@ -471,28 +484,19 @@ void app_main(void)
 
 
 
-    //===============
-    //==== Servo ====
-    //===============
-    // enable servo power
-    gpio_set_level(CONFIG_SERVO_ENABLE_GPIO, 1);
-    // configure your servo
-    servo_config_t servo_cfg = {
-        .max_angle = 180,     // degrees
-        .min_width_us = 500,  // 0°
-        .max_width_us = 2500, // 180°
-        .freq = 50,           // 50 Hz standard
-        .timer_number = LEDC_TIMER_0,
-        .channels = {
-            .servo_pin = {CONFIG_SERVO_PWM_GPIO}, // your GPIO
-            .ch = {LEDC_CHANNEL_0},               // channel
-        }, // -> this servo is channel 0
-        .channel_number = 1,
+    //=======================
+    //==== Gate (Servo) =====
+    //=======================
+    gate_cfg_t gate_cfg = {
+        .mode = LEDC_LOW_SPEED_MODE,
+        .timer = LEDC_TIMER_0,
+        .ch = LEDC_CHANNEL_0,
+        .pwm_gpio = CONFIG_SERVO_PWM_GPIO,
+        .en_gpio = CONFIG_SERVO_ENABLE_GPIO,
+        .open_deg = 160.0f,
+        .close_deg = 10.0f,
     };
-    // init servo
-    ESP_ERROR_CHECK(iot_servo_init(LEDC_LOW_SPEED_MODE, &servo_cfg));
-    // operate servo:
-    //ESP_ERROR_CHECK(iot_servo_write_angle(LEDC_LOW_SPEED_MODE, /*channel=*/0, angle));
+    ESP_ERROR_CHECK(gate_init(&gate_cfg));
 
 
 
