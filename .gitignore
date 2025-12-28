@@ -30,6 +30,7 @@ managed_components
 # backup files
 pcb_*/*backups/
 *auto_saved_files*
+_autosave*.kicad_pcb
 *kicad_sch.lck
 *kicad_pcb.lck
 *.kicad_prl

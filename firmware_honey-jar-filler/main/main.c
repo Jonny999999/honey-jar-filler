@@ -11,6 +11,8 @@
 #include "ssd1306.h"
 #include "iot_servo.h"
 #include "driver/ledc.h"
+#include "motor.h"
+#include "gate.h"
 
 #include "config.h"
 #include "iotest.h"
@@ -158,11 +160,19 @@ static void task_display(void *arg)
 
     while(1) {
         //--- drain queues (show freshest data each frame) ---
-        // get last scale readout
+        // get last scale readout from queue (if used)
         scale_sample_t smp;
         while (cfg.q_scale && xQueueReceive(cfg.q_scale, &smp, 1) == pdPASS) {
             grams = smp.grams;
             valid = smp.valid;
+        }
+
+        // also read the latest snapshot (fast-path, no queue)
+        scale_latest_t latest;
+        scale_latest_get(&latest);
+        if (latest.ts_us != 0) {
+            grams = latest.grams;
+            valid = latest.valid;
         }
 
         // get last encoder event
@@ -213,15 +223,65 @@ static void task_display(void *arg)
 static void task_servoTest(void *arg)
 {
     while(1){
-    float angle = 90.0f; // center
-    ESP_ERROR_CHECK(iot_servo_write_angle(LEDC_LOW_SPEED_MODE, /*channel=*/0, angle));
-    vTaskDelay(pdMS_TO_TICKS(2000));
-    angle = 0.0f;
-    ESP_ERROR_CHECK(iot_servo_write_angle(LEDC_LOW_SPEED_MODE, /*channel=*/0, angle));
-    vTaskDelay(pdMS_TO_TICKS(2000));
+        // 100% = open, 0% = closed (works with inverted mechanics).
+        ESP_ERROR_CHECK(gate_set_percent(100.0f));
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        ESP_ERROR_CHECK(gate_set_percent(0.0f));
+        vTaskDelay(pdMS_TO_TICKS(2000));
     }
     //read back the last set angle (calculated)
-    //ESP_ERROR_CHECK(iot_servo_read_angle(LEDC_LOW_SPEED_MODE, 0, &angle));
+}
+
+
+
+
+
+// Task: raw servo calibration using encoder + OLED (no gate clamp).
+typedef struct {
+    ssd1306_handle_t disp;
+    QueueHandle_t    q_enc;
+} gate_calib_args_t;
+
+static void task_gate_calibrate(void *arg)
+{
+    gate_calib_args_t cfg = *(gate_calib_args_t*)arg;
+    vPortFree(arg);
+
+    float angle = 90.0f;     // start in a safe mid position
+    const float step = 1.0f; // degrees per encoder tick
+    bool dirty = true;
+
+    ESP_LOGI(TAG, "gate_cal: start angle=%.1f deg", (double)angle);
+    (void)iot_servo_write_angle(LEDC_LOW_SPEED_MODE, /*channel=*/0, angle);
+
+    TickType_t last = xTaskGetTickCount();
+    const TickType_t period = pdMS_TO_TICKS(100);
+
+    while (1) {
+        rotary_encoder_event_t ev;
+        if (xQueueReceive(cfg.q_enc, &ev, pdMS_TO_TICKS(20)) == pdPASS) {
+            if (ev.type == RE_ET_CHANGED) {
+                angle += (float)ev.diff * step;
+                if (angle < 0.0f) angle = 0.0f;
+                if (angle > 180.0f) angle = 180.0f;
+                ESP_LOGI(TAG, "gate_cal: angle=%.1f deg", (double)angle);
+                (void)iot_servo_write_angle(LEDC_LOW_SPEED_MODE, /*channel=*/0, angle);
+                dirty = true;
+            }
+        }
+
+        if (dirty && (xTaskGetTickCount() - last) >= period) {
+            last = xTaskGetTickCount();
+            dirty = false;
+
+            char line1[24];
+            ssd1306_clear(cfg.disp);
+            ssd1306_draw_text_scaled(cfg.disp, 0, LINE2PIXEL(0), "Gate Cal", true, 2);
+            snprintf(line1, sizeof(line1), "Angle: %5.1f", (double)angle);
+            ssd1306_draw_text_scaled(cfg.disp, 0, LINE2PIXEL(3), line1, true, 2);
+            ssd1306_display(cfg.disp);
+        }
+    }
 }
 
 
@@ -255,8 +315,6 @@ static void task_hardware_test(void *arg)
     const TickType_t poll = pdMS_TO_TICKS(10);
     const TickType_t relay_timeout = pdMS_TO_TICKS(5000);
     const int servo_cycles = 1;
-    const float servo_fwd = 90.0f;
-    const float servo_back = 0.0f;
 
     buzzer_beep(3, 100, 100);
 
@@ -301,10 +359,10 @@ static void task_hardware_test(void *arg)
         gpio_set_level(CONFIG_RELAY_MOTOR_GPIO, 0);
 
         for (int i = 0; i < servo_cycles; ++i) {
-            ESP_ERROR_CHECK(iot_servo_write_angle(LEDC_LOW_SPEED_MODE, /*channel=*/0, servo_fwd));
-            vTaskDelay(pdMS_TO_TICKS(500));
-            ESP_ERROR_CHECK(iot_servo_write_angle(LEDC_LOW_SPEED_MODE, /*channel=*/0, servo_back));
-            vTaskDelay(pdMS_TO_TICKS(500));
+            ESP_ERROR_CHECK(gate_set_percent(100));
+            vTaskDelay(pdMS_TO_TICKS(1500));
+            ESP_ERROR_CHECK(gate_set_percent(0));
+            vTaskDelay(pdMS_TO_TICKS(200));
         }
 
         buzzer_beep(2, 100, 100);
@@ -316,6 +374,35 @@ static void task_hardware_test(void *arg)
             vTaskDelay(poll);
         }
         vTaskDelay(pdMS_TO_TICKS(30));
+    }
+}
+
+
+
+
+// Task: toggle gate between 0% and 100% on button press.
+static void task_gate_toggle_test(void *arg)
+{
+    const TickType_t poll = pdMS_TO_TICKS(10);
+    const TickType_t debounce = pdMS_TO_TICKS(30);
+    bool is_open = false;
+
+    // Start closed.
+    ESP_ERROR_CHECK(gate_set_percent(0.0f));
+
+    while (1) {
+        if (gpio_get_level(CONFIG_BUTTON_1_GPIO) == 0) {
+            vTaskDelay(debounce);
+            if (gpio_get_level(CONFIG_BUTTON_1_GPIO) == 0) {
+                is_open = !is_open;
+                ESP_ERROR_CHECK(gate_set_percent(is_open ? 100.0f : 0.0f));
+                // Wait for release to avoid repeat toggles.
+                while (gpio_get_level(CONFIG_BUTTON_1_GPIO) == 0) {
+                    vTaskDelay(poll);
+                }
+            }
+        }
+        vTaskDelay(poll);
     }
 }
 
@@ -389,12 +476,19 @@ void app_main(void)
         ESP_ERROR_CHECK(nvs_flash_erase());
         ESP_ERROR_CHECK(nvs_flash_init());
     }
+    // Enable detailed gate logging for calibration.
+    esp_log_level_set("gate", ESP_LOG_DEBUG);
 
 
     //=============================
     //=== init Digital IO gpios ===
     //=============================
     gpio_init_all();
+
+    //===================
+    //=== Motor relay ===
+    //===================
+    motor_init(CONFIG_RELAY_MOTOR_GPIO);
 
 
     //===================
@@ -471,28 +565,20 @@ void app_main(void)
 
 
 
-    //===============
-    //==== Servo ====
-    //===============
-    // enable servo power
-    gpio_set_level(CONFIG_SERVO_ENABLE_GPIO, 1);
-    // configure your servo
-    servo_config_t servo_cfg = {
-        .max_angle = 180,     // degrees
-        .min_width_us = 500,  // 0°
-        .max_width_us = 2500, // 180°
-        .freq = 50,           // 50 Hz standard
-        .timer_number = LEDC_TIMER_0,
-        .channels = {
-            .servo_pin = {CONFIG_SERVO_PWM_GPIO}, // your GPIO
-            .ch = {LEDC_CHANNEL_0},               // channel
-        }, // -> this servo is channel 0
-        .channel_number = 1,
+    //=======================
+    //==== Gate (Servo) =====
+    //=======================
+    gate_cfg_t gate_cfg = {
+        .mode = LEDC_LOW_SPEED_MODE,
+        .timer = LEDC_TIMER_0,
+        .ch = LEDC_CHANNEL_0,
+        .pwm_gpio = CONFIG_SERVO_PWM_GPIO,
+        .en_gpio = CONFIG_SERVO_ENABLE_GPIO,
+        // If mechanics are inverted, set open_deg < close_deg.
+        .open_deg = 4.0f,
+        .close_deg = 102.5f,
     };
-    // init servo
-    ESP_ERROR_CHECK(iot_servo_init(LEDC_LOW_SPEED_MODE, &servo_cfg));
-    // operate servo:
-    //ESP_ERROR_CHECK(iot_servo_write_angle(LEDC_LOW_SPEED_MODE, /*channel=*/0, angle));
+    ESP_ERROR_CHECK(gate_init(&gate_cfg));
 
 
 
@@ -502,11 +588,6 @@ void app_main(void)
     //=======================
     //=== Start all tasks ===
     //=======================
-    //--- IO-test tasks ---
-    #if DEBUG_RUN_IOTEST
-    xTaskCreatePinnedToCore(iotest_input_monitor_task, "in_mon", 4096, NULL, 1, NULL, 1); // core=1, prio=1
-    xTaskCreatePinnedToCore(iotest_output_toggler_task, "out_chase", 4096, NULL, 5, NULL, tskNO_AFFINITY);
-    #endif
 
     //--- weight scale task ---
     // start producer - constantly reads HX711 and updates a queue
@@ -516,6 +597,9 @@ void app_main(void)
         pdMS_TO_TICKS(CONFIG_HX711_POLL_INTERVAL_MS), //sample period
         1,    // queue length - “latest only"
         &queue_hx711_readouts));
+
+
+
     // simple task consuming/logging all readouts
     #if DEBUG_LOG_SCALE_READOUTS
     xTaskCreatePinnedToCore(task_scale_log_readouts, "scale_cons", 4096, (void*)queue_hx711_readouts, 2, NULL, 1);
@@ -527,30 +611,46 @@ void app_main(void)
     xTaskCreatePinnedToCore(task_enc_consumer, "enc_consumer", 3072, queue_encoder_events, 4, NULL, 1);
     #endif
 
-    //--- display task ---
-    // notes: task conflicts with debug logging tasks above since those take out the events from queue already
+    //--- debug run modes: pick ONE for safety ---
+    #define DEBUG_MODE_NONE         0
+    #define DEBUG_MODE_GATE_CALIB   1  // raw servo control with encoder + OLED angle readout
+    #define DEBUG_MODE_SERVO_SWEEP  2  // simple gate open/close sweep
+    #define DEBUG_MODE_HARDWARE     3  // button-triggered IO test sequence (motor -> pos -> servo)
+    #define DEBUG_MODE_GATE_TOGGLE  4  // button toggles gate 0%/100%
+    #define DEBUG_MODE_POS_SWITCH   5  // beep on pos switch edge + toggle motor with button
+    #define DEBUG_MODE_IOTEST       6  // monitor inputs, cycle through outputs
+
+    // select active mode:
+    #define DEBUG_MODE DEBUG_MODE_GATE_TOGGLE
+
+    //--- display task (or raw gate calibration UI) ---
+    #if DEBUG_MODE == DEBUG_MODE_GATE_CALIB
+    gate_calib_args_t *cal_args = pvPortMalloc(sizeof(*cal_args));
+    cal_args->disp  = disp;
+    cal_args->q_enc = queue_encoder_events;
+    xTaskCreatePinnedToCore(task_gate_calibrate, "gate_cal", 4096, cal_args, 4, NULL, 1);
+    #else
+    // notes: UI task conflicts with encoder log task above (queue consumer).
     disp_args_t *args = pvPortMalloc(sizeof(*args));
     args->disp    = disp;
     args->q_scale = queue_hx711_readouts;     // recommend queue_len = 1 (latest sample)
-    args->q_enc   = queue_encoder_events; // from rotary_encoder_init()
+    args->q_enc   = queue_encoder_events;     // from rotary_encoder_init()
     xTaskCreatePinnedToCore(task_display, "ui_display", 4096, args, 4, NULL, 1);
+    #endif
 
-    //--- servo test task ---
-#define DEBUG_RUN_SERVO_TEST 0
-    #if DEBUG_RUN_SERVO_TEST
+    //--- one-of test tasks ---
+    #if DEBUG_MODE == DEBUG_MODE_SERVO_SWEEP
     xTaskCreatePinnedToCore(task_servoTest, "servo_test", 3072, queue_encoder_events, 4, NULL, 1);
-    #endif
-
-    //--- hardware test task ---
-#define DEBUG_RUN_HARDWARE_TEST 1
-    #if DEBUG_RUN_HARDWARE_TEST
+    #elif DEBUG_MODE == DEBUG_MODE_HARDWARE
     xTaskCreatePinnedToCore(task_hardware_test, "hw_test", 4096, NULL, 4, NULL, 1);
-    #endif
-
-    //--- pos switch edge + toggle motor test task ---
-#define DEBUG_RUN_POS_SWITCH_EDGE_TEST 0
-    #if DEBUG_RUN_POS_SWITC_EDGE_TEST
+    #elif DEBUG_MODE == DEBUG_MODE_GATE_TOGGLE
+    xTaskCreatePinnedToCore(task_gate_toggle_test, "gate_toggle", 3072, NULL, 4, NULL, 1);
+    #elif DEBUG_MODE == DEBUG_MODE_POS_SWITCH
     xTaskCreatePinnedToCore(task_pos_switch_test, "motor_edge_test", 3072, NULL, 4, NULL, 1);
+    //--- IO-test tasks ---
+    #elif DEBUG_MODE == DEBUG_MODE_IOTEST
+    xTaskCreatePinnedToCore(iotest_input_monitor_task, "in_mon", 4096, NULL, 1, NULL, 1); // core=1, prio=1
+    xTaskCreatePinnedToCore(iotest_output_toggler_task, "out_chase", 4096, NULL, 5, NULL, tskNO_AFFINITY);
     #endif
 
 
