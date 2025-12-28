@@ -4,6 +4,7 @@
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
 #include "esp_log.h"
+//#include "esp_rom_sys.h"
 #include "sdkconfig.h"
 #include "nvs_flash.h"
 #include "nvs.h"
@@ -13,10 +14,13 @@
 #include "driver/ledc.h"
 #include "motor.h"
 #include "gate.h"
+#include "ui_task.h"
+#include "filler_fsm.h"
 
 #include "config.h"
 #include "iotest.h"
 #include "scale_hx711.h"
+#include "app.h"
 
 static const char *TAG = "main";
 
@@ -458,6 +462,7 @@ static void task_pos_switch_test(void *arg)
 
 void app_main(void)
 {
+
     //=======================
     //=== Queues (shared) ===
     //=======================
@@ -476,8 +481,11 @@ void app_main(void)
         ESP_ERROR_CHECK(nvs_flash_erase());
         ESP_ERROR_CHECK(nvs_flash_init());
     }
-    // Enable detailed gate logging for calibration.
-    esp_log_level_set("gate", ESP_LOG_DEBUG);
+    // Enable verbose logging while debugging.
+    esp_log_level_set("*", ESP_LOG_DEBUG);
+
+    // Load persistent app parameters (targets/timeouts).
+    app_params_init();
 
 
     //=============================
@@ -498,6 +506,7 @@ void app_main(void)
     static scale_hx711_t scale;
     ESP_ERROR_CHECK(scale_hx711_init(&scale));
 
+    #define SCALE_RUN_CALIBRATION
 #ifdef SCALE_RUN_CALIBRATION //TODO: trigger this with UI
     // 1. zero readout (determine offset)
     printf("calibration: tare in 2 seconds... -> remove weight from scale\n");
@@ -588,6 +597,8 @@ void app_main(void)
     //=======================
     //=== Start all tasks ===
     //=======================
+    //--- filler FSM task ---
+    filler_start_task(4, 1);
 
     //--- weight scale task ---
     // start producer - constantly reads HX711 and updates a queue
@@ -621,7 +632,7 @@ void app_main(void)
     #define DEBUG_MODE_IOTEST       6  // monitor inputs, cycle through outputs
 
     // select active mode:
-    #define DEBUG_MODE DEBUG_MODE_GATE_TOGGLE
+    #define DEBUG_MODE DEBUG_MODE_NONE
 
     //--- display task (or raw gate calibration UI) ---
     #if DEBUG_MODE == DEBUG_MODE_GATE_CALIB
@@ -631,11 +642,8 @@ void app_main(void)
     xTaskCreatePinnedToCore(task_gate_calibrate, "gate_cal", 4096, cal_args, 4, NULL, 1);
     #else
     // notes: UI task conflicts with encoder log task above (queue consumer).
-    disp_args_t *args = pvPortMalloc(sizeof(*args));
-    args->disp    = disp;
-    args->q_scale = queue_hx711_readouts;     // recommend queue_len = 1 (latest sample)
-    args->q_enc   = queue_encoder_events;     // from rotary_encoder_init()
-    xTaskCreatePinnedToCore(task_display, "ui_display", 4096, args, 4, NULL, 1);
+    ui_task_set_encoder_queue(queue_encoder_events);
+    ui_task_start(disp, 4, 1);
     #endif
 
     //--- one-of test tasks ---
