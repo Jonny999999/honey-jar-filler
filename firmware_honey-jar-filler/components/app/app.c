@@ -44,12 +44,6 @@ void app_params_init(void)
         }
     }
 
-    esp_err_t err = nvs_flash_init();
-    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        (void)nvs_flash_erase();
-        err = nvs_flash_init();
-    }
-
     app_params_t defaults = app_params_defaults();
 
     // Serialize init/load to ensure consistent RAM state.
@@ -60,33 +54,38 @@ void app_params_init(void)
 
     s_params = defaults;
 
+    // Prefer caller-initialized NVS; if not initialized, fall back to defaults only.
+    bool need_save = false;
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &h);
+    if (err == ESP_ERR_NVS_NOT_INITIALIZED) {
+        s_params = defaults;
+        xSemaphoreGive(s_params_mtx);
+        return;
+    }
+
     if (err == ESP_OK) {
-        bool need_save = false;
-        nvs_handle_t h;
-        err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &h);
-        if (err == ESP_OK) {
-            size_t len = sizeof(s_params);
-            err = nvs_get_blob(h, NVS_KEY_PARAMS, &s_params, &len);
-            nvs_close(h);
-            if (err != ESP_OK || len != sizeof(s_params)) {
-                // Invalid or mismatched blob -> reset to defaults.
-                s_params = defaults;
-                need_save = true;
-            }
-        } else {
-            // No namespace yet -> write defaults once.
+        size_t len = sizeof(s_params);
+        err = nvs_get_blob(h, NVS_KEY_PARAMS, &s_params, &len);
+        nvs_close(h);
+        if (err != ESP_OK || len != sizeof(s_params)) {
+            // Invalid or mismatched blob -> reset to defaults.
             s_params = defaults;
             need_save = true;
         }
+    } else {
+        // No namespace yet -> write defaults once.
+        s_params = defaults;
+        need_save = true;
+    }
 
-        if (need_save) {
-            nvs_handle_t h_wr;
-            if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h_wr) == ESP_OK) {
-                if (nvs_set_blob(h_wr, NVS_KEY_PARAMS, &s_params, sizeof(s_params)) == ESP_OK) {
-                    (void)nvs_commit(h_wr);
-                }
-                nvs_close(h_wr);
+    if (need_save) {
+        nvs_handle_t h_wr;
+        if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h_wr) == ESP_OK) {
+            if (nvs_set_blob(h_wr, NVS_KEY_PARAMS, &s_params, sizeof(s_params)) == ESP_OK) {
+                (void)nvs_commit(h_wr);
             }
+            nvs_close(h_wr);
         }
     }
 
