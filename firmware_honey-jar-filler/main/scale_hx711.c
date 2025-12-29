@@ -60,9 +60,14 @@ static esp_err_t scale_nvs_load(scale_hx711_t *s)
 }
 
 
+#define DELAY_BEFORE_NVS_WRITE 1
 
 static esp_err_t scale_nvs_save(const scale_hx711_t *s)
 {
+    #if DELAY_BEFORE_NVS_WRITE
+    ESP_LOGI(TAG, "waiting 2s before open");
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    #endif
     nvs_handle_t h;
     esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h);
     if (err != ESP_OK) return err;
@@ -72,6 +77,7 @@ static esp_err_t scale_nvs_save(const scale_hx711_t *s)
     err = nvs_set_i32(h, NVS_KEY_OFFS, s->offset_raw);
     if (err == ESP_OK) err = nvs_set_blob(h, NVS_KEY_SCALE, &s->scale_cpg, sizeof(s->scale_cpg));
     if (err == ESP_OK) err = nvs_set_u8(h, NVS_KEY_VALID, ok);
+
     if (err == ESP_OK) err = nvs_commit(h);
     nvs_close(h);
 
