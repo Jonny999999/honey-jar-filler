@@ -3,6 +3,7 @@
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "nvs_flash.h"
+#include "scale_hx711.h"
 
 #include "nvs.h"
 
@@ -23,6 +24,7 @@ void app_main(void)
     }
 
     
+#define SIMPLE_WRITE
 #ifdef SIMPLE_WRITE
     // Simple NVS write test (no HX711).
 
@@ -31,12 +33,14 @@ void app_main(void)
 
     nvs_handle_t h;
     ESP_ERROR_CHECK(nvs_open("test", NVS_READWRITE, &h));
-    ESP_ERROR_CHECK(nvs_set_u32(h, "counter", 1));
-    ESP_ERROR_CHECK(nvs_commit(h));
-    nvs_close(h);
-    ESP_LOGI(TAG, "NVS write test: OK");
-
-    ESP_LOGI(TAG, "boot: minimal NVS + HX711 init");
+    uint32_t counter = 0;
+    while (1) {
+        counter++;
+        ESP_ERROR_CHECK(nvs_set_u32(h, "counter", counter));
+        ESP_ERROR_CHECK(nvs_commit(h));
+        ESP_LOGI(TAG, "NVS write OK: %u", (unsigned)counter);
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
 
 #else
 
