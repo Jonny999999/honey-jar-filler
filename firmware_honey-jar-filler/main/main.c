@@ -23,6 +23,9 @@ void app_main(void)
         ESP_ERROR_CHECK(nvs_flash_init());
     }
 
+
+// Issue with crash on nvs write located: strapping pin was pulled high by hx711 module resuling in wrong flash voltage selected
+// -> re-routed to gpio 19 using jumper wire
     
 #define SIMPLE_WRITE
 #ifdef SIMPLE_WRITE
