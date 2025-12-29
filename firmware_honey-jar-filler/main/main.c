@@ -22,16 +22,41 @@ void app_main(void)
         ESP_ERROR_CHECK(nvs_flash_init());
     }
 
+    
+#ifdef SIMPLE_WRITE
+    // Simple NVS write test (no HX711).
+
     //ESP_LOGI(TAG, "waiting 2s before nvs write...");
     //vTaskDelay(pdMS_TO_TICKS(2000));
 
-    // Simple NVS write test (no HX711).
     nvs_handle_t h;
     ESP_ERROR_CHECK(nvs_open("test", NVS_READWRITE, &h));
     ESP_ERROR_CHECK(nvs_set_u32(h, "counter", 1));
     ESP_ERROR_CHECK(nvs_commit(h));
     nvs_close(h);
     ESP_LOGI(TAG, "NVS write test: OK");
+
+    ESP_LOGI(TAG, "boot: minimal NVS + HX711 init");
+
+#else
+
+    // Init HX711 wrapper.
+    static scale_hx711_t scale;
+    ESP_ERROR_CHECK(scale_hx711_init(&scale));
+
+    // Simple tare + calibration sequence to force NVS write.
+    ESP_LOGI(TAG, "calibration: tare in 2 seconds... -> remove weight");
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    ESP_ERROR_CHECK(scale_hx711_tare(&scale, 16));
+
+    ESP_LOGI(TAG, "calibration: set 500g in 2 seconds...");
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    ESP_ERROR_CHECK(scale_hx711_calibrate(&scale, 500.0f, 16));
+
+#endif
+
+
+
 
     // Idle forever.
     while (1) {
