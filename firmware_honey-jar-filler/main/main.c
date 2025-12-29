@@ -506,8 +506,8 @@ void app_main(void)
     static scale_hx711_t scale;
     ESP_ERROR_CHECK(scale_hx711_init(&scale));
 
-    #define SCALE_RUN_CALIBRATION
-#ifdef SCALE_RUN_CALIBRATION //TODO: trigger this with UI
+    #define SCALE_RUN_CALIBRATION 0
+#if SCALE_RUN_CALIBRATION //TODO: trigger this with UI
     // 1. zero readout (determine offset)
     printf("calibration: tare in 2 seconds... -> remove weight from scale\n");
     vTaskDelay(pdMS_TO_TICKS(2000));
@@ -612,6 +612,7 @@ void app_main(void)
 
 
     // simple task consuming/logging all readouts
+    #define DEBUG_LOG_SCALE_READOUTS 0
     #if DEBUG_LOG_SCALE_READOUTS
     xTaskCreatePinnedToCore(task_scale_log_readouts, "scale_cons", 4096, (void*)queue_hx711_readouts, 2, NULL, 1);
     #endif

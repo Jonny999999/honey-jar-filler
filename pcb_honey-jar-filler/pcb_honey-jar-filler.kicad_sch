@@ -7885,7 +7885,7 @@
 	)
 	(rectangle
 		(start 294.64 163.83)
-		(end 307.34 171.45)
+		(end 344.17 171.45)
 		(stroke
 			(width 0)
 			(type default)
@@ -8043,6 +8043,17 @@
 		)
 		(uuid "1a283b17-0788-49f5-9747-619e8a8574ae")
 	)
+	(text "GPIO12 Must be low at boot! (nvs fail 1.8V)"
+		(exclude_from_sim no)
+		(at 200.406 164.084 0)
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+			(justify left)
+		)
+		(uuid "2212eb08-61e8-4bf5-885e-6fd094d3060a")
+	)
 	(text "Power terminals, testpoints"
 		(exclude_from_sim no)
 		(at 99.314 21.082 0)
@@ -8064,6 +8075,17 @@
 			)
 		)
 		(uuid "2b79f9a7-770b-4daa-b05f-0cce9b20c404")
+	)
+	(text "TODO next version:\n - Critical: do not use GPIO12 for HX711_DT (strapping pin) -> reroute\n - Add connector for front button input (currently using reserve terminal)\n - Add connector + decoupling for RGB LED-Strip\n - optimize servo power (optional, works currently)\n   - Add additional decoupling C for servo power\n   - Switch to 5A regulator"
+		(exclude_from_sim no)
+		(at 245.11 211.582 0)
+		(effects
+			(font
+				(size 1.524 1.524)
+			)
+			(justify left)
+		)
+		(uuid "3070617e-fa69-4e68-aff1-e46d351bd432")
 	)
 	(text "Encoder A/B: [R_up=3k3]; R_ser=1k; C=100n (R_up nopop for encoder module to work)\nEncoder Btn: R_up=10k; R_ser=2k2; C=100n\nButtons: R_up=10k; R_ser=1k; C=10u\nPos-Sw: R_up=10k; R_ser=1k; C=10u"
 		(exclude_from_sim no)
@@ -8154,6 +8176,17 @@
 			)
 		)
 		(uuid "6b0f196a-16d7-4c87-a48e-2b8259e9a328")
+	)
+	(text "HX711_DT currently wired to GPIO19"
+		(exclude_from_sim no)
+		(at 307.848 165.608 0)
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+			(justify left)
+		)
+		(uuid "6c5a824f-67b3-4210-b393-84d998e7375a")
 	)
 	(text "1: used for USB\n3: used for USB"
 		(exclude_from_sim no)
@@ -8331,6 +8364,17 @@
 			)
 		)
 		(uuid "db820ebc-7d86-4c4f-8460-8b647ff69ccd")
+	)
+	(text "HX711_DT currently wired to GPIO19"
+		(exclude_from_sim no)
+		(at 292.354 179.07 0)
+		(effects
+			(font
+				(size 1.27 1.27)
+			)
+			(justify left)
+		)
+		(uuid "e0aba618-99c9-48aa-be37-fcd43160bbad")
 	)
 	(text "Servo"
 		(exclude_from_sim no)

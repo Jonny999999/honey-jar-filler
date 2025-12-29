@@ -10,6 +10,9 @@
 #include "hx711.h"   // external HX711 component
 
 // Define GPIO pins the module is connected
+#include "config.h"
+
+// defaults if not set in config.h
 #ifndef CONFIG_HX711_DT_GPIO
 #define CONFIG_HX711_DT_GPIO  GPIO_NUM_12
 #endif
