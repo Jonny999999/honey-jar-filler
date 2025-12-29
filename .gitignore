@@ -22,6 +22,9 @@ settings.json
 # stl files are usually temporary
 *.stl
 
+*.3mf
+*.json 
+*.pdf
 # kicad 
 # backup files
 pcb_*/*backups/
