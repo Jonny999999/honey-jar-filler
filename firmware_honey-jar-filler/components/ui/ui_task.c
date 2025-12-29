@@ -10,6 +10,7 @@
 
 #include "encoder.h"
 #include "app.h"
+#include "buzzer.h"
 #include "config.h"
 #include "filler_fsm.h"
 #include "scale_hx711.h"
@@ -22,6 +23,9 @@
 
 // Encoder step for target grams.
 #define UI_TARGET_STEP_G 5.0f
+
+// Rate-limit encoder beeps to avoid continuous tone.
+#define UI_BEEP_MIN_INTERVAL_MS 80
 
 #define LINE2PIXEL(n) ((n) * 8)
 
@@ -56,20 +60,25 @@ static void ui_handle_button(filler_state_t st)
     last_btn = cur;
 }
 
-static void ui_handle_encoder(filler_state_t st)
+static void ui_handle_encoder(filler_state_t st, int32_t enc_delta, int64_t *last_beep_us)
 {
-    if (st != FILLER_IDLE || !s_enc_q) return;
+    // Only apply changes when idle or fault; always drain queue elsewhere.
+    if (enc_delta == 0) return;
+    if (st != FILLER_IDLE && st != FILLER_FAULT) return;
 
-    rotary_encoder_event_t ev;
-    while (xQueueReceive(s_enc_q, &ev, 0) == pdPASS) {
-        if (ev.type != RE_ET_CHANGED) continue;
+    app_params_t p;
+    app_params_get(&p);
+    p.target_grams += ((float)enc_delta * UI_TARGET_STEP_G);
+    if (p.target_grams < 0.0f) p.target_grams = 0.0f;
+    (void)app_params_set(&p);
+    ESP_LOGI(TAG, "encoder: target=%.1f g", (double)p.target_grams);
 
-        app_params_t p;
-        app_params_get(&p);
-        p.target_grams += ((float)ev.diff * UI_TARGET_STEP_G);
-        if (p.target_grams < 0.0f) p.target_grams = 0.0f;
-        (void)app_params_set(&p);
-        ESP_LOGI(TAG, "encoder: target=%.1f g", (double)p.target_grams);
+    if (last_beep_us) {
+        int64_t now_us = esp_timer_get_time();
+        if (now_us - *last_beep_us >= (UI_BEEP_MIN_INTERVAL_MS * 1000)) {
+            *last_beep_us = now_us;
+            buzzer_beep_ms(20);
+        }
     }
 }
 
@@ -116,18 +125,30 @@ static void task_ui(void *arg)
     filler_state_t last_state = FILLER_DONE;
     filler_fault_t last_fault = FLT_NONE;
 
-    TickType_t last = xTaskGetTickCount();
+    TickType_t next_refresh = xTaskGetTickCount() + pdMS_TO_TICKS(UI_PERIOD_MS);
     const TickType_t period = pdMS_TO_TICKS(UI_PERIOD_MS);
+    int64_t last_beep_us = 0;
 
     while (1) {
-        scale_latest_t latest = {0};
-        scale_latest_get(&latest);
+        // Wait for encoder events or for the next display refresh tick.
+        TickType_t now_ticks = xTaskGetTickCount();
+        TickType_t wait = (next_refresh > now_ticks) ? (next_refresh - now_ticks) : 0;
+        int32_t enc_delta = 0;
 
-        app_params_t params;
-        app_params_get(&params);
+        if (s_enc_q) {
+            rotary_encoder_event_t ev;
+            if (xQueueReceive(s_enc_q, &ev, wait) == pdPASS) {
+                if (ev.type == RE_ET_CHANGED) enc_delta += ev.diff;
+                // Drain any queued events quickly.
+                while (xQueueReceive(s_enc_q, &ev, 0) == pdPASS) {
+                    if (ev.type == RE_ET_CHANGED) enc_delta += ev.diff;
+                }
+            }
+        } else {
+            vTaskDelay(wait);
+        }
 
         filler_state_t st = filler_get_state();
-        uint8_t slot = filler_get_slot_idx();
         filler_fault_t flt = filler_get_fault();
 
         if (st != last_state) {
@@ -140,11 +161,20 @@ static void task_ui(void *arg)
         }
 
         ui_handle_button(st);
-        ui_handle_encoder(st);
+        ui_handle_encoder(st, enc_delta, &last_beep_us);
 
-        ui_render(cfg.disp, &latest, &params, st, slot, flt);
+        now_ticks = xTaskGetTickCount();
+        if (now_ticks >= next_refresh) {
+            scale_latest_t latest = {0};
+            scale_latest_get(&latest);
 
-        vTaskDelayUntil(&last, period);
+            app_params_t params;
+            app_params_get(&params);
+
+            uint8_t slot = filler_get_slot_idx();
+            ui_render(cfg.disp, &latest, &params, st, slot, flt);
+            next_refresh = now_ticks + period;
+        }
     }
 }
 

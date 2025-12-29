@@ -16,6 +16,7 @@
 #include "gate.h"
 #include "ui_task.h"
 #include "filler_fsm.h"
+#include "buzzer.h"
 
 #include "config.h"
 #include "iotest.h"
@@ -291,28 +292,6 @@ static void task_gate_calibrate(void *arg)
 
 
 
-static void buzzer_beep(uint8_t count, uint32_t on_ms, uint32_t off_ms)
-{
-    for (uint8_t i = 0; i < count; ++i) {
-        gpio_set_level(CONFIG_BUZZER_GPIO, 1);
-        vTaskDelay(pdMS_TO_TICKS(on_ms));
-        gpio_set_level(CONFIG_BUZZER_GPIO, 0);
-        if (i + 1 < count) {
-            vTaskDelay(pdMS_TO_TICKS(off_ms));
-        }
-    }
-}
-
-static void buzzer_pulse(uint32_t on_ms)
-{
-    gpio_set_level(CONFIG_BUZZER_GPIO, 1);
-    vTaskDelay(pdMS_TO_TICKS(on_ms));
-    gpio_set_level(CONFIG_BUZZER_GPIO, 0);
-}
-
-
-
-
 // Task: button-triggered hardware test sequence (LED, relay, servo, buzzer).
 static void task_hardware_test(void *arg)
 {
@@ -320,7 +299,7 @@ static void task_hardware_test(void *arg)
     const TickType_t relay_timeout = pdMS_TO_TICKS(5000);
     const int servo_cycles = 1;
 
-    buzzer_beep(3, 100, 100);
+    buzzer_beep_count(3, 100, 100);
 
     while (1) {
         // wait for BUTTON_1 press (active LOW)
@@ -334,7 +313,7 @@ static void task_hardware_test(void *arg)
 
         gpio_set_level(CONFIG_LED1_GPIO, 1);
         gpio_set_level(CONFIG_LED2_GPIO, 1);
-        buzzer_beep(1, 100, 100);
+        buzzer_beep_count(1, 100, 100);
 
         gpio_set_level(CONFIG_RELAY_MOTOR_GPIO, 1);
         TickType_t start = xTaskGetTickCount();
@@ -369,7 +348,7 @@ static void task_hardware_test(void *arg)
             vTaskDelay(pdMS_TO_TICKS(200));
         }
 
-        buzzer_beep(2, 100, 100);
+        buzzer_beep_count(2, 100, 100);
         gpio_set_level(CONFIG_LED1_GPIO, 0);
         gpio_set_level(CONFIG_LED2_GPIO, 0);
 
@@ -445,7 +424,7 @@ static void task_pos_switch_test(void *arg)
         {
             int pos = gpio_get_level(CONFIG_POS_SWITCH_GPIO);
             if (pos != last_pos) {
-                buzzer_pulse(pos ? beep_short_ms : beep_long_ms);
+                buzzer_beep_count(1, pos ? beep_short_ms : beep_long_ms, 0);
                 last_pos = pos;
             }
         }
@@ -492,6 +471,11 @@ void app_main(void)
     //=== init Digital IO gpios ===
     //=============================
     gpio_init_all();
+
+    //=====================
+    //=== Buzzer output ===
+    //=====================
+    buzzer_init(CONFIG_BUZZER_GPIO);
 
     //===================
     //=== Motor relay ===
@@ -597,8 +581,10 @@ void app_main(void)
     //=======================
     //=== Start all tasks ===
     //=======================
-    //--- filler FSM task ---
-    filler_start_task(4, 1);
+    //--- buzzer task ---
+    buzzer_task_start(3);
+    buzzer_beep_short(3);
+
 
     //--- weight scale task ---
     // start producer - constantly reads HX711 and updates a queue
@@ -660,11 +646,14 @@ void app_main(void)
     #elif DEBUG_MODE == DEBUG_MODE_IOTEST
     xTaskCreatePinnedToCore(iotest_input_monitor_task, "in_mon", 4096, NULL, 1, NULL, 1); // core=1, prio=1
     xTaskCreatePinnedToCore(iotest_output_toggler_task, "out_chase", 4096, NULL, 5, NULL, tskNO_AFFINITY);
+
+    #else
+
+    //--- filler FSM task ---
+    filler_start_task(4, 1);
+
+
     #endif
-
-
-
-
 
 
 
