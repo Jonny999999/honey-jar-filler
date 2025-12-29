@@ -22,10 +22,24 @@
 #define SCALE_STALE_US (2 * 1000 * 1000)
 
 // Target window for VERIFY_TARGET (grams).
-#define TARGET_TOL_LOW  3.0f
-#define TARGET_TOL_HIGH 5.0f
+#define TARGET_TOL_LOW  60.0f // if below that we swith to fill again to adjust/fill some more
+#define TARGET_TOL_HIGH 100.0f
+
+
+// Minimum motor run time before accepting POS switch (avoid immediate stop).
+#define FIND_IGNORE_MS 200
+// Step used to relax close-early offset after an underweight retry.
+#define CLOSE_EARLY_STEP_G 10.0f
 
 static const char *TAG = "filler_fsm";
+
+
+typedef enum {
+    GATE_CMD_NONE = 0,
+    GATE_CMD_OPEN,
+    GATE_CMD_CLOSE,
+    GATE_CMD_PERCENT
+} gate_cmd_t;
 
 static TaskHandle_t s_task;
 static portMUX_TYPE s_lock = portMUX_INITIALIZER_UNLOCKED;
@@ -34,6 +48,8 @@ static volatile filler_fault_t s_fault = FLT_NONE;
 static volatile uint8_t s_slot_idx = 0;
 static volatile bool s_start_req = false;
 static volatile bool s_abort_req = false;
+static gate_cmd_t s_gate_cmd = GATE_CMD_NONE;
+static float s_gate_pct = -1.0f;
 
 static void filler_set_state(filler_state_t st)
 {
@@ -86,6 +102,35 @@ static void filler_stop_all(void)
     ESP_LOGD(TAG, "stop all outputs");
     motor_set(false);
     (void)gate_close();
+    s_gate_cmd = GATE_CMD_CLOSE;
+    s_gate_pct = -1.0f;
+}
+
+static void gate_open_cached(void)
+{
+    if (s_gate_cmd != GATE_CMD_OPEN) {
+        (void)gate_open();
+        s_gate_cmd = GATE_CMD_OPEN;
+        s_gate_pct = -1.0f;
+    }
+}
+
+static void gate_close_cached(void)
+{
+    if (s_gate_cmd != GATE_CMD_CLOSE) {
+        (void)gate_close();
+        s_gate_cmd = GATE_CMD_CLOSE;
+        s_gate_pct = -1.0f;
+    }
+}
+
+static void gate_set_percent_cached(float pct)
+{
+    if (s_gate_cmd != GATE_CMD_PERCENT || s_gate_pct != pct) {
+        (void)gate_set_percent(pct);
+        s_gate_cmd = GATE_CMD_PERCENT;
+        s_gate_pct = pct;
+    }
 }
 
 static bool scale_is_stale(const scale_latest_t *s)
@@ -96,6 +141,26 @@ static bool scale_is_stale(const scale_latest_t *s)
     return age > SCALE_STALE_US;
 }
 
+static bool scale_require_fresh_or_fault(const char *ctx,
+                                         const scale_latest_t *s,
+                                         filler_state_t *state)
+{
+    if (!scale_is_stale(s)) return true;
+    if (ctx) {
+        ESP_LOGE(TAG, "scale stale (%s)", ctx);
+    } else {
+        ESP_LOGE(TAG, "scale stale");
+    }
+    filler_set_fault(FLT_SCALE_TIMEOUT);
+    if (state) {
+        *state = FILLER_FAULT;
+        filler_set_state(*state);
+    } else {
+        filler_set_state(FILLER_FAULT);
+    }
+    return false;
+}
+
 static void task_filler_fsm(void *arg)
 {
     (void)arg;
@@ -103,9 +168,8 @@ static void task_filler_fsm(void *arg)
     filler_state_t state = FILLER_IDLE;
     filler_state_t last_state = FILLER_DONE;
     int64_t state_enter_us = esp_timer_get_time();
-    bool target_adjusted = false;
-    bool adjust_active = false;
-    int64_t adjust_end_us = 0;
+    bool near_close_logged = false;
+    float close_early_g_cur = 0.0f;
 
     app_params_t params = {0};
 
@@ -123,9 +187,7 @@ static void task_filler_fsm(void *arg)
         if (state != last_state) {
             state_enter_us = esp_timer_get_time();
             app_params_get(&params);
-            target_adjusted = false;
-            adjust_active = false;
-            adjust_end_us = 0;
+            near_close_logged = false;
             ESP_LOGI(TAG, "state -> %s", filler_state_name(state));
             last_state = state;
 
@@ -143,15 +205,27 @@ static void task_filler_fsm(void *arg)
             case FILLER_VERIFY_EMPTY:
                 ESP_LOGD(TAG, "verify empty: motor off, gate closed");
                 motor_set(false);
-                (void)gate_close();
+                gate_close_cached();
+                break;
+            case FILLER_SLOT_SETTLE:
+                ESP_LOGD(TAG, "slot settle: motor off, gate closed");
+                motor_set(false);
+                gate_close_cached();
                 break;
             case FILLER_FILL:
                 ESP_LOGD(TAG, "fill: gate open");
-                (void)gate_open();
+                if (last_state != FILLER_VERIFY_TARGET) {
+                    close_early_g_cur = params.close_early_g;
+                }
+                gate_open_cached();
+                break;
+            case FILLER_DRIP_WAIT:
+                ESP_LOGD(TAG, "drip wait: gate closed");
+                gate_close_cached();
                 break;
             case FILLER_VERIFY_TARGET:
                 ESP_LOGD(TAG, "verify target: gate closed");
-                (void)gate_close();
+                gate_close_cached();
                 break;
             case FILLER_ADVANCE_NEXT:
                 ESP_LOGD(TAG, "advance: motor on");
@@ -170,6 +244,7 @@ static void task_filler_fsm(void *arg)
             // Waiting for start request.
             filler_set_fault(FLT_NONE);
             if (filler_take_start_req()) {
+                ESP_LOGI(TAG, "start: slots_total=%u", (unsigned)params.slots_total);
                 filler_set_slot(0);
                 state = FILLER_FIND_SLOT;
                 filler_set_state(state);
@@ -178,10 +253,11 @@ static void task_filler_fsm(void *arg)
 
         case FILLER_FIND_SLOT:
             // Advance until the position switch goes LOW or timeout.
-            if (gpio_get_level(CONFIG_POS_SWITCH_GPIO) == 0) {
+            if ((esp_timer_get_time() - state_enter_us) >= ((int64_t)FIND_IGNORE_MS * 1000) &&
+                gpio_get_level(CONFIG_POS_SWITCH_GPIO) == 0) {
                 ESP_LOGI(TAG, "slot found (pos switch low)");
                 motor_set(false);
-                state = FILLER_VERIFY_EMPTY;
+                state = FILLER_SLOT_SETTLE;
                 filler_set_state(state);
             } else if ((esp_timer_get_time() - state_enter_us) > ((int64_t)params.advance_timeout_ms * 1000)) {
                 motor_set(false);
@@ -191,13 +267,19 @@ static void task_filler_fsm(void *arg)
             }
             break;
 
+        case FILLER_SLOT_SETTLE: {
+            // Let the motor stop fully before reading the scale.
+            int64_t elapsed_us = esp_timer_get_time() - state_enter_us;
+            if (elapsed_us >= ((int64_t)params.slot_settle_ms * 1000)) {
+                state = FILLER_VERIFY_EMPTY;
+                filler_set_state(state);
+            }
+            break;
+        }
+
         case FILLER_VERIFY_EMPTY:
             // Check for an empty jar; reject heavy or stale readings.
-            if (scale_is_stale(&latest)) {
-                ESP_LOGE(TAG, "scale stale during verify empty");
-                filler_set_fault(FLT_SCALE_TIMEOUT);
-                state = FILLER_FAULT;
-                filler_set_state(state);
+            if (!scale_require_fresh_or_fault("verify empty", &latest, &state)) {
                 break;
             }
             if (fabsf(grams) < 50.0f) {
@@ -214,28 +296,33 @@ static void task_filler_fsm(void *arg)
 
         case FILLER_FILL: {
             // Open gate fully, then partially close near target.
-            if (scale_is_stale(&latest)) {
-                ESP_LOGE(TAG, "scale stale during fill");
-                filler_set_fault(FLT_SCALE_TIMEOUT);
-                state = FILLER_FAULT;
-                filler_set_state(state);
+            if (!scale_require_fresh_or_fault("fill", &latest, &state)) {
                 break;
             }
             float near_close = params.target_grams - params.near_close_delta_g;
+            float close_early = params.target_grams - close_early_g_cur;
             if (grams >= params.target_grams) {
                 ESP_LOGI(TAG, "target reached: %.1f g", (double)grams);
-                (void)gate_close();
-                state = FILLER_VERIFY_TARGET;
+                gate_close_cached();
+                state = FILLER_DRIP_WAIT;
+                filler_set_state(state);
+            } else if (grams >= close_early) {
+                ESP_LOGI(TAG, "close-early reached: %.1f g (offset %.1f g)", (double)grams, (double)close_early_g_cur);
+                gate_close_cached();
+                state = FILLER_DRIP_WAIT;
                 filler_set_state(state);
             } else if (grams >= near_close) {
-                ESP_LOGD(TAG, "near close: %.1f g -> partial gate", (double)grams);
-                (void)gate_set_percent(50.0f);
+                if (!near_close_logged) {
+                    ESP_LOGD(TAG, "near close: %.1f g -> partial gate", (double)grams);
+                    near_close_logged = true;
+                }
+                gate_set_percent_cached(params.near_close_gate_pct);
             } else {
-                (void)gate_open();
+                gate_open_cached();
             }
             if ((esp_timer_get_time() - state_enter_us) > ((int64_t)params.fill_timeout_ms * 1000)) {
                 ESP_LOGE(TAG, "fill timeout");
-                (void)gate_close();
+                gate_close_cached();
                 filler_set_fault(FLT_SERVO_TIMEOUT);
                 state = FILLER_FAULT;
                 filler_set_state(state);
@@ -243,45 +330,48 @@ static void task_filler_fsm(void *arg)
             break;
         }
 
-        case FILLER_VERIFY_TARGET: {
-            // Dwell, then accept target within tolerance; allow one correction.
-            if (scale_is_stale(&latest)) {
-                ESP_LOGE(TAG, "scale stale during verify target");
-                filler_set_fault(FLT_SCALE_TIMEOUT);
-                state = FILLER_FAULT;
-                filler_set_state(state);
-                break;
-            }
-            if (adjust_active) {
-                if (esp_timer_get_time() >= adjust_end_us) {
-                    ESP_LOGD(TAG, "top-up done, closing gate");
-                    (void)gate_close();
-                    adjust_active = false;
-                    state_enter_us = esp_timer_get_time();
-                }
-                break;
-            }
+        case FILLER_DRIP_WAIT: {
+            // Wait for honey to drip after closing gate.
             int64_t elapsed_us = esp_timer_get_time() - state_enter_us;
-            if (elapsed_us < ((int64_t)params.motor_dwell_ms * 1000)) {
+            if (elapsed_us >= ((int64_t)params.drip_delay_ms * 1000)) {
+                state = FILLER_VERIFY_TARGET;
+                filler_set_state(state);
+            }
+            break;
+        }
+
+        case FILLER_VERIFY_TARGET: {
+            // Check target window; re-fill if low, fault if high.
+            if (!scale_require_fresh_or_fault("verify target", &latest, &state)) {
                 break;
             }
-
-            if ((grams >= (params.target_grams - TARGET_TOL_LOW)) &&
-                (grams <= (params.target_grams + TARGET_TOL_HIGH))) {
-                ESP_LOGI(TAG, "target verified: %.1f g", (double)grams);
-                state = FILLER_ADVANCE_NEXT;
-                filler_set_state(state);
-            } else if (!target_adjusted && grams < (params.target_grams - TARGET_TOL_LOW)) {
-                // Single small top-up attempt (non-blocking).
-                ESP_LOGI(TAG, "top-up: %.1f g (target %.1f)", (double)grams, (double)params.target_grams);
-                (void)gate_set_percent(30.0f);
-                adjust_active = true;
-                adjust_end_us = esp_timer_get_time() + (300 * 1000);
-                target_adjusted = true;
-            } else {
-                ESP_LOGE(TAG, "target verify failed: %.1f g", (double)grams);
+            if (grams > (params.target_grams + TARGET_TOL_HIGH)) {
+                float over = grams - params.target_grams;
+                ESP_LOGE(TAG, "overweight: %.1f g (+%.1f g)", (double)grams, (double)over);
+                ESP_LOGW(TAG, "suggestion: increase close_early_g (now %.1f g)", (double)params.close_early_g);
                 filler_set_fault(FLT_WEIGHT_RANGE);
                 state = FILLER_FAULT;
+                filler_set_state(state);
+            } else if (grams < (params.target_grams - TARGET_TOL_LOW)) {
+                float under = params.target_grams - grams;
+                ESP_LOGI(TAG, "underweight: %.1f g (-%.1f g) -> refill", (double)grams, (double)under);
+                if (close_early_g_cur > 0.0f) {
+                    float prev = close_early_g_cur;
+                    close_early_g_cur -= CLOSE_EARLY_STEP_G;
+                    if (close_early_g_cur < 0.0f) close_early_g_cur = 0.0f;
+                    ESP_LOGI(TAG, "relax close_early_g: %.1f -> %.1f g", (double)prev, (double)close_early_g_cur);
+                    ESP_LOGW(TAG, "suggestion: decrease close_early_g (now %.1f g)", (double)params.close_early_g);
+                }
+                state = FILLER_FILL;
+                filler_set_state(state);
+            } else {
+                ESP_LOGI(TAG, "target verified: %.1f g", (double)grams);
+                uint8_t cur = filler_get_slot_idx();
+                if ((cur + 1) >= params.slots_total) {
+                    state = FILLER_DONE;
+                } else {
+                    state = FILLER_ADVANCE_NEXT;
+                }
                 filler_set_state(state);
             }
             break;
@@ -294,7 +384,8 @@ static void task_filler_fsm(void *arg)
                 motor_set(false);
                 uint8_t cur = filler_get_slot_idx();
                 uint8_t next = cur + 1;
-                ESP_LOGI(TAG, "advance: slot %u -> %u", (unsigned)cur, (unsigned)next);
+                ESP_LOGI(TAG, "advance: slot %u -> %u (total=%u)",
+                         (unsigned)cur, (unsigned)next, (unsigned)params.slots_total);
                 filler_set_slot(next);
                 if (next >= params.slots_total) {
                     state = FILLER_DONE;
@@ -382,6 +473,8 @@ const char *filler_state_name(filler_state_t st)
     case FILLER_FIND_SLOT:     return "FIND_SLOT";
     case FILLER_VERIFY_EMPTY:  return "VERIFY_EMPTY";
     case FILLER_FILL:          return "FILL";
+    case FILLER_SLOT_SETTLE:   return "SLOT_SETTLE";
+    case FILLER_DRIP_WAIT:     return "DRIP_WAIT";
     case FILLER_VERIFY_TARGET: return "VERIFY_TARGET";
     case FILLER_ADVANCE_NEXT:  return "ADVANCE_NEXT";
     case FILLER_DONE:          return "DONE";
