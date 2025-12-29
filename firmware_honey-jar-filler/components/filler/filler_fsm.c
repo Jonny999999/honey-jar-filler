@@ -10,6 +10,7 @@
 #include "esp_timer.h"
 
 #include "app.h"
+#include "buzzer.h"
 #include "gate.h"
 #include "motor.h"
 #include "config.h"
@@ -27,7 +28,7 @@
 
 
 // Minimum motor run time before accepting POS switch (avoid immediate stop).
-#define FIND_IGNORE_MS 200
+#define FIND_IGNORE_MS 500
 // Step used to relax close-early offset after an underweight retry.
 #define CLOSE_EARLY_STEP_G 10.0f
 
@@ -185,11 +186,23 @@ static void task_filler_fsm(void *arg)
 
         // State entry handling.
         if (state != last_state) {
+            filler_state_t prev_state = last_state;
             state_enter_us = esp_timer_get_time();
             app_params_get(&params);
             near_close_logged = false;
             ESP_LOGI(TAG, "state -> %s", filler_state_name(state));
             last_state = state;
+
+            // Audible state-change feedback.
+            if (state == FILLER_FIND_SLOT && prev_state == FILLER_IDLE) {
+                buzzer_beep_long(1); // start
+            } else if (state == FILLER_DONE) {
+                buzzer_beep_short(3); // finish
+            } else if (state == FILLER_FAULT) {
+                buzzer_beep_long(2); // failure
+            } else {
+                buzzer_beep_ms(20); // generic state change
+            }
 
             // Per-state entry actions.
             switch (state) {
@@ -282,15 +295,21 @@ static void task_filler_fsm(void *arg)
             if (!scale_require_fresh_or_fault("verify empty", &latest, &state)) {
                 break;
             }
-            if (fabsf(grams) < 50.0f) {
+            if (fabsf(grams) < 180.0f) {
                 ESP_LOGI(TAG, "empty jar verified (%.1f g)", (double)grams);
                 state = FILLER_FILL;
                 filler_set_state(state);
-            } else if (grams > (params.target_grams * 0.6f)) {
-                ESP_LOGE(TAG, "weight out of range (%.1f g)", (double)grams);
+            } else if (grams > (params.target_grams * 0.8f)) {
+                ESP_LOGE(TAG, "weight out of range (already full?) (%.1f g)", (double)grams);
                 filler_set_fault(FLT_WEIGHT_RANGE);
                 state = FILLER_FAULT;
                 filler_set_state(state);
+            } else {
+                ESP_LOGE(TAG, "unexpected weight (partially full?)(%.1f g)", (double)grams);
+                filler_set_fault(FLT_WEIGHT_RANGE);
+                state = FILLER_FAULT;
+                filler_set_state(state);
+
             }
             break;
 
