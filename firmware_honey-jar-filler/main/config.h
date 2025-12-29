@@ -39,7 +39,8 @@
 //=======================================
 //==== HX711 24 bit ADC (load-cell) =====
 //=======================================
-#define CONFIG_HX711_DT_GPIO        GPIO_NUM_12
+#define CONFIG_HX711_DT_GPIO        GPIO_NUM_19 // re-routed using jumper wire on the back
+//#define CONFIG_HX711_DT_GPIO        GPIO_NUM_12 //according to pcb layout, but causes crash on nvs write (strapping pin)
 #define CONFIG_HX711_SCK_GPIO       GPIO_NUM_13
 
 #define CONFIG_HX711_POLL_INTERVAL_MS 400 //AVG vs INTERVAL: consider one readout takes ~90ms 

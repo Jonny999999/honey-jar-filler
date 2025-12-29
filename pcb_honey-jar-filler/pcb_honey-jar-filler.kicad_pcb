@@ -43610,6 +43610,19 @@
 			)
 		)
 	)
+	(gr_text "TODO next version:\n  - Reroute H711 DT pin (currently jump wired to GPIO19)"
+		(at 163.4 59.8 0)
+		(layer "Cmts.User")
+		(uuid "96a7d6a7-85f1-4669-8a09-8f73bf976832")
+		(effects
+			(font
+				(size 2 2)
+				(thickness 0.4)
+				(bold yes)
+			)
+			(justify left top)
+		)
+	)
 	(gr_text "Changelog since tag {dblquote}pcb/v1.0-milled{dblquote}\n  - Fixed {dblquote}PWM{dblquote} text placed over pad\n  - Remove excess {dblquote}5V{dblquote} text"
 		(at 163.83 37.465 0)
 		(layer "Cmts.User")
