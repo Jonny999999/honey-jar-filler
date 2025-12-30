@@ -8,8 +8,8 @@
 //===== Input GPIO pins =====
 //===========================
 // all inputs are active LOW (switches wired to pull input to GND)
-#define CONFIG_ENCODER_A_GPIO     GPIO_NUM_36  // board pullup desoldered for encoder module to work
-#define CONFIG_ENCODER_B_GPIO     GPIO_NUM_39  // board pullup desoldered for encoder module to work
+#define CONFIG_ENCODER_A_GPIO     GPIO_NUM_39  // board pullup desoldered for encoder module to work
+#define CONFIG_ENCODER_B_GPIO     GPIO_NUM_36  // board pullup desoldered for encoder module to work
 #define CONFIG_ENCODER_SW_GPIO    GPIO_NUM_34
 
 #define CONFIG_POS_SWITCH_GPIO    GPIO_NUM_35
@@ -33,18 +33,19 @@
 #define CONFIG_RELAY_MOTOR_GPIO     GPIO_NUM_27
 #define CONFIG_RELAY_230V_GPIO      GPIO_NUM_2
 
+
 //============================
 //===== Optional disables ====
 //============================
 // 1 = disable output, 0 = normal operation.
-#define CONFIG_DISABLE_BUZZER      1
-#define CONFIG_DISABLE_SERVO       0
+#define CONFIG_DISABLE_BUZZER      0
 
 
 //============================
 //======= WS2812 LED =========
 //============================
 // Single-wire addressable LED strip (WS2812B).
+#define CONFIG_WS2812_ENABLE        1
 #define CONFIG_WS2812_GPIO          GPIO_NUM_23
 #define CONFIG_WS2812_LED_COUNT     50
 #define CONFIG_WS2812_MAX_BRIGHTNESS_PCT 15
@@ -58,8 +59,29 @@
 //#define CONFIG_HX711_DT_GPIO        GPIO_NUM_12 //according to pcb layout, but causes crash on nvs write (strapping pin)
 #define CONFIG_HX711_SCK_GPIO       GPIO_NUM_13
 
-#define CONFIG_HX711_POLL_INTERVAL_MS 400 //AVG vs INTERVAL: consider one readout takes ~90ms 
-#define CONFIG_HX711_AVG_SAMPLE_COUNT 4
+// sample interval / averaging - consider one readout takes ~90ms
+#define CONFIG_HX711_POLL_INTERVAL_MS 280 //note: INTERVAL > COUNT * 90ms
+#define CONFIG_HX711_AVG_SAMPLE_COUNT 3  //note: COUNT < INTERVAL / 90ms
+
+
+
+//===============================
+//====== I2C OLED Display =======
+//===============================
+#define CONFIG_DISPLAY_SDA_GPIO     GPIO_NUM_21
+#define CONFIG_DISPLAY_SCL_GPIO     GPIO_NUM_22
+
+
+
+//=======================
+//======== Servo ========
+//=======================
+#define CONFIG_DISABLE_SERVO       0
+#define CONFIG_SERVO_PWM_GPIO       GPIO_NUM_4  // Servo PWM Signal: directly connected to terminal (no pulldown present)
+#define CONFIG_SERVO_ENABLE_GPIO    GPIO_NUM_16  // P-MOSFET Enable supply for Servo (outputs 12V when HIGH)
+
+
+
 
 //=======================================
 //=========== Task priorities ===========
@@ -74,20 +96,3 @@
 #define CONFIG_TASK_CORE_HX711       0
 #define CONFIG_TASK_CORE_FSM         1
 #define CONFIG_TASK_CORE_UI          1
-
-
-
-//===============================
-//====== I2C OLED Display =======
-//===============================
-#define CONFIG_DISPLAY_SDA_GPIO     GPIO_NUM_21
-#define CONFIG_DISPLAY_SCL_GPIO     GPIO_NUM_22
-
-
-
-
-//=======================
-//======== Servo ========
-//=======================
-#define CONFIG_SERVO_PWM_GPIO       GPIO_NUM_4  // Servo PWM Signal: directly connected to terminal (no pulldown present)
-#define CONFIG_SERVO_ENABLE_GPIO    GPIO_NUM_16  // P-MOSFET Enable supply for Servo (outputs 12V when HIGH)

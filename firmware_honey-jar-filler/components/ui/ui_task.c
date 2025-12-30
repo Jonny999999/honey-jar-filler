@@ -17,10 +17,11 @@
 #include "scale_hx711.h"
 
 // UI refresh rate.
-#define UI_PERIOD_MS 200
+//#define UI_PERIOD_MS 200
+#define UI_PERIOD_MS CONFIG_HX711_POLL_INTERVAL_MS
 
 // Button debounce.
-#define UI_BTN_DEBOUNCE_MS 60
+#define UI_BTN_DEBOUNCE_MS 50
 
 // Encoder step for target grams.
 #define UI_TARGET_STEP_G 10.0f
@@ -29,10 +30,10 @@
 #define UI_WS2812_MAX_BRIGHTNESS_PCT CONFIG_WS2812_MAX_BRIGHTNESS_PCT
 
 // Rate-limit encoder beeps to avoid continuous tone.
-#define UI_BEEP_MIN_INTERVAL_MS 80
+#define UI_BEEP_MIN_INTERVAL_MS 50
 
 // LED animation for waiting/filling.
-#define UI_ANIM_PERIOD_MS 50
+#define UI_ANIM_PERIOD_MS 40
 #define UI_ANIM_BLOCK_LEN 4
 #define UI_ANIM_DIM_PCT 55
 
@@ -92,13 +93,13 @@ static void ui_get_state_color(filler_state_t st, filler_fault_t flt,
         *animated = true;
         break;
     case FILLER_SLOT_SETTLE:
+    case FILLER_VERIFY_TARGET:
     case FILLER_DRIP_WAIT:
         *r = 0; *g = 180; *b = 255; // cyan = waiting/settling
         *animated = true;
         break;
     case FILLER_FIND_SLOT:
     case FILLER_VERIFY_EMPTY:
-    case FILLER_VERIFY_TARGET:
     case FILLER_DONE:
     default:
         *r = 0; *g = 255; *b = 0; // green = active/ok
@@ -126,16 +127,12 @@ static void ui_render_anim_block(uint8_t r, uint8_t g, uint8_t b, int pos)
     (void)led_strip_refresh(s_strip);
 }
 
-static void ui_update_state_outputs(filler_state_t st, filler_fault_t flt)
+static void ui_update_state_outputs(filler_state_t st, uint8_t r, uint8_t g, uint8_t b)
 {
     // LED1/LED2 indicate active filling only.
     bool filling = (st == FILLER_FILL);
     gpio_set_level(CONFIG_LED1_GPIO, filling ? 1 : 0);
     gpio_set_level(CONFIG_LED2_GPIO, filling ? 1 : 0);
-
-    uint8_t r = 0, g = 0, b = 0;
-    bool animated = false;
-    ui_get_state_color(st, flt, &r, &g, &b, &animated);
     ui_ws2812_set_all(r, g, b);
 }
 
@@ -238,27 +235,28 @@ static void task_ui(void *arg)
     filler_state_t last_state = FILLER_DONE;
     filler_fault_t last_fault = FLT_NONE;
     int anim_pos = 0;
-    int64_t last_anim_us = 0;
+    bool anim_active = false;
+    uint8_t base_r = 0, base_g = 0, base_b = 0;
 
     TickType_t next_refresh = xTaskGetTickCount() + pdMS_TO_TICKS(UI_PERIOD_MS);
     const TickType_t period = pdMS_TO_TICKS(UI_PERIOD_MS);
+    const TickType_t anim_period = pdMS_TO_TICKS(UI_ANIM_PERIOD_MS);
+    TickType_t next_anim = 0;
     int64_t last_beep_us = 0;
 
     while (1) {
-        // Wait for encoder events or for the next display refresh tick.
+        // Calculate max required delay for this loop (display refresh and optional LED animation).
         TickType_t now_ticks = xTaskGetTickCount();
-        int64_t now_us = esp_timer_get_time();
-        int64_t next_anim_us = (last_anim_us == 0)
-            ? now_us
-            : (last_anim_us + (int64_t)UI_ANIM_PERIOD_MS * 1000);
         TickType_t wait_refresh = (next_refresh > now_ticks) ? (next_refresh - now_ticks) : 0;
-        TickType_t wait_anim = 0;
-        if (now_us < next_anim_us) {
-            wait_anim = pdMS_TO_TICKS((next_anim_us - now_us) / 1000);
+        TickType_t wait = wait_refresh;
+        if (anim_active) {
+            if (next_anim == 0) next_anim = now_ticks;
+            TickType_t wait_anim = (next_anim > now_ticks) ? (next_anim - now_ticks) : 0;
+            if (wait_anim < wait) wait = wait_anim;
         }
-        TickType_t wait = (wait_refresh < wait_anim) ? wait_refresh : wait_anim;
         int32_t enc_delta = 0;
 
+        // Consume encoder events (bounded by the wait time computed above).
         if (s_enc_q) {
             rotary_encoder_event_t ev;
             if (xQueueReceive(s_enc_q, &ev, wait) == pdPASS) {
@@ -275,33 +273,35 @@ static void task_ui(void *arg)
         filler_state_t st = filler_get_state();
         filler_fault_t flt = filler_get_fault();
 
-        if (st != last_state) {
-            ESP_LOGI(TAG, "state -> %s", filler_state_name(st));
-            last_state = st;
-            ui_update_state_outputs(st, flt);
+        // Update LEDs only when state/fault changes to avoid unnecessary refreshes.
+        if (st != last_state || flt != last_fault) {
+            if (st != last_state) {
+                ESP_LOGI(TAG, "state -> %s", filler_state_name(st));
+                last_state = st;
+            }
+            if (flt != last_fault) {
+                ESP_LOGI(TAG, "fault -> %s", filler_fault_name(flt));
+                last_fault = flt;
+            }
+            ui_get_state_color(st, flt, &base_r, &base_g, &base_b, &anim_active);
+            if (!s_strip) anim_active = false;
+            ui_update_state_outputs(st, base_r, base_g, base_b);
             anim_pos = 0;
-            last_anim_us = 0;
-        }
-        if (flt != last_fault) {
-            ESP_LOGI(TAG, "fault -> %s", filler_fault_name(flt));
-            last_fault = flt;
-            ui_update_state_outputs(st, flt);
+            next_anim = 0;
         }
 
         ui_handle_button(st);
         ui_handle_encoder(st, enc_delta, &last_beep_us);
 
-        {
-            uint8_t r = 0, g = 0, b = 0;
-            bool animated = false;
-            ui_get_state_color(st, flt, &r, &g, &b, &animated);
-            now_us = esp_timer_get_time();
-            if (animated && (last_anim_us == 0 || (now_us - last_anim_us) >= (UI_ANIM_PERIOD_MS * 1000))) {
-                ui_render_anim_block(r, g, b, anim_pos);
+        // Run lightweight LED animation ticks only when active.
+        if (anim_active) {
+            now_ticks = xTaskGetTickCount();
+            if (now_ticks >= next_anim) {
+                ui_render_anim_block(base_r, base_g, base_b, anim_pos);
                 if (CONFIG_WS2812_LED_COUNT > 0) {
                     anim_pos = (anim_pos + 1) % CONFIG_WS2812_LED_COUNT;
                 }
-                last_anim_us = now_us;
+                next_anim = now_ticks + anim_period;
             }
         }
 
