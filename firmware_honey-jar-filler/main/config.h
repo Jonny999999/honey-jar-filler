@@ -34,6 +34,14 @@
 #define CONFIG_RELAY_230V_GPIO      GPIO_NUM_2
 
 
+//============================
+//======= WS2812 LED =========
+//============================
+// Single-wire addressable LED strip (WS2812B).
+#define CONFIG_WS2812_GPIO          GPIO_NUM_23
+#define CONFIG_WS2812_LED_COUNT     50
+#define CONFIG_WS2812_MAX_BRIGHTNESS_PCT 15
+
 
  
 //=======================================

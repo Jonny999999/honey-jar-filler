@@ -10,6 +10,7 @@
 #include "nvs.h"
 #include "encoder.h"
 #include "ssd1306.h"
+#include "led_strip.h"
 #include "iot_servo.h"
 #include "driver/ledc.h"
 #include "motor.h"
@@ -24,6 +25,32 @@
 #include "app.h"
 
 static const char *TAG = "main";
+
+
+static led_strip_handle_t s_strip;
+
+static uint8_t ws2812_scale(uint8_t v)
+{
+    return (uint8_t)((v * CONFIG_WS2812_MAX_BRIGHTNESS_PCT) / 100);
+}
+
+static void ws2812_set_all(uint8_t r, uint8_t g, uint8_t b)
+{
+    if (!s_strip) return;
+    r = ws2812_scale(r);
+    g = ws2812_scale(g);
+    b = ws2812_scale(b);
+    for (int i = 0; i < CONFIG_WS2812_LED_COUNT; ++i) {
+        led_strip_set_pixel(s_strip, i, r, g, b);
+    }
+    (void)led_strip_refresh(s_strip);
+}
+
+static void ws2812_clear(void)
+{
+    if (!s_strip) return;
+    (void)led_strip_clear(s_strip);
+}
 
 void gpio_init_all(void)
 {
@@ -389,6 +416,56 @@ static void task_gate_toggle_test(void *arg)
     }
 }
 
+// Task: WS2812B strip test (cycle colors).
+static void task_ws2812_test(void *arg)
+{
+    (void)arg;
+    const TickType_t chase_delay = pdMS_TO_TICKS(30);
+    const TickType_t cycle_delay = pdMS_TO_TICKS(400);
+    const int block_len = 3;
+    int idx = 0;
+    while (1) {
+        // Sequence 1: red chase, two full laps.
+        for (int lap = 0; lap < 3; ++lap) {
+            for (int i = 0; i < CONFIG_WS2812_LED_COUNT; ++i) {
+                ws2812_clear();
+                if (s_strip) {
+                    led_strip_set_pixel(s_strip, i, ws2812_scale(255), 0, 0);
+                    (void)led_strip_refresh(s_strip);
+                }
+                vTaskDelay(chase_delay);
+            }
+        }
+
+        // Sequence 2: "working" pattern (green with darker green block).
+        for (int step = 0; step < (CONFIG_WS2812_LED_COUNT * 3); ++step) {
+            if (s_strip) {
+                for (int i = 0; i < CONFIG_WS2812_LED_COUNT; ++i) {
+                    int rel = (i - idx + CONFIG_WS2812_LED_COUNT) % CONFIG_WS2812_LED_COUNT;
+                    bool in_block = (rel < block_len);
+                    uint8_t g = in_block ? 80 : 255;
+                    led_strip_set_pixel(s_strip, i, 0, ws2812_scale(g), 0);
+                }
+                (void)led_strip_refresh(s_strip);
+            }
+            idx = (idx + 1) % CONFIG_WS2812_LED_COUNT;
+            vTaskDelay(chase_delay);
+        }
+
+        // Sequence 3: full-strip color cycle.
+        ws2812_set_all(255, 0, 0);
+        vTaskDelay(cycle_delay);
+        ws2812_set_all(0, 255, 0);
+        vTaskDelay(cycle_delay);
+        ws2812_set_all(0, 0, 255);
+        vTaskDelay(cycle_delay);
+        ws2812_set_all(255, 255, 255);
+        vTaskDelay(cycle_delay);
+        //ws2812_clear();
+        //vTaskDelay(cycle_delay);
+    }
+}
+
 
 
 
@@ -476,6 +553,27 @@ void app_main(void)
     //=== Buzzer output ===
     //=====================
     buzzer_init(CONFIG_BUZZER_GPIO);
+
+    //=====================
+    //=== WS2812 Strip ====
+    //=====================
+    led_strip_config_t strip_cfg = {
+        .strip_gpio_num = CONFIG_WS2812_GPIO,
+        .max_leds = CONFIG_WS2812_LED_COUNT,
+        .led_model = LED_MODEL_WS2812,
+        .color_component_format = LED_STRIP_COLOR_COMPONENT_FMT_GRB,
+        .flags.invert_out = false,
+    };
+    led_strip_rmt_config_t rmt_cfg = {
+        .clk_src = RMT_CLK_SRC_DEFAULT,
+        .resolution_hz = 10 * 1000 * 1000,
+        .flags.with_dma = false,
+    };
+    if (led_strip_new_rmt_device(&strip_cfg, &rmt_cfg, &s_strip) != ESP_OK) {
+        ESP_LOGW(TAG, "WS2812 init failed");
+    } else {
+        ws2812_clear();
+    }
 
     //===================
     //=== Motor relay ===
@@ -617,9 +715,10 @@ void app_main(void)
     #define DEBUG_MODE_GATE_TOGGLE  4  // button toggles gate 0%/100%
     #define DEBUG_MODE_POS_SWITCH   5  // beep on pos switch edge + toggle motor with button
     #define DEBUG_MODE_IOTEST       6  // monitor inputs, cycle through outputs
+    #define DEBUG_MODE_WS2812_TEST  7  // WS2812 strip test pattern
 
     // select active mode:
-    #define DEBUG_MODE DEBUG_MODE_NONE
+    #define DEBUG_MODE DEBUG_MODE_WS2812_TEST
 
     //--- display task (or raw gate calibration UI) ---
     #if DEBUG_MODE == DEBUG_MODE_GATE_CALIB
@@ -646,6 +745,8 @@ void app_main(void)
     #elif DEBUG_MODE == DEBUG_MODE_IOTEST
     xTaskCreatePinnedToCore(iotest_input_monitor_task, "in_mon", 4096, NULL, 1, NULL, 1); // core=1, prio=1
     xTaskCreatePinnedToCore(iotest_output_toggler_task, "out_chase", 4096, NULL, 5, NULL, tskNO_AFFINITY);
+    #elif DEBUG_MODE == DEBUG_MODE_WS2812_TEST
+    xTaskCreatePinnedToCore(task_ws2812_test, "ws2812_test", 3072, NULL, 3, NULL, 1);
 
     #else
 
