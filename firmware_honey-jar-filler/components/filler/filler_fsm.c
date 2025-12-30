@@ -22,7 +22,10 @@
 #define SCALE_STALE_US (2 * 1000 * 1000)
 
 // Step used to relax close-early offset after an underweight retry.
-#define CLOSE_EARLY_STEP_G 10.0f
+#define CLOSE_EARLY_STEP_PCT 4.0f
+
+// Require consecutive samples to confirm threshold crossings.
+#define THRESH_CONFIRM_COUNT 4
 
 static const char *TAG = "filler_fsm";
 
@@ -184,6 +187,48 @@ static bool scale_require_fresh_or_fault(const char *ctx,
     return false;
 }
 
+static bool stable_above(float value, float threshold, uint8_t *count, uint8_t required)
+{
+    if (!count || required == 0) return value >= threshold;
+    if (value >= threshold) {
+        if (*count < required) {
+            (*count)++;
+            ESP_LOGD(TAG, "stable_above: %.1f >= %.1f -> %u/%u", (double)value, (double)threshold,
+                     (unsigned)*count, (unsigned)required);
+        }
+    } else {
+        if (*count != 0) {
+            ESP_LOGD(TAG, "stable_above: %.1f < %.1f -> reset", (double)value, (double)threshold);
+        }
+        *count = 0;
+    }
+    if (*count >= required) {
+        ESP_LOGD(TAG, "stable_above: %.1f >= %.1f -> true", (double)value, (double)threshold);
+    }
+    return *count >= required;
+}
+
+static bool stable_below(float value, float threshold, uint8_t *count, uint8_t required)
+{
+    if (!count || required == 0) return value <= threshold;
+    if (value <= threshold) {
+        if (*count < required) {
+            (*count)++;
+            ESP_LOGD(TAG, "stable_below: %.1f <= %.1f -> %u/%u", (double)value, (double)threshold,
+                     (unsigned)*count, (unsigned)required);
+        }
+    } else {
+        if (*count != 0) {
+            ESP_LOGD(TAG, "stable_below: %.1f > %.1f -> reset", (double)value, (double)threshold);
+        }
+        *count = 0;
+    }
+    if (*count >= required) {
+        ESP_LOGD(TAG, "stable_below: %.1f <= %.1f -> true", (double)value, (double)threshold);
+    }
+    return *count >= required;
+}
+
 static void task_filler_fsm(void *arg)
 {
     (void)arg;
@@ -193,6 +238,14 @@ static void task_filler_fsm(void *arg)
     int64_t state_enter_us = esp_timer_get_time();
     bool near_close_logged = false;
     float close_early_g_cur = 0.0f;
+    float close_early_pct_cur = 0.0f;
+    uint8_t cnt_near_close = 0;
+    uint8_t cnt_close_early = 0;
+    uint8_t cnt_target = 0;
+    uint8_t cnt_under = 0;
+    uint8_t cnt_over = 0;
+    uint8_t sample_count = 0;
+    int64_t last_sample_ts = 0;
 
     app_params_t params = {0};
 
@@ -212,6 +265,13 @@ static void task_filler_fsm(void *arg)
             state_enter_us = esp_timer_get_time();
             app_params_get(&params);
             near_close_logged = false;
+            cnt_near_close = 0;
+            cnt_close_early = 0;
+            cnt_target = 0;
+            cnt_under = 0;
+            cnt_over = 0;
+            sample_count = 0;
+            last_sample_ts = 0;
             ESP_LOGI(TAG, "state -> %s", filler_state_name(state));
             last_state = state;
 
@@ -251,8 +311,9 @@ static void task_filler_fsm(void *arg)
                 break;
             case FILLER_FILL:
                 ESP_LOGD(TAG, "fill: gate open");
-                if (last_state != FILLER_VERIFY_TARGET) {
-                    close_early_g_cur = params.close_early_g;
+                if (prev_state != FILLER_VERIFY_TARGET) {
+                    close_early_pct_cur = params.close_early_pct;
+                    close_early_g_cur = params.target_grams * (close_early_pct_cur / 100.0f);
                 }
                 gate_set_percent_cached(params.max_gate_pct);
                 break;
@@ -271,6 +332,11 @@ static void task_filler_fsm(void *arg)
         scale_latest_t latest = {0};
         scale_latest_get(&latest);
         float grams = latest.grams;
+        bool new_sample = (latest.ts_us != 0 && latest.ts_us != last_sample_ts);
+        if (new_sample) {
+            last_sample_ts = latest.ts_us;
+            if (sample_count < 255) sample_count++;
+        }
 
         switch (state) {
         case FILLER_IDLE:
@@ -351,17 +417,30 @@ static void task_filler_fsm(void *arg)
             float rel_g = grams - (has_tare ? tare_g : 0.0f);
             float near_close = params.target_grams - params.near_close_delta_g;
             float close_early = params.target_grams - close_early_g_cur;
-            if (rel_g >= params.target_grams) {
+            if ((esp_timer_get_time() - state_enter_us) > ((int64_t)params.fill_timeout_ms * 1000)) {
+                ESP_LOGE(TAG, "fill timeout");
+                gate_close_cached();
+                filler_set_fault(FLT_SERVO_TIMEOUT);
+                state = FILLER_FAULT;
+                filler_set_state(state);
+                break;
+            }
+            if (!new_sample) {
+                // Keep last gate position until a fresh sample arrives.
+                break;
+            }
+            if (new_sample && stable_above(rel_g, params.target_grams, &cnt_target, THRESH_CONFIRM_COUNT)) {
                 ESP_LOGI(TAG, "target reached: rel=%.1f g abs=%.1f g", (double)rel_g, (double)grams);
                 gate_close_cached();
                 state = FILLER_DRIP_WAIT;
                 filler_set_state(state);
-            } else if (rel_g >= close_early) {
-                ESP_LOGI(TAG, "close-early reached: rel=%.1f g (offset %.1f g)", (double)rel_g, (double)close_early_g_cur);
+            } else if (new_sample && stable_above(rel_g, close_early, &cnt_close_early, THRESH_CONFIRM_COUNT)) {
+                ESP_LOGI(TAG, "close-early reached: rel=%.1f g (offset %.1f g / %.1f%%)",
+                         (double)rel_g, (double)close_early_g_cur, (double)close_early_pct_cur);
                 gate_close_cached();
                 state = FILLER_DRIP_WAIT;
                 filler_set_state(state);
-            } else if (rel_g >= near_close) {
+            } else if (new_sample && stable_above(rel_g, near_close, &cnt_near_close, THRESH_CONFIRM_COUNT)) {
                 if (!near_close_logged) {
                     ESP_LOGD(TAG, "near close: rel=%.1f g -> partial gate", (double)rel_g);
                     near_close_logged = true;
@@ -369,13 +448,6 @@ static void task_filler_fsm(void *arg)
                 gate_set_percent_cached(params.near_close_gate_pct);
             } else {
                 gate_set_percent_cached(params.max_gate_pct);
-            }
-            if ((esp_timer_get_time() - state_enter_us) > ((int64_t)params.fill_timeout_ms * 1000)) {
-                ESP_LOGE(TAG, "fill timeout");
-                gate_close_cached();
-                filler_set_fault(FLT_SERVO_TIMEOUT);
-                state = FILLER_FAULT;
-                filler_set_state(state);
             }
             break;
         }
@@ -400,28 +472,32 @@ static void task_filler_fsm(void *arg)
             float rel_g = grams - (has_tare ? tare_g : 0.0f);
             float tol_low_g = params.target_grams * (params.target_tol_low_pct / 100.0f);
             float tol_high_g = params.target_grams * (params.target_tol_high_pct / 100.0f);
-            if (rel_g > (params.target_grams + tol_high_g)) {
+            if (new_sample && stable_above(rel_g, params.target_grams + tol_high_g, &cnt_over, THRESH_CONFIRM_COUNT)) {
                 float over = rel_g - params.target_grams;
                 ESP_LOGE(TAG, "overweight: rel=%.1f g (+%.1f g, tol=+%.1f g)",
                          (double)rel_g, (double)over, (double)tol_high_g);
-                ESP_LOGW(TAG, "suggestion: increase close_early_g (now %.1f g)", (double)params.close_early_g);
+                ESP_LOGW(TAG, "suggestion: increase close_early_pct (now %.1f%%)", (double)params.close_early_pct);
                 filler_set_fault(FLT_WEIGHT_RANGE);
                 state = FILLER_FAULT;
                 filler_set_state(state);
-            } else if (rel_g < (params.target_grams - tol_low_g)) {
+            } else if (new_sample && stable_below(rel_g, params.target_grams - tol_low_g, &cnt_under, THRESH_CONFIRM_COUNT)) {
                 float under = params.target_grams - rel_g;
                 ESP_LOGI(TAG, "underweight: rel=%.1f g (-%.1f g, tol=-%.1f g) -> refill",
                          (double)rel_g, (double)under, (double)tol_low_g);
-                if (close_early_g_cur > 0.0f) {
-                    float prev = close_early_g_cur;
-                    close_early_g_cur -= CLOSE_EARLY_STEP_G;
-                    if (close_early_g_cur < 0.0f) close_early_g_cur = 0.0f;
-                    ESP_LOGI(TAG, "relax close_early_g: %.1f -> %.1f g", (double)prev, (double)close_early_g_cur);
-                    ESP_LOGW(TAG, "suggestion: decrease close_early_g (now %.1f g)", (double)params.close_early_g);
+                if (close_early_pct_cur > 0.0f) {
+                    float prev_pct = close_early_pct_cur;
+                    close_early_pct_cur -= CLOSE_EARLY_STEP_PCT;
+                    if (close_early_pct_cur < 0.0f) close_early_pct_cur = 0.0f;
+                    float prev_g = close_early_g_cur;
+                    close_early_g_cur = params.target_grams * (close_early_pct_cur / 100.0f);
+                    ESP_LOGI(TAG, "relax close_early: %.1f%% -> %.1f%% (%.1f g -> %.1f g)",
+                             (double)prev_pct, (double)close_early_pct_cur,
+                             (double)prev_g, (double)close_early_g_cur);
+                    ESP_LOGW(TAG, "suggestion: decrease close_early_pct (now %.1f%%)", (double)params.close_early_pct);
                 }
                 state = FILLER_FILL;
                 filler_set_state(state);
-            } else {
+            } else if (sample_count >= THRESH_CONFIRM_COUNT) {
                 ESP_LOGI(TAG, "target verified: rel=%.1f g", (double)rel_g);
                 uint8_t cur = filler_get_slot_idx();
                 uint8_t next = cur + 1;
