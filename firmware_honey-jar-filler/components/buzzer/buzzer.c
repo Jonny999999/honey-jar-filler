@@ -121,6 +121,7 @@ static void buzzer_enqueue(const buzzer_req_t *req)
     if (!req || !s_queue) return;
 
     if (!s_enabled) {
+        ESP_LOGD(TAG, "enqueue ignored (disabled)");
         buzzer_notify_done(req);
         return;
     }

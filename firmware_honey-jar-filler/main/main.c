@@ -52,6 +52,32 @@ static void ws2812_clear(void)
     (void)led_strip_clear(s_strip);
 }
 
+// Startup LED strip self-test (blocking, runs once).
+static void ws2812_startup_sequence(void)
+{
+    if (!s_strip) return;
+    const TickType_t delay = pdMS_TO_TICKS(20);
+
+    // Fast lap: red -> green -> blue gradient chase.
+    for (int i = 0; i < CONFIG_WS2812_LED_COUNT; ++i) {
+        ws2812_clear();
+        uint8_t r = (uint8_t)(255 - (i * 255 / (CONFIG_WS2812_LED_COUNT ? CONFIG_WS2812_LED_COUNT : 1)));
+        uint8_t g = (uint8_t)(i * 255 / (CONFIG_WS2812_LED_COUNT ? CONFIG_WS2812_LED_COUNT : 1));
+        uint8_t b = (uint8_t)(i * 255 / (CONFIG_WS2812_LED_COUNT ? CONFIG_WS2812_LED_COUNT : 1));
+        led_strip_set_pixel(s_strip, i, ws2812_scale(r), ws2812_scale(g), ws2812_scale(b));
+        (void)led_strip_refresh(s_strip);
+        vTaskDelay(delay);
+    }
+
+    // Loading bar: fill to idle color one LED at a time.
+    ws2812_clear();
+    for (int i = 0; i < CONFIG_WS2812_LED_COUNT; ++i) {
+        led_strip_set_pixel(s_strip, i, ws2812_scale(0), ws2812_scale(0), ws2812_scale(255));
+        (void)led_strip_refresh(s_strip);
+        vTaskDelay(delay);
+    }
+}
+
 void gpio_init_all(void)
 {
     ESP_LOGI(TAG, "Configuring GPIOs (simple)…");
@@ -549,10 +575,16 @@ void app_main(void)
     //=============================
     gpio_init_all();
 
+
     //=====================
     //=== Buzzer output ===
     //=====================
     buzzer_init(CONFIG_BUZZER_GPIO);
+    if (CONFIG_DISABLE_BUZZER) {
+        ESP_LOGW(TAG, "Note: buzzer disabled by config");
+        buzzer_set_enabled(false);
+    }
+
 
     //=====================
     //=== WS2812 Strip ====
@@ -574,6 +606,7 @@ void app_main(void)
     } else {
         ws2812_clear();
     }
+
 
     //===================
     //=== Motor relay ===
@@ -601,7 +634,6 @@ void app_main(void)
 #endif
 
 
-
     //======================
     //=== Rotary Encoder ===
     //======================
@@ -616,11 +648,8 @@ void app_main(void)
     };
     // Register encoder
     ESP_ERROR_CHECK(rotary_encoder_add(&enc));
-
     // (Optional) Acceleration for faster turning feel
     //ESP_ERROR_CHECK(rotary_encoder_enable_acceleration(&enc, 400));
-
-
 
 
     //===============
@@ -654,8 +683,6 @@ void app_main(void)
     //ssd1306_draw_text_scaled(disp, 0, 4, "SSD1306 I2C", true, 2);
 
 
-
-
     //=======================
     //==== Gate (Servo) =====
     //=======================
@@ -670,6 +697,10 @@ void app_main(void)
         .close_deg = 102.5f,
     };
     ESP_ERROR_CHECK(gate_init(&gate_cfg));
+    if (CONFIG_DISABLE_SERVO) {
+        ESP_LOGW(TAG, "Note: gate disabled by config");
+        gate_set_enabled(false);
+    }
 
 
 
@@ -681,7 +712,11 @@ void app_main(void)
     //=======================
     //--- buzzer task ---
     buzzer_task_start(3);
+
+
+    // --- STARTUP SEQUENCE ---
     buzzer_beep_short(3);
+    ws2812_startup_sequence();
 
 
     //--- weight scale task ---
@@ -694,19 +729,6 @@ void app_main(void)
         &queue_hx711_readouts));
 
 
-
-    // simple task consuming/logging all readouts
-    #define DEBUG_LOG_SCALE_READOUTS 0
-    #if DEBUG_LOG_SCALE_READOUTS
-    xTaskCreatePinnedToCore(task_scale_log_readouts, "scale_cons", 4096, (void*)queue_hx711_readouts, 2, NULL, 1);
-    #endif
-
-    //--- encoder log task---
-    // simple task to consume and log encoder events
-    #if DEBUG_LOG_ENCODER_EVENTS
-    xTaskCreatePinnedToCore(task_enc_consumer, "enc_consumer", 3072, queue_encoder_events, 4, NULL, 1);
-    #endif
-
     //--- debug run modes: pick ONE for safety ---
     #define DEBUG_MODE_NONE         0
     #define DEBUG_MODE_GATE_CALIB   1  // raw servo control with encoder + OLED angle readout
@@ -716,24 +738,19 @@ void app_main(void)
     #define DEBUG_MODE_POS_SWITCH   5  // beep on pos switch edge + toggle motor with button
     #define DEBUG_MODE_IOTEST       6  // monitor inputs, cycle through outputs
     #define DEBUG_MODE_WS2812_TEST  7  // WS2812 strip test pattern
+    #define DEBUG_MODE_LOG_SCALE    8  // log scale readouts
+    #define DEBUG_MODE_LOG_ENCODER  9  // log encoder events
 
     // select active mode:
-    #define DEBUG_MODE DEBUG_MODE_WS2812_TEST
+    #define DEBUG_MODE DEBUG_MODE_NONE
 
-    //--- display task (or raw gate calibration UI) ---
+    //--- one-of test tasks ---
     #if DEBUG_MODE == DEBUG_MODE_GATE_CALIB
     gate_calib_args_t *cal_args = pvPortMalloc(sizeof(*cal_args));
     cal_args->disp  = disp;
     cal_args->q_enc = queue_encoder_events;
     xTaskCreatePinnedToCore(task_gate_calibrate, "gate_cal", 4096, cal_args, 4, NULL, 1);
-    #else
-    // notes: UI task conflicts with encoder log task above (queue consumer).
-    ui_task_set_encoder_queue(queue_encoder_events);
-    ui_task_start(disp, 4, 1);
-    #endif
-
-    //--- one-of test tasks ---
-    #if DEBUG_MODE == DEBUG_MODE_SERVO_SWEEP
+    #elif DEBUG_MODE == DEBUG_MODE_SERVO_SWEEP
     xTaskCreatePinnedToCore(task_servoTest, "servo_test", 3072, queue_encoder_events, 4, NULL, 1);
     #elif DEBUG_MODE == DEBUG_MODE_HARDWARE
     xTaskCreatePinnedToCore(task_hardware_test, "hw_test", 4096, NULL, 4, NULL, 1);
@@ -747,12 +764,21 @@ void app_main(void)
     xTaskCreatePinnedToCore(iotest_output_toggler_task, "out_chase", 4096, NULL, 5, NULL, tskNO_AFFINITY);
     #elif DEBUG_MODE == DEBUG_MODE_WS2812_TEST
     xTaskCreatePinnedToCore(task_ws2812_test, "ws2812_test", 3072, NULL, 3, NULL, 1);
+    #elif DEBUG_MODE == DEBUG_MODE_LOG_SCALE
+    xTaskCreatePinnedToCore(task_scale_log_readouts, "scale_cons", 4096, (void*)queue_hx711_readouts, 2, NULL, 1);
+    #elif DEBUG_MODE == DEBUG_MODE_LOG_ENCODER
+    xTaskCreatePinnedToCore(task_enc_consumer, "enc_consumer", 3072, queue_encoder_events, 4, NULL, 1);
 
-    #else
+    
+    #else // when not in any debug mode, normal startup (FSM + UI task)
 
     //--- filler FSM task ---
     filler_start_task(4, 1);
 
+    //--- UI task ---
+    ui_task_set_encoder_queue(queue_encoder_events);
+    ui_task_set_led_strip(s_strip);
+    ui_task_start(disp, 4, 1);
 
     #endif
 

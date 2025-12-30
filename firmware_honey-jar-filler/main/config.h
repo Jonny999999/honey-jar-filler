@@ -33,6 +33,13 @@
 #define CONFIG_RELAY_MOTOR_GPIO     GPIO_NUM_27
 #define CONFIG_RELAY_230V_GPIO      GPIO_NUM_2
 
+//============================
+//===== Optional disables ====
+//============================
+// 1 = disable output, 0 = normal operation.
+#define CONFIG_DISABLE_BUZZER      1
+#define CONFIG_DISABLE_SERVO       1
+
 
 //============================
 //======= WS2812 LED =========
