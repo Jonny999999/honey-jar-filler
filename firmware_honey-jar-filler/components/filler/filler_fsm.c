@@ -27,8 +27,6 @@
 #define TARGET_TOL_HIGH 100.0f
 
 
-// Minimum motor run time before accepting POS switch (avoid immediate stop).
-#define FIND_IGNORE_MS 500
 // Step used to relax close-early offset after an underweight retry.
 #define CLOSE_EARLY_STEP_G 10.0f
 
@@ -240,10 +238,6 @@ static void task_filler_fsm(void *arg)
                 ESP_LOGD(TAG, "verify target: gate closed");
                 gate_close_cached();
                 break;
-            case FILLER_ADVANCE_NEXT:
-                ESP_LOGD(TAG, "advance: motor on");
-                motor_set(true);
-                break;
             }
         }
 
@@ -266,7 +260,7 @@ static void task_filler_fsm(void *arg)
 
         case FILLER_FIND_SLOT:
             // Advance until the position switch goes LOW or timeout.
-            if ((esp_timer_get_time() - state_enter_us) >= ((int64_t)FIND_IGNORE_MS * 1000) &&
+            if ((esp_timer_get_time() - state_enter_us) >= ((int64_t)params.find_ignore_ms * 1000) &&
                 gpio_get_level(CONFIG_POS_SWITCH_GPIO) == 0) {
                 ESP_LOGI(TAG, "slot found (pos switch low)");
                 motor_set(false);
@@ -386,24 +380,8 @@ static void task_filler_fsm(void *arg)
             } else {
                 ESP_LOGI(TAG, "target verified: %.1f g", (double)grams);
                 uint8_t cur = filler_get_slot_idx();
-                if ((cur + 1) >= params.slots_total) {
-                    state = FILLER_DONE;
-                } else {
-                    state = FILLER_ADVANCE_NEXT;
-                }
-                filler_set_state(state);
-            }
-            break;
-        }
-
-        case FILLER_ADVANCE_NEXT: {
-            // Pulse motor to advance to next slot.
-            int64_t elapsed_us = esp_timer_get_time() - state_enter_us;
-            if (elapsed_us >= ((int64_t)params.motor_dwell_ms * 1000)) {
-                motor_set(false);
-                uint8_t cur = filler_get_slot_idx();
                 uint8_t next = cur + 1;
-                ESP_LOGI(TAG, "advance: slot %u -> %u (total=%u)",
+                ESP_LOGI(TAG, "slot complete: %u -> %u (total=%u)",
                          (unsigned)cur, (unsigned)next, (unsigned)params.slots_total);
                 filler_set_slot(next);
                 if (next >= params.slots_total) {
@@ -495,7 +473,6 @@ const char *filler_state_name(filler_state_t st)
     case FILLER_SLOT_SETTLE:   return "SLOT_SETTLE";
     case FILLER_DRIP_WAIT:     return "DRIP_WAIT";
     case FILLER_VERIFY_TARGET: return "VERIFY_TARGET";
-    case FILLER_ADVANCE_NEXT:  return "ADVANCE_NEXT";
     case FILLER_DONE:          return "DONE";
     case FILLER_FAULT:         return "FAULT";
     default:                   return "?";

@@ -16,7 +16,7 @@ typedef struct {
     float    close_early_g;          // grams before target to fully close gate (compensates drip/in-flight)
     uint32_t fill_timeout_ms;        // max time allowed in FILL before fault
     uint32_t advance_timeout_ms;     // max time to find POS switch when advancing
-    uint32_t motor_dwell_ms;         // motor on-time to advance one slot (pulse length)
+    uint32_t find_ignore_ms;         // ignore POS switch for this long after motor start (aka motor min time on)
     uint32_t drip_delay_ms;          // wait after closing gate so drips fall into jar
     uint32_t slot_settle_ms;         // wait after slot found so motor/scale settles
     uint8_t  slots_total;            // total number of jars to fill in a run

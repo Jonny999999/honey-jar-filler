@@ -4,6 +4,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "ssd1306.h"
+#include "led_strip.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -11,6 +12,9 @@ extern "C" {
 
 // Provide the encoder event queue before starting the UI task.
 void ui_task_set_encoder_queue(QueueHandle_t q);
+
+// Provide the WS2812 strip handle (optional).
+void ui_task_set_led_strip(led_strip_handle_t strip);
 
 // Start the UI task (OLED + buttons + encoder).
 void ui_task_start(ssd1306_handle_t disp, UBaseType_t prio, BaseType_t core);

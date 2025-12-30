@@ -13,6 +13,7 @@
 #include "buzzer.h"
 #include "config.h"
 #include "filler_fsm.h"
+#include "led_strip.h"
 #include "scale_hx711.h"
 
 // UI refresh rate.
@@ -23,6 +24,9 @@
 
 // Encoder step for target grams.
 #define UI_TARGET_STEP_G 5.0f
+
+// LED strip brightness limit (% of 255). Override in config.h.
+#define UI_WS2812_MAX_BRIGHTNESS_PCT CONFIG_WS2812_MAX_BRIGHTNESS_PCT
 
 // Rate-limit encoder beeps to avoid continuous tone.
 #define UI_BEEP_MIN_INTERVAL_MS 80
@@ -35,7 +39,59 @@ typedef struct {
 
 static QueueHandle_t s_enc_q;
 static TaskHandle_t s_task;
+static led_strip_handle_t s_strip;
 static const char *TAG = "ui_task";
+
+static uint8_t ui_ws2812_scale(uint8_t v)
+{
+    return (uint8_t)((v * UI_WS2812_MAX_BRIGHTNESS_PCT) / 100);
+}
+
+static void ui_ws2812_set_all(uint8_t r, uint8_t g, uint8_t b)
+{
+    if (!s_strip) return;
+    r = ui_ws2812_scale(r);
+    g = ui_ws2812_scale(g);
+    b = ui_ws2812_scale(b);
+    for (int i = 0; i < CONFIG_WS2812_LED_COUNT; ++i) {
+        led_strip_set_pixel(s_strip, i, r, g, b);
+    }
+    (void)led_strip_refresh(s_strip);
+}
+
+static void ui_update_state_outputs(filler_state_t st, filler_fault_t flt)
+{
+    // LED1/LED2 indicate active filling only.
+    bool filling = (st == FILLER_FILL);
+    gpio_set_level(CONFIG_LED1_GPIO, filling ? 1 : 0);
+    gpio_set_level(CONFIG_LED2_GPIO, filling ? 1 : 0);
+
+    if (st == FILLER_FAULT) {
+        (void)flt;
+        ui_ws2812_set_all(255, 0, 0); // red
+        return;
+    }
+
+    switch (st) {
+    case FILLER_IDLE:
+        ui_ws2812_set_all(0, 0, 255); // blue = idle/ready
+        break;
+    case FILLER_FILL:
+        ui_ws2812_set_all(255, 180, 0); // amber = filling
+        break;
+    case FILLER_SLOT_SETTLE:
+    case FILLER_DRIP_WAIT:
+        ui_ws2812_set_all(0, 180, 255); // cyan = waiting/settling
+        break;
+    case FILLER_FIND_SLOT:
+    case FILLER_VERIFY_EMPTY:
+    case FILLER_VERIFY_TARGET:
+    case FILLER_DONE:
+    default:
+        ui_ws2812_set_all(0, 255, 0); // green = active/ok
+        break;
+    }
+}
 
 static void ui_handle_button(filler_state_t st)
 {
@@ -154,10 +210,12 @@ static void task_ui(void *arg)
         if (st != last_state) {
             ESP_LOGI(TAG, "state -> %s", filler_state_name(st));
             last_state = st;
+            ui_update_state_outputs(st, flt);
         }
         if (flt != last_fault) {
             ESP_LOGI(TAG, "fault -> %s", filler_fault_name(flt));
             last_fault = flt;
+            ui_update_state_outputs(st, flt);
         }
 
         ui_handle_button(st);
@@ -181,6 +239,11 @@ static void task_ui(void *arg)
 void ui_task_set_encoder_queue(QueueHandle_t q)
 {
     s_enc_q = q;
+}
+
+void ui_task_set_led_strip(led_strip_handle_t strip)
+{
+    s_strip = strip;
 }
 
 void ui_task_start(ssd1306_handle_t disp, UBaseType_t prio, BaseType_t core)

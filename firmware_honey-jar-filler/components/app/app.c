@@ -14,7 +14,7 @@ static app_params_t s_params;
 static const char *TAG = "app_params";
 
 // Bump to force defaults reload (when changing defaults/layout).
-#define APP_PARAMS_VERSION 3
+#define APP_PARAMS_VERSION 4
 
 // Centralized defaults for persistent parameters.
 static app_params_t app_params_defaults(void)
@@ -35,8 +35,8 @@ static app_params_t app_params_defaults(void)
         .fill_timeout_ms    = 300000,
         // Max time to find the position switch while advancing (ms).
         .advance_timeout_ms = 4000,
-        // Motor pulse length to advance one slot (ms).
-        .motor_dwell_ms     = 1000,
+        // Ignore POS switch for this long after motor start (ms) (aka motor min on time)
+        .find_ignore_ms     = 500,
         // Wait after closing gate so drips fall into the jar (ms).
         .drip_delay_ms      = 4000,
         // Wait after slot found so motor/scale settles before weighing (ms).
@@ -120,7 +120,7 @@ void app_params_init(void)
              "  close_early_g=%.1f g\n"
              "  fill_timeout_ms=%u\n"
              "  advance_timeout_ms=%u\n"
-             "  motor_dwell_ms=%u\n"
+             "  find_ignore_ms=%u\n"
              "  drip_delay_ms=%u\n"
              "  slot_settle_ms=%u\n"
              "  slots_total=%u",
@@ -131,7 +131,7 @@ void app_params_init(void)
              (double)s_params.close_early_g,
              (unsigned)s_params.fill_timeout_ms,
              (unsigned)s_params.advance_timeout_ms,
-             (unsigned)s_params.motor_dwell_ms,
+             (unsigned)s_params.find_ignore_ms,
              (unsigned)s_params.drip_delay_ms,
              (unsigned)s_params.slot_settle_ms,
              (unsigned)s_params.slots_total);

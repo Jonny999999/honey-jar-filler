@@ -16,7 +16,6 @@ typedef enum {
     FILLER_SLOT_SETTLE,
     FILLER_DRIP_WAIT,
     FILLER_VERIFY_TARGET,
-    FILLER_ADVANCE_NEXT,
     FILLER_DONE,
     FILLER_FAULT
 } filler_state_t;
