@@ -37,6 +37,7 @@ void filler_request_abort(void);  // set an atomic flag
 filler_state_t filler_get_state(void);
 uint8_t filler_get_slot_idx(void);
 filler_fault_t filler_get_fault(void);
+bool filler_get_jar_tare(float *out_grams);
 const char *filler_state_name(filler_state_t st);
 const char *filler_fault_name(filler_fault_t flt);
 

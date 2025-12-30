@@ -23,13 +23,18 @@
 #define UI_BTN_DEBOUNCE_MS 30
 
 // Encoder step for target grams.
-#define UI_TARGET_STEP_G 5.0f
+#define UI_TARGET_STEP_G 10.0f
 
 // LED strip brightness limit (% of 255). Override in config.h.
 #define UI_WS2812_MAX_BRIGHTNESS_PCT CONFIG_WS2812_MAX_BRIGHTNESS_PCT
 
 // Rate-limit encoder beeps to avoid continuous tone.
 #define UI_BEEP_MIN_INTERVAL_MS 80
+
+// LED animation for waiting/filling.
+#define UI_ANIM_PERIOD_MS 40
+#define UI_ANIM_BLOCK_LEN 3
+#define UI_ANIM_DIM_PCT 55
 
 #define LINE2PIXEL(n) ((n) * 8)
 
@@ -59,6 +64,68 @@ static void ui_ws2812_set_all(uint8_t r, uint8_t g, uint8_t b)
     (void)led_strip_refresh(s_strip);
 }
 
+static void ui_ws2812_set_pixel(int idx, uint8_t r, uint8_t g, uint8_t b)
+{
+    if (!s_strip) return;
+    r = ui_ws2812_scale(r);
+    g = ui_ws2812_scale(g);
+    b = ui_ws2812_scale(b);
+    led_strip_set_pixel(s_strip, idx, r, g, b);
+}
+
+static void ui_get_state_color(filler_state_t st, filler_fault_t flt,
+                               uint8_t *r, uint8_t *g, uint8_t *b, bool *animated)
+{
+    *animated = false;
+    if (st == FILLER_FAULT) {
+        (void)flt;
+        *r = 255; *g = 0; *b = 0; // red
+        return;
+    }
+
+    switch (st) {
+    case FILLER_IDLE:
+        *r = 0; *g = 0; *b = 255; // blue = idle/ready
+        break;
+    case FILLER_FILL:
+        *r = 255; *g = 180; *b = 0; // amber = filling
+        *animated = true;
+        break;
+    case FILLER_SLOT_SETTLE:
+    case FILLER_DRIP_WAIT:
+        *r = 0; *g = 180; *b = 255; // cyan = waiting/settling
+        *animated = true;
+        break;
+    case FILLER_FIND_SLOT:
+    case FILLER_VERIFY_EMPTY:
+    case FILLER_VERIFY_TARGET:
+    case FILLER_DONE:
+    default:
+        *r = 0; *g = 255; *b = 0; // green = active/ok
+        break;
+    }
+}
+
+static void ui_render_anim_block(uint8_t r, uint8_t g, uint8_t b, int pos)
+{
+    if (!s_strip) return;
+    int count = CONFIG_WS2812_LED_COUNT;
+    if (count <= 0) return;
+
+    uint8_t dr = (uint8_t)((r * UI_ANIM_DIM_PCT) / 100);
+    uint8_t dg = (uint8_t)((g * UI_ANIM_DIM_PCT) / 100);
+    uint8_t db = (uint8_t)((b * UI_ANIM_DIM_PCT) / 100);
+
+    for (int i = 0; i < count; ++i) {
+        ui_ws2812_set_pixel(i, r, g, b);
+    }
+    for (int i = 0; i < UI_ANIM_BLOCK_LEN; ++i) {
+        int idx = (pos + i) % count;
+        ui_ws2812_set_pixel(idx, dr, dg, db);
+    }
+    (void)led_strip_refresh(s_strip);
+}
+
 static void ui_update_state_outputs(filler_state_t st, filler_fault_t flt)
 {
     // LED1/LED2 indicate active filling only.
@@ -66,31 +133,10 @@ static void ui_update_state_outputs(filler_state_t st, filler_fault_t flt)
     gpio_set_level(CONFIG_LED1_GPIO, filling ? 1 : 0);
     gpio_set_level(CONFIG_LED2_GPIO, filling ? 1 : 0);
 
-    if (st == FILLER_FAULT) {
-        (void)flt;
-        ui_ws2812_set_all(255, 0, 0); // red
-        return;
-    }
-
-    switch (st) {
-    case FILLER_IDLE:
-        ui_ws2812_set_all(0, 0, 255); // blue = idle/ready
-        break;
-    case FILLER_FILL:
-        ui_ws2812_set_all(255, 180, 0); // amber = filling
-        break;
-    case FILLER_SLOT_SETTLE:
-    case FILLER_DRIP_WAIT:
-        ui_ws2812_set_all(0, 180, 255); // cyan = waiting/settling
-        break;
-    case FILLER_FIND_SLOT:
-    case FILLER_VERIFY_EMPTY:
-    case FILLER_VERIFY_TARGET:
-    case FILLER_DONE:
-    default:
-        ui_ws2812_set_all(0, 255, 0); // green = active/ok
-        break;
-    }
+    uint8_t r = 0, g = 0, b = 0;
+    bool animated = false;
+    ui_get_state_color(st, flt, &r, &g, &b, &animated);
+    ui_ws2812_set_all(r, g, b);
 }
 
 static void ui_handle_button(filler_state_t st)
@@ -143,7 +189,9 @@ static void ui_render(ssd1306_handle_t disp,
                       const app_params_t *p,
                       filler_state_t st,
                       uint8_t slot,
-                      filler_fault_t flt)
+                      filler_fault_t flt,
+                      bool has_tare,
+                      float tare_g)
 {
     char line1[24];
     char line2[32];
@@ -152,8 +200,17 @@ static void ui_render(ssd1306_handle_t disp,
     ssd1306_clear(disp);
 
     // Line 1: big current weight.
-    if (s && s->valid) snprintf(line1, sizeof(line1), "%.1f g", (double)s->grams);
-    else snprintf(line1, sizeof(line1), "--.- g");
+    if (s && s->valid) {
+        float shown_g = s->grams;
+        char prefix = 'A';
+        if (has_tare) {
+            shown_g -= tare_g;
+            prefix = 'R';
+        }
+        snprintf(line1, sizeof(line1), "%c%.1f g", prefix, (double)shown_g);
+    } else {
+        snprintf(line1, sizeof(line1), "--.- g");
+    }
     ssd1306_draw_text_scaled(disp, 0, LINE2PIXEL(0), line1, true, 3);
 
     // Line 2: state + slot.
@@ -180,6 +237,8 @@ static void task_ui(void *arg)
 
     filler_state_t last_state = FILLER_DONE;
     filler_fault_t last_fault = FLT_NONE;
+    int anim_pos = 0;
+    int64_t last_anim_us = 0;
 
     TickType_t next_refresh = xTaskGetTickCount() + pdMS_TO_TICKS(UI_PERIOD_MS);
     const TickType_t period = pdMS_TO_TICKS(UI_PERIOD_MS);
@@ -188,7 +247,16 @@ static void task_ui(void *arg)
     while (1) {
         // Wait for encoder events or for the next display refresh tick.
         TickType_t now_ticks = xTaskGetTickCount();
-        TickType_t wait = (next_refresh > now_ticks) ? (next_refresh - now_ticks) : 0;
+        int64_t now_us = esp_timer_get_time();
+        int64_t next_anim_us = (last_anim_us == 0)
+            ? now_us
+            : (last_anim_us + (int64_t)UI_ANIM_PERIOD_MS * 1000);
+        TickType_t wait_refresh = (next_refresh > now_ticks) ? (next_refresh - now_ticks) : 0;
+        TickType_t wait_anim = 0;
+        if (now_us < next_anim_us) {
+            wait_anim = pdMS_TO_TICKS((next_anim_us - now_us) / 1000);
+        }
+        TickType_t wait = (wait_refresh < wait_anim) ? wait_refresh : wait_anim;
         int32_t enc_delta = 0;
 
         if (s_enc_q) {
@@ -211,6 +279,8 @@ static void task_ui(void *arg)
             ESP_LOGI(TAG, "state -> %s", filler_state_name(st));
             last_state = st;
             ui_update_state_outputs(st, flt);
+            anim_pos = 0;
+            last_anim_us = 0;
         }
         if (flt != last_fault) {
             ESP_LOGI(TAG, "fault -> %s", filler_fault_name(flt));
@@ -221,6 +291,20 @@ static void task_ui(void *arg)
         ui_handle_button(st);
         ui_handle_encoder(st, enc_delta, &last_beep_us);
 
+        {
+            uint8_t r = 0, g = 0, b = 0;
+            bool animated = false;
+            ui_get_state_color(st, flt, &r, &g, &b, &animated);
+            now_us = esp_timer_get_time();
+            if (animated && (last_anim_us == 0 || (now_us - last_anim_us) >= (UI_ANIM_PERIOD_MS * 1000))) {
+                ui_render_anim_block(r, g, b, anim_pos);
+                if (CONFIG_WS2812_LED_COUNT > 0) {
+                    anim_pos = (anim_pos + 1) % CONFIG_WS2812_LED_COUNT;
+                }
+                last_anim_us = now_us;
+            }
+        }
+
         now_ticks = xTaskGetTickCount();
         if (now_ticks >= next_refresh) {
             scale_latest_t latest = {0};
@@ -230,7 +314,9 @@ static void task_ui(void *arg)
             app_params_get(&params);
 
             uint8_t slot = filler_get_slot_idx();
-            ui_render(cfg.disp, &latest, &params, st, slot, flt);
+            float tare_g = 0.0f;
+            bool has_tare = filler_get_jar_tare(&tare_g);
+            ui_render(cfg.disp, &latest, &params, st, slot, flt, has_tare, tare_g);
             next_refresh = now_ticks + period;
         }
     }

@@ -1,7 +1,6 @@
 #include "filler_fsm.h"
 
 #include <stdbool.h>
-#include <math.h>
 
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -21,11 +20,6 @@
 
 // Consider scale stale if no update for this long.
 #define SCALE_STALE_US (2 * 1000 * 1000)
-
-// Target window for VERIFY_TARGET (grams).
-#define TARGET_TOL_LOW  60.0f // if below that we swith to fill again to adjust/fill some more
-#define TARGET_TOL_HIGH 100.0f
-
 
 // Step used to relax close-early offset after an underweight retry.
 #define CLOSE_EARLY_STEP_G 10.0f
@@ -47,6 +41,8 @@ static volatile filler_fault_t s_fault = FLT_NONE;
 static volatile uint8_t s_slot_idx = 0;
 static volatile bool s_start_req = false;
 static volatile bool s_abort_req = false;
+static volatile bool s_has_jar_tare = false;
+static float s_jar_tare_g = 0.0f;
 static gate_cmd_t s_gate_cmd = GATE_CMD_NONE;
 static float s_gate_pct = -1.0f;
 
@@ -94,6 +90,34 @@ static void filler_set_slot(uint8_t idx)
     taskENTER_CRITICAL(&s_lock);
     s_slot_idx = idx;
     taskEXIT_CRITICAL(&s_lock);
+}
+
+static void jar_tare_clear(void)
+{
+    taskENTER_CRITICAL(&s_lock);
+    s_has_jar_tare = false;
+    s_jar_tare_g = 0.0f;
+    taskEXIT_CRITICAL(&s_lock);
+}
+
+static void jar_tare_set(float grams)
+{
+    taskENTER_CRITICAL(&s_lock);
+    s_has_jar_tare = true;
+    s_jar_tare_g = grams;
+    taskEXIT_CRITICAL(&s_lock);
+}
+
+static bool jar_tare_get(float *out_grams)
+{
+    bool has;
+    taskENTER_CRITICAL(&s_lock);
+    has = s_has_jar_tare;
+    if (out_grams) {
+        *out_grams = s_jar_tare_g;
+    }
+    taskEXIT_CRITICAL(&s_lock);
+    return has;
 }
 
 static void filler_stop_all(void)
@@ -208,10 +232,12 @@ static void task_filler_fsm(void *arg)
             case FILLER_DONE:
             case FILLER_FAULT:
                 filler_stop_all();
+                jar_tare_clear();
                 break;
             case FILLER_FIND_SLOT:
                 ESP_LOGD(TAG, "motor on (find slot)");
                 motor_set(true);
+                jar_tare_clear();
                 break;
             case FILLER_VERIFY_EMPTY:
                 ESP_LOGD(TAG, "verify empty: motor off, gate closed");
@@ -228,7 +254,7 @@ static void task_filler_fsm(void *arg)
                 if (last_state != FILLER_VERIFY_TARGET) {
                     close_early_g_cur = params.close_early_g;
                 }
-                gate_open_cached();
+                gate_set_percent_cached(params.max_gate_pct);
                 break;
             case FILLER_DRIP_WAIT:
                 ESP_LOGD(TAG, "drip wait: gate closed");
@@ -289,21 +315,29 @@ static void task_filler_fsm(void *arg)
             if (!scale_require_fresh_or_fault("verify empty", &latest, &state)) {
                 break;
             }
-            if (fabsf(grams) < 180.0f) {
-                ESP_LOGI(TAG, "empty jar verified (%.1f g)", (double)grams);
-                state = FILLER_FILL;
+            if (grams < params.empty_glass_min_g) {
+                ESP_LOGW(TAG, "no jar: %.1f g (min %.1f g) -> skip slot", (double)grams, (double)params.empty_glass_min_g);
+                uint8_t cur = filler_get_slot_idx();
+                uint8_t next = cur + 1;
+                ESP_LOGI(TAG, "slot skipped: %u -> %u (total=%u)",
+                         (unsigned)cur, (unsigned)next, (unsigned)params.slots_total);
+                filler_set_slot(next);
+                state = (next >= params.slots_total) ? FILLER_DONE : FILLER_FIND_SLOT;
                 filler_set_state(state);
-            } else if (grams > (params.target_grams * 0.8f)) {
-                ESP_LOGE(TAG, "weight out of range (already full?) (%.1f g)", (double)grams);
-                filler_set_fault(FLT_WEIGHT_RANGE);
-                state = FILLER_FAULT;
+            } else if (grams > params.empty_glass_max_g) {
+                ESP_LOGW(TAG, "jar not empty: %.1f g (max %.1f g) -> skip slot", (double)grams, (double)params.empty_glass_max_g);
+                uint8_t cur = filler_get_slot_idx();
+                uint8_t next = cur + 1;
+                ESP_LOGI(TAG, "slot skipped: %u -> %u (total=%u)",
+                         (unsigned)cur, (unsigned)next, (unsigned)params.slots_total);
+                filler_set_slot(next);
+                state = (next >= params.slots_total) ? FILLER_DONE : FILLER_FIND_SLOT;
                 filler_set_state(state);
             } else {
-                ESP_LOGE(TAG, "unexpected weight (partially full?)(%.1f g)", (double)grams);
-                filler_set_fault(FLT_WEIGHT_RANGE);
-                state = FILLER_FAULT;
+                jar_tare_set(grams);
+                ESP_LOGI(TAG, "empty jar verified: %.1f g (tare set)", (double)grams);
+                state = FILLER_FILL;
                 filler_set_state(state);
-
             }
             break;
 
@@ -312,26 +346,29 @@ static void task_filler_fsm(void *arg)
             if (!scale_require_fresh_or_fault("fill", &latest, &state)) {
                 break;
             }
+            float tare_g = 0.0f;
+            bool has_tare = jar_tare_get(&tare_g);
+            float rel_g = grams - (has_tare ? tare_g : 0.0f);
             float near_close = params.target_grams - params.near_close_delta_g;
             float close_early = params.target_grams - close_early_g_cur;
-            if (grams >= params.target_grams) {
-                ESP_LOGI(TAG, "target reached: %.1f g", (double)grams);
+            if (rel_g >= params.target_grams) {
+                ESP_LOGI(TAG, "target reached: rel=%.1f g abs=%.1f g", (double)rel_g, (double)grams);
                 gate_close_cached();
                 state = FILLER_DRIP_WAIT;
                 filler_set_state(state);
-            } else if (grams >= close_early) {
-                ESP_LOGI(TAG, "close-early reached: %.1f g (offset %.1f g)", (double)grams, (double)close_early_g_cur);
+            } else if (rel_g >= close_early) {
+                ESP_LOGI(TAG, "close-early reached: rel=%.1f g (offset %.1f g)", (double)rel_g, (double)close_early_g_cur);
                 gate_close_cached();
                 state = FILLER_DRIP_WAIT;
                 filler_set_state(state);
-            } else if (grams >= near_close) {
+            } else if (rel_g >= near_close) {
                 if (!near_close_logged) {
-                    ESP_LOGD(TAG, "near close: %.1f g -> partial gate", (double)grams);
+                    ESP_LOGD(TAG, "near close: rel=%.1f g -> partial gate", (double)rel_g);
                     near_close_logged = true;
                 }
                 gate_set_percent_cached(params.near_close_gate_pct);
             } else {
-                gate_open_cached();
+                gate_set_percent_cached(params.max_gate_pct);
             }
             if ((esp_timer_get_time() - state_enter_us) > ((int64_t)params.fill_timeout_ms * 1000)) {
                 ESP_LOGE(TAG, "fill timeout");
@@ -358,16 +395,23 @@ static void task_filler_fsm(void *arg)
             if (!scale_require_fresh_or_fault("verify target", &latest, &state)) {
                 break;
             }
-            if (grams > (params.target_grams + TARGET_TOL_HIGH)) {
-                float over = grams - params.target_grams;
-                ESP_LOGE(TAG, "overweight: %.1f g (+%.1f g)", (double)grams, (double)over);
+            float tare_g = 0.0f;
+            bool has_tare = jar_tare_get(&tare_g);
+            float rel_g = grams - (has_tare ? tare_g : 0.0f);
+            float tol_low_g = params.target_grams * (params.target_tol_low_pct / 100.0f);
+            float tol_high_g = params.target_grams * (params.target_tol_high_pct / 100.0f);
+            if (rel_g > (params.target_grams + tol_high_g)) {
+                float over = rel_g - params.target_grams;
+                ESP_LOGE(TAG, "overweight: rel=%.1f g (+%.1f g, tol=+%.1f g)",
+                         (double)rel_g, (double)over, (double)tol_high_g);
                 ESP_LOGW(TAG, "suggestion: increase close_early_g (now %.1f g)", (double)params.close_early_g);
                 filler_set_fault(FLT_WEIGHT_RANGE);
                 state = FILLER_FAULT;
                 filler_set_state(state);
-            } else if (grams < (params.target_grams - TARGET_TOL_LOW)) {
-                float under = params.target_grams - grams;
-                ESP_LOGI(TAG, "underweight: %.1f g (-%.1f g) -> refill", (double)grams, (double)under);
+            } else if (rel_g < (params.target_grams - tol_low_g)) {
+                float under = params.target_grams - rel_g;
+                ESP_LOGI(TAG, "underweight: rel=%.1f g (-%.1f g, tol=-%.1f g) -> refill",
+                         (double)rel_g, (double)under, (double)tol_low_g);
                 if (close_early_g_cur > 0.0f) {
                     float prev = close_early_g_cur;
                     close_early_g_cur -= CLOSE_EARLY_STEP_G;
@@ -378,7 +422,7 @@ static void task_filler_fsm(void *arg)
                 state = FILLER_FILL;
                 filler_set_state(state);
             } else {
-                ESP_LOGI(TAG, "target verified: %.1f g", (double)grams);
+                ESP_LOGI(TAG, "target verified: rel=%.1f g", (double)rel_g);
                 uint8_t cur = filler_get_slot_idx();
                 uint8_t next = cur + 1;
                 ESP_LOGI(TAG, "slot complete: %u -> %u (total=%u)",
@@ -461,6 +505,11 @@ filler_fault_t filler_get_fault(void)
     v = s_fault;
     taskEXIT_CRITICAL(&s_lock);
     return v;
+}
+
+bool filler_get_jar_tare(float *out_grams)
+{
+    return jar_tare_get(out_grams);
 }
 
 const char *filler_state_name(filler_state_t st)
