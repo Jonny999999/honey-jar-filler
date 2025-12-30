@@ -6,10 +6,10 @@
 #include "esp_log.h"
 
 // Default timings for convenience beeps.
-#define BUZZER_SHORT_ON_MS  60
+#define BUZZER_SHORT_ON_MS  80
 #define BUZZER_SHORT_OFF_MS 80
-#define BUZZER_LONG_ON_MS   200
-#define BUZZER_LONG_OFF_MS  120
+#define BUZZER_LONG_ON_MS   350
+#define BUZZER_LONG_OFF_MS  200
 
 #define BUZZER_QUEUE_LEN 8
 

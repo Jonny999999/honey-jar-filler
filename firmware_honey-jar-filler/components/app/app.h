@@ -14,7 +14,7 @@ typedef struct {
     float    near_close_delta_g;     // when within this many grams of target, partially close gate
     float    near_close_gate_pct;    // partial gate opening (%) used near the target
     float    max_gate_pct;           // max gate opening (%) used during bulk fill (full open cap)
-    float    close_early_g;          // grams before target to fully close gate (compensates drip/in-flight)
+    float    close_early_pct;        // % of target before target to fully close gate (compensates drip/in-flight)
     float    empty_glass_min_g;      // below this -> no jar present (measured empty jar weight window)
     float    empty_glass_max_g;      // above this -> jar not empty / already filled (empty jar upper bound)
     float    target_tol_low_pct;     // below target by this % -> re-fill (retry window)

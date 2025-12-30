@@ -14,7 +14,7 @@ static app_params_t s_params;
 static const char *TAG = "app_params";
 
 // Bump to force defaults reload (when changing defaults/layout).
-#define APP_PARAMS_VERSION 9
+#define APP_PARAMS_VERSION 10
 
 // Centralized defaults for persistent parameters.
 static app_params_t app_params_defaults(void)
@@ -23,21 +23,21 @@ static app_params_t app_params_defaults(void)
         // NOTE: bump APP_PARAMS_VERSION above to force defaults reload.
         .version            = APP_PARAMS_VERSION,
         // Target filled mass per jar (grams).
-        .target_grams       = 200.0f,
+        .target_grams       = 150.0f,
         // When within this many grams of target, partially close gate to slow flow.
-        .near_close_delta_g = 100.0f,
+        .near_close_delta_g = 60.0f,
         // Partial opening (%) used once near_close_delta_g is reached.
-        .near_close_gate_pct= 15.0f,
+        .near_close_gate_pct= 16.0f,
         // Max gate opening (%) during bulk fill (cap to avoid over-speed).
         .max_gate_pct       = 30.0f,
-        // Close this many grams before target to compensate drip/in-flight volume.
+        // Close this many % before target to compensate drip/in-flight volume.
         // Thick honey usually needs a larger value; thin honey needs less.
-        .close_early_g      = 50.0f,
+        .close_early_pct    = 10.0f,
         // Empty jar weight window (grams) used to detect missing or pre-filled jars.
         .empty_glass_min_g  = 100.0f,
         .empty_glass_max_g  = 200.0f,
         // Target tolerance (%) below target that triggers a refill.
-        .target_tol_low_pct = 12.0f,
+        .target_tol_low_pct = 3.0f,
         // Target tolerance (%) above target that triggers a fault.
         .target_tol_high_pct= 20.0f,
         // Max time allowed in FILL before faulting (ms).
@@ -127,7 +127,7 @@ void app_params_init(void)
              "  near_close_delta_g=%.1f g\n"
              "  near_close_gate_pct=%.1f %%\n"
              "  max_gate_pct=%.1f %%\n"
-             "  close_early_g=%.1f g\n"
+             "  close_early_pct=%.1f %%\n"
              "  empty_glass_min_g=%.1f g\n"
              "  empty_glass_max_g=%.1f g\n"
              "  target_tol_low_pct=%.1f %%\n"
@@ -143,7 +143,7 @@ void app_params_init(void)
              (double)s_params.near_close_delta_g,
              (double)s_params.near_close_gate_pct,
              (double)s_params.max_gate_pct,
-             (double)s_params.close_early_g,
+             (double)s_params.close_early_pct,
              (double)s_params.empty_glass_min_g,
              (double)s_params.empty_glass_max_g,
              (double)s_params.target_tol_low_pct,
