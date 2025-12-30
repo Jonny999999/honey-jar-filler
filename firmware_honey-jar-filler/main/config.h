@@ -38,7 +38,7 @@
 //============================
 // 1 = disable output, 0 = normal operation.
 #define CONFIG_DISABLE_BUZZER      1
-#define CONFIG_DISABLE_SERVO       1
+#define CONFIG_DISABLE_SERVO       0
 
 
 //============================
