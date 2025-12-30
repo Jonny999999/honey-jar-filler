@@ -783,12 +783,12 @@ void app_main(void)
     #else // when not in any debug mode, normal startup (FSM + UI task)
 
     //--- filler FSM task ---
-    filler_start_task(4, 1);
+    filler_start_task(CONFIG_TASK_PRIO_FSM, CONFIG_TASK_CORE_FSM);
 
     //--- UI task ---
     ui_task_set_encoder_queue(queue_encoder_events);
     ui_task_set_led_strip(s_strip);
-    ui_task_start(disp, 4, 1);
+    ui_task_start(disp, CONFIG_TASK_PRIO_UI, CONFIG_TASK_CORE_UI);
 
     #endif
 

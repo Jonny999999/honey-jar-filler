@@ -17,10 +17,10 @@
 #include "scale_hx711.h"
 
 // UI refresh rate.
-#define UI_PERIOD_MS 180
+#define UI_PERIOD_MS 200
 
 // Button debounce.
-#define UI_BTN_DEBOUNCE_MS 30
+#define UI_BTN_DEBOUNCE_MS 60
 
 // Encoder step for target grams.
 #define UI_TARGET_STEP_G 10.0f
@@ -32,8 +32,8 @@
 #define UI_BEEP_MIN_INTERVAL_MS 80
 
 // LED animation for waiting/filling.
-#define UI_ANIM_PERIOD_MS 40
-#define UI_ANIM_BLOCK_LEN 3
+#define UI_ANIM_PERIOD_MS 50
+#define UI_ANIM_BLOCK_LEN 4
 #define UI_ANIM_DIM_PCT 55
 
 #define LINE2PIXEL(n) ((n) * 8)

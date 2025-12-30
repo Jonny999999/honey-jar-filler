@@ -406,8 +406,9 @@ esp_err_t scale_hx711_start_poll(scale_hx711_t *s,
     cfg->period = period;
     cfg->q = q;
 
-    // Pin to core 1, low priority
-    if (xTaskCreatePinnedToCore(task_scale_poll, "scale_poll", 4096, cfg, 2, NULL, 1) != pdPASS) {
+    // Pin to selected core and priority for reliable sampling.
+    if (xTaskCreatePinnedToCore(task_scale_poll, "scale_poll", 4096, cfg,
+                                CONFIG_TASK_PRIO_HX711, NULL, CONFIG_TASK_CORE_HX711) != pdPASS) {
         vPortFree(cfg);
         vQueueDelete(q);
         return ESP_ERR_NO_MEM;

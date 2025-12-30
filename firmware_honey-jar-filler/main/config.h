@@ -61,6 +61,19 @@
 #define CONFIG_HX711_POLL_INTERVAL_MS 400 //AVG vs INTERVAL: consider one readout takes ~90ms 
 #define CONFIG_HX711_AVG_SAMPLE_COUNT 4
 
+//=======================================
+//=========== Task priorities ===========
+//=======================================
+// Higher number = higher priority (ESP-IDF max is configMAX_PRIORITIES-1).
+// Keep HX711 > FSM > UI for stable weight reads.
+#define CONFIG_TASK_PRIO_HX711       8
+#define CONFIG_TASK_PRIO_FSM         6
+#define CONFIG_TASK_PRIO_UI          3
+
+// Core pinning: 0=PRO CPU, 1=APP CPU, tskNO_AFFINITY lets FreeRTOS choose.
+#define CONFIG_TASK_CORE_HX711       0
+#define CONFIG_TASK_CORE_FSM         1
+#define CONFIG_TASK_CORE_UI          1
 
 
 
