@@ -574,7 +574,7 @@ void app_main(void)
     esp_log_level_set("io_test", ESP_LOG_WARN);
     esp_log_level_set("encoder_consumer", ESP_LOG_WARN);
     esp_log_level_set("scale_consumer", ESP_LOG_WARN);
-    esp_log_level_set("filler_fsm", ESP_LOG_INFO);
+    esp_log_level_set("filler_fsm", ESP_LOG_DEBUG);
 
     // Load persistent app parameters (targets/timeouts).
     app_params_init();
@@ -599,23 +599,27 @@ void app_main(void)
     //=====================
     //=== WS2812 Strip ====
     //=====================
-    led_strip_config_t strip_cfg = {
-        .strip_gpio_num = CONFIG_WS2812_GPIO,
-        .max_leds = CONFIG_WS2812_LED_COUNT,
-        .led_model = LED_MODEL_WS2812,
-        .color_component_format = LED_STRIP_COLOR_COMPONENT_FMT_GRB,
-        .flags.invert_out = false,
-    };
-    led_strip_rmt_config_t rmt_cfg = {
-        .clk_src = RMT_CLK_SRC_DEFAULT,
-        .resolution_hz = 10 * 1000 * 1000,
-        .flags.with_dma = false,
-    };
-    if (led_strip_new_rmt_device(&strip_cfg, &rmt_cfg, &s_strip) != ESP_OK) {
-        ESP_LOGW(TAG, "WS2812 init failed");
-    } else {
-        ws2812_clear();
-    }
+    #if CONFIG_WS2812_ENABLE
+        led_strip_config_t strip_cfg = {
+            .strip_gpio_num = CONFIG_WS2812_GPIO,
+            .max_leds = CONFIG_WS2812_LED_COUNT,
+            .led_model = LED_MODEL_WS2812,
+            .color_component_format = LED_STRIP_COLOR_COMPONENT_FMT_GRB,
+            .flags.invert_out = false,
+        };
+        led_strip_rmt_config_t rmt_cfg = {
+            .clk_src = RMT_CLK_SRC_DEFAULT,
+            .resolution_hz = 10 * 1000 * 1000,
+            .flags.with_dma = false,
+        };
+        if (led_strip_new_rmt_device(&strip_cfg, &rmt_cfg, &s_strip) != ESP_OK) {
+            ESP_LOGW(TAG, "WS2812 init failed");
+        } else {
+            ws2812_clear();
+        }
+    #else
+        ESP_LOGW(TAG, "WS2812 disabled by config");
+    #endif
 
 
     //===================
@@ -726,7 +730,9 @@ void app_main(void)
 
     // --- STARTUP SEQUENCE ---
     buzzer_beep_short(3);
-    ws2812_startup_sequence();
+    if (CONFIG_WS2812_ENABLE && s_strip) {
+        ws2812_startup_sequence();
+    }
 
 
     //--- weight scale task ---
@@ -787,7 +793,9 @@ void app_main(void)
 
     //--- UI task ---
     ui_task_set_encoder_queue(queue_encoder_events);
-    ui_task_set_led_strip(s_strip);
+    if (CONFIG_WS2812_ENABLE && s_strip) {
+        ui_task_set_led_strip(s_strip);
+    }
     ui_task_start(disp, CONFIG_TASK_PRIO_UI, CONFIG_TASK_CORE_UI);
 
     #endif
