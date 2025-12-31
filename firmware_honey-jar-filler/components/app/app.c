@@ -4,23 +4,63 @@
 #include "freertos/semphr.h"
 #include "nvs.h"
 #include "nvs_flash.h"
+#include "esp_log.h"
 
 #define NVS_NAMESPACE  "app"
 #define NVS_KEY_PARAMS "params_v1"
 
 static SemaphoreHandle_t s_params_mtx;
 static app_params_t s_params;
+static const char *TAG = "app_params";
+
+// Bump to force defaults reload (when changing defaults/layout).
+#define APP_PARAMS_VERSION 10
 
 // Centralized defaults for persistent parameters.
 static app_params_t app_params_defaults(void)
 {
     app_params_t p = {
-        .target_grams       = 500.0f,
-        .near_close_delta_g = 40.0f,
-        .fill_timeout_ms    = 20000,
+        //=== Meta / versions ===
+        // NOTE: bump APP_PARAMS_VERSION above to force defaults reload.
+        .version            = APP_PARAMS_VERSION,
+
+        //=== Target + verification ===
+        // Target filled mass per jar (grams).
+        .target_grams       = 150.0f,
+        // Target tolerance (%) below target that triggers a refill.
+        .target_tol_low_pct = 3.0f,
+        // Target tolerance (%) above target that triggers a fault.
+        .target_tol_high_pct= 20.0f,
+        // Max time allowed in FILL before faulting (ms).
+        .fill_timeout_ms    = 180000,
+        // Empty jar weight window (grams) used to detect missing or already filled jars 
+        // (skips slot when outside this range)
+        .empty_glass_min_g  = 100.0f,
+        .empty_glass_max_g  = 200.0f,
+
+
+        //=== Honey flow tuning ===
+        // When within this many grams of target, partially close gate to slow flow.
+        .near_close_delta_g = 60.0f,
+        // Partial opening (%) used once near_close_delta_g is reached.
+        .near_close_gate_pct= 16.0f,
+        // Max gate opening (%) during bulk fill (cap to avoid over-speed).
+        .max_gate_pct       = 30.0f,
+        // Close this many % before target to compensate drip/in-flight volume.
+        // Thick honey usually needs a larger value; thin honey needs less.
+        .close_early_pct    = 10.0f,
+        // Wait after closing gate so drips fall into the jar (ms).
+        .drip_delay_ms      = 4000,
+
+        //=== Mechanics / motion ===
+        // Max time to find the position switch while advancing (ms).
         .advance_timeout_ms = 4000,
-        .motor_dwell_ms     = 400,
-        .slots_total        = 6,
+        // Ignore POS switch for this long after motor start (ms) (aka motor min time on)
+        .find_ignore_ms     = 500,
+        // Wait after slot found so motor/scale settles before weighing + verifying glass (ms).
+        .slot_settle_ms     = 1500,
+        // Total number of jars per run.
+        .slots_total        = 3,
     };
     return p;
 }
@@ -44,12 +84,6 @@ void app_params_init(void)
         }
     }
 
-    esp_err_t err = nvs_flash_init();
-    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        (void)nvs_flash_erase();
-        err = nvs_flash_init();
-    }
-
     app_params_t defaults = app_params_defaults();
 
     // Serialize init/load to ensure consistent RAM state.
@@ -60,35 +94,80 @@ void app_params_init(void)
 
     s_params = defaults;
 
+    // Prefer caller-initialized NVS; if not initialized, fall back to defaults only.
+    bool need_save = false;
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &h);
+    if (err == ESP_ERR_NVS_NOT_INITIALIZED) {
+        s_params = defaults;
+        xSemaphoreGive(s_params_mtx);
+        return;
+    }
+
     if (err == ESP_OK) {
-        bool need_save = false;
-        nvs_handle_t h;
-        err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &h);
-        if (err == ESP_OK) {
-            size_t len = sizeof(s_params);
-            err = nvs_get_blob(h, NVS_KEY_PARAMS, &s_params, &len);
-            nvs_close(h);
-            if (err != ESP_OK || len != sizeof(s_params)) {
-                // Invalid or mismatched blob -> reset to defaults.
-                s_params = defaults;
-                need_save = true;
-            }
-        } else {
-            // No namespace yet -> write defaults once.
+        size_t len = sizeof(s_params);
+        err = nvs_get_blob(h, NVS_KEY_PARAMS, &s_params, &len);
+        nvs_close(h);
+        if (err != ESP_OK || len != sizeof(s_params) || s_params.version != APP_PARAMS_VERSION) {
+            // Invalid or mismatched blob -> reset to defaults.
             s_params = defaults;
             need_save = true;
         }
+    } else {
+        // No namespace yet -> write defaults once.
+        s_params = defaults;
+        need_save = true;
+    }
 
-        if (need_save) {
-            nvs_handle_t h_wr;
-            if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h_wr) == ESP_OK) {
-                if (nvs_set_blob(h_wr, NVS_KEY_PARAMS, &s_params, sizeof(s_params)) == ESP_OK) {
-                    (void)nvs_commit(h_wr);
-                }
-                nvs_close(h_wr);
+    if (need_save) {
+        nvs_handle_t h_wr;
+        if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h_wr) == ESP_OK) {
+            if (nvs_set_blob(h_wr, NVS_KEY_PARAMS, &s_params, sizeof(s_params)) == ESP_OK) {
+                (void)nvs_commit(h_wr);
             }
+            nvs_close(h_wr);
         }
     }
+
+    ESP_LOGI(TAG,
+             "params:\n"
+             "  === Meta ===\n"
+             "  version=%u (param defaults)\n"
+             "  === Target + verification ===\n"
+             "  target_grams=%.1f g\n"
+             "  target_tol_low_pct=%.1f %%\n"
+             "  target_tol_high_pct=%.1f %%\n"
+             "  fill_timeout_ms=%u\n"
+             "  === Honey flow tuning ===\n"
+             "  near_close_delta_g=%.1f g\n"
+             "  near_close_gate_pct=%.1f %%\n"
+             "  max_gate_pct=%.1f %%\n"
+             "  close_early_pct=%.1f %%\n"
+             "  drip_delay_ms=%u\n"
+             "  === Glass detection ===\n"
+             "  empty_glass_min_g=%.1f g\n"
+             "  empty_glass_max_g=%.1f g\n"
+             "  === Mechanics / motion ===\n"
+             "  advance_timeout_ms=%u\n"
+             "  find_ignore_ms=%u\n"
+             "  slot_settle_ms=%u\n"
+             "  slots_total=%u",
+             (unsigned)s_params.version,
+             (double)s_params.target_grams,
+             (double)s_params.target_tol_low_pct,
+             (double)s_params.target_tol_high_pct,
+             (unsigned)s_params.fill_timeout_ms,
+             (double)s_params.near_close_delta_g,
+             (double)s_params.near_close_gate_pct,
+             (double)s_params.max_gate_pct,
+             (double)s_params.close_early_pct,
+             (unsigned)s_params.drip_delay_ms,
+             (double)s_params.empty_glass_min_g,
+             (double)s_params.empty_glass_max_g,
+             (unsigned)s_params.advance_timeout_ms,
+             (unsigned)s_params.find_ignore_ms,
+             (unsigned)s_params.slot_settle_ms,
+             (unsigned)s_params.slots_total);
 
     xSemaphoreGive(s_params_mtx);
 }

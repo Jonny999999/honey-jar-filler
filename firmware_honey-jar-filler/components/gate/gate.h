@@ -25,6 +25,8 @@ esp_err_t gate_open(void);
 esp_err_t gate_close(void);
 esp_err_t gate_set(float deg);   // clamp to [close, open]
 esp_err_t gate_set_percent(float pct); // 0=closed, 100=open (handles inverted ranges)
+void gate_set_enabled(bool enable);    // disable keeps power off and ignores commands
+bool gate_is_enabled(void);
 
 #ifdef __cplusplus
 }
