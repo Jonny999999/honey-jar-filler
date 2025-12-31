@@ -566,7 +566,7 @@ void app_main(void)
     // Default to warnings; bump specific components as needed.
     esp_log_level_set("*", ESP_LOG_WARN);
     esp_log_level_set("main", ESP_LOG_WARN);
-    esp_log_level_set("app_params", ESP_LOG_WARN);
+    esp_log_level_set("app_params", ESP_LOG_INFO);
     esp_log_level_set("scale_hx711", ESP_LOG_WARN);
     esp_log_level_set("ui_task", ESP_LOG_WARN);
     esp_log_level_set("gate", ESP_LOG_WARN);
