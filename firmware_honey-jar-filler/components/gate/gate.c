@@ -13,6 +13,7 @@
 // Static runtime config for the gate.
 static gate_cfg_t s_cfg;
 static bool s_inited = false;
+static bool s_enabled = true;
 static const char *TAG = "gate";
 
 static float gate_min_deg(void)
@@ -89,10 +90,17 @@ esp_err_t gate_init(const gate_cfg_t *cfg)
     }
 
     // Enable power only after PWM is configured and set.
-    gpio_set_level(s_cfg.en_gpio, 1);
-    s_inited = true;
-    ESP_LOGI(TAG, "init: power enabled, closing gate");
-    return gate_close();
+    if (s_enabled) {
+        gpio_set_level(s_cfg.en_gpio, 1);
+        s_inited = true;
+        ESP_LOGI(TAG, "init: power enabled, closing gate");
+        return gate_close();
+    } else {
+        gpio_set_level(s_cfg.en_gpio, 0);
+        s_inited = true;
+        ESP_LOGI(TAG, "init: power disabled (gate disabled)");
+        return ESP_OK;
+    }
 }
 
 esp_err_t gate_set(float deg)
@@ -100,6 +108,10 @@ esp_err_t gate_set(float deg)
     if (!s_inited) {
         ESP_LOGW(TAG, "set: called before init");
         return ESP_ERR_INVALID_STATE;
+    }
+    if (!s_enabled) {
+        ESP_LOGD(TAG, "set ignored (disabled)");
+        return ESP_OK;
     }
 
     float clamped = gate_clamp(deg);
@@ -114,6 +126,10 @@ esp_err_t gate_set_percent(float pct)
     if (!s_inited) {
         ESP_LOGW(TAG, "set_percent: called before init");
         return ESP_ERR_INVALID_STATE;
+    }
+    if (!s_enabled) {
+        ESP_LOGD(TAG, "set_percent ignored (disabled)");
+        return ESP_OK;
     }
 
     if (pct < 0.0f) pct = 0.0f;
@@ -131,8 +147,12 @@ esp_err_t gate_set_percent(float pct)
 esp_err_t gate_open(void)
 {
     if (!s_inited) {
-        ESP_LOGW(TAG, "open: called before init");
+        ESP_LOGE(TAG, "open: called before init");
         return ESP_ERR_INVALID_STATE;
+    }
+    if (!s_enabled) {
+        ESP_LOGD(TAG, "open ignored (disabled)");
+        return ESP_OK;
     }
     ESP_LOGI(TAG, "open");
     return gate_set(s_cfg.open_deg);
@@ -144,6 +164,29 @@ esp_err_t gate_close(void)
         ESP_LOGW(TAG, "close: called before init");
         return ESP_ERR_INVALID_STATE;
     }
+    if (!s_enabled) {
+        ESP_LOGD(TAG, "close ignored (disabled)");
+        return ESP_OK;
+    }
     ESP_LOGI(TAG, "close");
     return gate_set(s_cfg.close_deg);
+}
+
+void gate_set_enabled(bool enable)
+{
+    s_enabled = enable;
+    if (!s_inited) return;
+
+    if (!enable) {
+        gpio_set_level(s_cfg.en_gpio, 0);
+        ESP_LOGI(TAG, "disabled (power off)");
+    } else {
+        gpio_set_level(s_cfg.en_gpio, 1);
+        ESP_LOGI(TAG, "enabled (power on)");
+    }
+}
+
+bool gate_is_enabled(void)
+{
+    return s_enabled;
 }

@@ -3,3 +3,4 @@ dependencies:
   esp-idf-lib/encoder: '*'
   chill-sam/ssd1306: ^1.1.1
   espressif/servo: ^0.1.0
+  espressif/led_strip: '*'

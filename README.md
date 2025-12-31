@@ -1,7 +1,7 @@
 # honey-jar-filler
 
 Semi-automatic **weight-based honey jar filler** with a **jar carousel/magazine** and a **servo-actuated honey gate**.  
-This repo currently contains the **KiCad PCB-Project** and **FreeCAD** models and firmware (ESP-IDF).
+This repo contains the **KiCad PCB-Project**, **FreeCAD** models, and firmware (ESP-IDF).
 
   <img src="cad/exports/screenshots/assembly.png" alt="Assembly Preview" width="70%">
 
@@ -12,7 +12,7 @@ This repo currently contains the **KiCad PCB-Project** and **FreeCAD** models an
   <img src="doc/images/pcb_IO-test.jpg" alt="I/O test with peripherals" width="48%">
 </p>
 
-*Left: board fully populated. Right: I/O test with all peripherals connected.*
+*Left: custom pcb fully populated. Right: I/O test with all peripherals connected.*
 
 ## Repo contents
 - `pcb_honey-jar-filler/` - KiCad project (schematic & PCB, exports)
@@ -41,7 +41,7 @@ This repo currently contains the **KiCad PCB-Project** and **FreeCAD** models an
 </p>
 
 ## Firmware build (ESP-IDF)
-- Install ESP-IDF (v5.x recommended) and export its environment (`. ./export.sh`).
+- Install ESP-IDF **v5.5.2** and export its environment (`. ./export.sh`).
 - Enter the firmware project:
 ```bash
 cd firmware_honey-jar-filler
@@ -55,3 +55,22 @@ idf.py build
 ```bash
 idf.py -p /dev/ttyUSB0 flash monitor
 ```
+
+## Wiring (servo mount DIN cable)
+The cable with 15-pin DIN connector from the base assembly to the servo mount carries OLED, encoder, and servo signals + power.
+
+OLED:
+- green: GND
+- red: 3V3
+- orange: SDA
+- yellow: SCL
+
+Encoder:
+- gray: SW
+- blue: B
+- light-green: A
+
+Servo:
+- brown, gray-brown, pink: 8V
+- gray-black, black, white: GND
+- purple: PWM
