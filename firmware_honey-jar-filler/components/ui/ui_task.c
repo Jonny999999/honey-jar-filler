@@ -25,7 +25,7 @@
 #define UI_BTN_DEBOUNCE_MS 50
 
 // Encoder step for target grams.
-#define UI_TARGET_STEP_G 10.0f
+#define UI_TARGET_STEP_G 10u
 
 // LED strip brightness limit (% of 255). Override in config.h.
 #define UI_WS2812_MAX_BRIGHTNESS_PCT CONFIG_WS2812_MAX_BRIGHTNESS_PCT
@@ -168,10 +168,11 @@ static void ui_handle_encoder(filler_state_t st, int32_t enc_delta, int64_t *las
 
     app_params_t p;
     app_params_get(&p);
-    p.target_grams += ((float)enc_delta * UI_TARGET_STEP_G);
-    if (p.target_grams < 0.0f) p.target_grams = 0.0f;
+    int32_t tgt = (int32_t)p.target_grams + (int32_t)enc_delta * (int32_t)UI_TARGET_STEP_G;
+    if (tgt < 0) tgt = 0;
+    p.target_grams = (uint32_t)tgt;
     (void)app_params_set(&p);
-    ESP_LOGI(TAG, "encoder: target=%.1f g", (double)p.target_grams);
+    ESP_LOGI(TAG, "encoder: target=%u g", (unsigned)p.target_grams);
 
     if (last_beep_us) {
         int64_t now_us = esp_timer_get_time();
@@ -220,9 +221,9 @@ static void ui_render(ssd1306_handle_t disp,
     ssd1306_draw_text(disp, 0, LINE2PIXEL(4), line2, true);
 
     // Line 3: action hint + target.
-    snprintf(line3, sizeof(line3), "Btn:%s  Tgt:%3.0fg",
+    snprintf(line3, sizeof(line3), "Btn:%s  Tgt:%ug",
              (st == FILLER_IDLE || st == FILLER_FAULT) ? "START" : "STOP",
-             (double)p->target_grams);
+             (unsigned)p->target_grams);
     ssd1306_draw_text(disp, 0, LINE2PIXEL(6), line3, true);
 
     ssd1306_display(disp);
