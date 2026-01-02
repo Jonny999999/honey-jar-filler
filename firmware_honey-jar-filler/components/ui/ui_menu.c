@@ -4,7 +4,9 @@
 #include <string.h>
 
 #include "app.h"
+#include "buzzer.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 
 #define LINE2PIXEL(n) ((n) * 8)
 
@@ -93,6 +95,25 @@ static void menu_apply_delta(const app_param_meta_t *meta,
     }
 }
 
+static void menu_wrap_brief(const char *brief, char *line_a, size_t len_a,
+                            char *line_b, size_t len_b)
+{
+    if (!brief) {
+        if (line_a && len_a) line_a[0] = '\0';
+        if (line_b && len_b) line_b[0] = '\0';
+        return;
+    }
+
+    size_t n = strlen(brief);
+    size_t first = (n > 20) ? 20 : n;
+    snprintf(line_a, len_a, "%.*s", (int)first, brief);
+    if (n > first) {
+        snprintf(line_b, len_b, "%.*s", (int)(n - first), brief + first);
+    } else {
+        if (line_b && len_b) line_b[0] = '\0';
+    }
+}
+
 static const app_param_meta_t *menu_meta_at(size_t index, size_t *count_out)
 {
     size_t count = 0;
@@ -117,6 +138,7 @@ void ui_menu_exit(ui_menu_t *m)
 {
     if (!m) return;
     m->active = false;
+    buzzer_beep_long(1);
     ESP_LOGI(TAG, "exit");
 }
 
@@ -139,12 +161,14 @@ void ui_menu_on_rotate(ui_menu_t *m, int32_t delta)
 
     if (m->view == UI_MENU_VIEW_LIST) {
         int32_t idx = (int32_t)m->index + delta;
-        if (idx < 0) idx = 0;
-        if ((size_t)idx >= count) idx = (int32_t)count - 1;
+        if (idx < 0) idx = (int32_t)count - 1;
+        if ((size_t)idx >= count) idx = 0;
         m->index = (size_t)idx;
+        buzzer_beep_ms(30);
         ESP_LOGD(TAG, "list: index=%u", (unsigned)m->index);
     } else {
         menu_apply_delta(meta, &m->working, delta);
+        buzzer_beep_ms(30);
         ESP_LOGD(TAG, "edit: %s delta=%ld", meta->name, (long)delta);
     }
 }
@@ -161,6 +185,7 @@ bool ui_menu_on_click(ui_menu_t *m, app_params_t *out_apply)
     // Confirm edit: copy working params out for persistence.
     if (out_apply) *out_apply = m->working;
     m->view = UI_MENU_VIEW_LIST;
+    buzzer_beep_short(2);
     ESP_LOGI(TAG, "edit: save");
     return true;
 }
@@ -170,6 +195,7 @@ bool ui_menu_on_long_press(ui_menu_t *m)
     if (!m) return false;
     if (m->view == UI_MENU_VIEW_EDIT) {
         m->view = UI_MENU_VIEW_LIST;
+        buzzer_beep_long(1);
         ESP_LOGI(TAG, "edit: cancel");
         return true;
     }
@@ -188,8 +214,17 @@ void ui_menu_render(const ui_menu_t *m, ssd1306_handle_t disp)
     char line1[24];
     char line2[24];
     char line3[24];
+    char line4[24];
+    char line5[24];
+    char line6[24];
 
     ssd1306_clear(disp);
+    line1[0] = '\0';
+    line2[0] = '\0';
+    line3[0] = '\0';
+    line4[0] = '\0';
+    line5[0] = '\0';
+    line6[0] = '\0';
 
     if (m->view == UI_MENU_VIEW_LIST) {
         snprintf(line0, sizeof(line0), "Settings %u/%u",
@@ -198,32 +233,53 @@ void ui_menu_render(const ui_menu_t *m, ssd1306_handle_t disp)
 
         char val[16];
         menu_format_value(meta, &m->working, val, sizeof(val));
-        snprintf(line2, sizeof(line2), "Val: %s%s%s",
+        snprintf(line3, sizeof(line3), "Val: %s%s%s",
                  val,
                  (meta->unit && meta->unit[0]) ? " " : "",
                  (meta->unit && meta->unit[0]) ? meta->unit : "");
-        snprintf(line3, sizeof(line3), "Click=Edit  Lng=Exit");
     } else {
         char val[16];
         char defv[16];
+        char brief_a[24];
+        char brief_b[24];
         menu_format_value(meta, &m->working, val, sizeof(val));
         snprintf(line0, sizeof(line0), "%s", meta->label ? meta->label : meta->name);
-        snprintf(line1, sizeof(line1), "Val: %s%s%s",
+        snprintf(line2, sizeof(line2), "Value: %s%s%s",
                  val,
                  (meta->unit && meta->unit[0]) ? " " : "",
                  (meta->unit && meta->unit[0]) ? meta->unit : "");
         menu_format_meta_value(meta, &meta->def, defv, sizeof(defv));
         if (meta->unit && meta->unit[0]) {
-            snprintf(line2, sizeof(line2), "Def:%s %s", defv, meta->unit);
+            snprintf(line3, sizeof(line4), "Default: %.11s %.2s", defv, meta->unit);
         } else {
-            snprintf(line2, sizeof(line2), "Def:%s", defv);
+            snprintf(line3, sizeof(line4), "Default: %.14s", defv);
         }
-        snprintf(line3, sizeof(line3), "%s", meta->desc_brief ? meta->desc_brief : "");
+        menu_wrap_brief(meta->desc_brief, brief_a, sizeof(brief_a), brief_b, sizeof(brief_b));
+        snprintf(line5, sizeof(line5), "%s", brief_a);
+        snprintf(line6, sizeof(line6), "%s", brief_b);
+    }
+
+    static int64_t last_blink_us = 0;
+    static bool blink_on = true;
+    int64_t now_us = esp_timer_get_time();
+    if (m->view == UI_MENU_VIEW_EDIT) {
+        if (now_us - last_blink_us >= 400000) {
+            blink_on = !blink_on;
+            last_blink_us = now_us;
+        }
+        if (line2[0]) {
+            char tmp[24];
+            snprintf(tmp, sizeof(tmp), "%c %.21s", blink_on ? '>' : ' ', line2);
+            snprintf(line2, sizeof(line2), "%s", tmp);
+        }
     }
 
     ssd1306_draw_text(disp, 0, LINE2PIXEL(0), line0, true);
     ssd1306_draw_text(disp, 0, LINE2PIXEL(2), line1, true);
-    ssd1306_draw_text(disp, 0, LINE2PIXEL(4), line2, true);
-    ssd1306_draw_text(disp, 0, LINE2PIXEL(7), line3, true);
+    ssd1306_draw_text(disp, 0, LINE2PIXEL(3), line2, true);
+    ssd1306_draw_text(disp, 0, LINE2PIXEL(4), line3, true);
+    ssd1306_draw_text(disp, 0, LINE2PIXEL(5), line4, true);
+    ssd1306_draw_text(disp, 0, LINE2PIXEL(6), line5, true);
+    ssd1306_draw_text(disp, 0, LINE2PIXEL(7), line6, true);
     ssd1306_display(disp);
 }
