@@ -213,10 +213,11 @@ void ui_menu_render(const ui_menu_t *m, ssd1306_handle_t disp)
                  (meta->unit && meta->unit[0]) ? " " : "",
                  (meta->unit && meta->unit[0]) ? meta->unit : "");
         menu_format_meta_value(meta, &meta->def, defv, sizeof(defv));
-        snprintf(line2, sizeof(line2), "Default: %s%s%s",
-                 defv,
-                 (meta->unit && meta->unit[0]) ? " " : "",
-                 (meta->unit && meta->unit[0]) ? meta->unit : "");
+        if (meta->unit && meta->unit[0]) {
+            snprintf(line2, sizeof(line2), "Def:%s %s", defv, meta->unit);
+        } else {
+            snprintf(line2, sizeof(line2), "Def:%s", defv);
+        }
         snprintf(line3, sizeof(line3), "%s", meta->desc_brief ? meta->desc_brief : "");
     }
 
