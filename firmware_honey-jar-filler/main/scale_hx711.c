@@ -18,6 +18,7 @@ static const char *TAG = "scale_hx711";
 // Latest snapshot storage (guarded by mutex to avoid torn reads).
 static SemaphoreHandle_t s_latest_mtx;
 static scale_latest_t s_latest;
+static scale_hx711_t *s_default;
 
 void scale_latest_set(const scale_latest_t *s)
 {
@@ -245,6 +246,23 @@ esp_err_t scale_hx711_calibrate(scale_hx711_t *s,
     (void)scale_nvs_save(s);
 
     return ESP_OK;
+}
+
+void scale_hx711_set_default(scale_hx711_t *s)
+{
+    s_default = s;
+}
+
+esp_err_t scale_hx711_tare_default(uint16_t samples)
+{
+    if (!s_default) return ESP_ERR_INVALID_STATE;
+    return scale_hx711_tare(s_default, samples);
+}
+
+esp_err_t scale_hx711_calibrate_default(float grams_on_scale, uint16_t samples)
+{
+    if (!s_default) return ESP_ERR_INVALID_STATE;
+    return scale_hx711_calibrate(s_default, grams_on_scale, samples);
 }
 
 

@@ -132,3 +132,8 @@ esp_err_t scale_hx711_read_grams(scale_hx711_t *s,
                                  int32_t *raw_out,
                                  float *grams_out,
                                  bool  *is_valid);
+
+// Optional default instance helpers (for UI-triggered calibration).
+void scale_hx711_set_default(scale_hx711_t *s);
+esp_err_t scale_hx711_tare_default(uint16_t samples);
+esp_err_t scale_hx711_calibrate_default(float grams_on_scale, uint16_t samples);

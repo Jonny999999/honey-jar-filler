@@ -7,10 +7,38 @@
 #include "buzzer.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "scale_hx711.h"
 
 #define LINE2PIXEL(n) ((n) * 8)
+#define MENU_TARE_SAMPLES 16
+#define MENU_CAL_SAMPLES  16
 
 static const char *TAG = "ui_menu";
+
+// Menu action entries (add here + handle in ui_menu_on_click).
+typedef enum {
+    MENU_ACTION_TARE = 0,
+    MENU_ACTION_CAL,
+    MENU_ACTION_COUNT
+} menu_action_t;
+
+// Labels shown in the settings list.
+static const char *k_action_labels[MENU_ACTION_COUNT] = {
+    "Tare scale",
+    "Calibrate scale",
+};
+
+// Brief descriptions shown in the settings list (line 6/7 area).
+static const char *k_action_brief[MENU_ACTION_COUNT] = {
+    "Zero the scale (no weight)",
+    "Calibrate with reference weight",
+};
+
+// Optional instruction line (line 4) for actions. Use %u for weight if needed.
+static const char *k_action_instr_fmt[MENU_ACTION_COUNT] = {
+    "Empty scale + Click",
+    "Place %u g + Click",
+};
 
 static void menu_format_value(const app_param_meta_t *meta,
                               const app_params_t *p,
@@ -124,6 +152,16 @@ static const app_param_meta_t *menu_meta_at(size_t index, size_t *count_out)
     return &meta[index];
 }
 
+static bool menu_is_action_index(size_t index, size_t param_count)
+{
+    return index >= param_count;
+}
+
+static size_t menu_total_count(size_t param_count)
+{
+    return param_count + MENU_ACTION_COUNT;
+}
+
 void ui_menu_enter(ui_menu_t *m, const app_params_t *cur)
 {
     if (!m || !cur) return;
@@ -160,9 +198,10 @@ void ui_menu_on_rotate(ui_menu_t *m, int32_t delta)
     if (!meta || count == 0) return;
 
     if (m->view == UI_MENU_VIEW_LIST) {
+        size_t total = menu_total_count(count);
         int32_t idx = (int32_t)m->index + delta;
-        if (idx < 0) idx = (int32_t)count - 1;
-        if ((size_t)idx >= count) idx = 0;
+        if (idx < 0) idx = (int32_t)total - 1;
+        if ((size_t)idx >= total) idx = 0;
         m->index = (size_t)idx;
         buzzer_beep_ms(30);
         ESP_LOGD(TAG, "list: index=%u", (unsigned)m->index);
@@ -176,6 +215,22 @@ void ui_menu_on_rotate(ui_menu_t *m, int32_t delta)
 bool ui_menu_on_click(ui_menu_t *m, app_params_t *out_apply)
 {
     if (!m) return false;
+    size_t param_count = 0;
+    (void)app_params_meta_get(&param_count);
+    if (m->view == UI_MENU_VIEW_LIST && menu_is_action_index(m->index, param_count)) {
+        size_t action_idx = m->index - param_count;
+        if (action_idx == MENU_ACTION_TARE) {
+            ESP_LOGI(TAG, "action: tare");
+            (void)scale_hx711_tare_default(MENU_TARE_SAMPLES);
+            buzzer_beep_long(2);
+        } else if (action_idx == MENU_ACTION_CAL) {
+            ESP_LOGI(TAG, "action: calibrate (%u g)", (unsigned)m->working.scale_cal_ref_g);
+            (void)scale_hx711_calibrate_default((float)m->working.scale_cal_ref_g, MENU_CAL_SAMPLES);
+            buzzer_beep_long(2);
+        }
+        return false;
+    }
+
     if (m->view == UI_MENU_VIEW_LIST) {
         m->view = UI_MENU_VIEW_EDIT;
         ESP_LOGI(TAG, "edit: enter");
@@ -209,6 +264,7 @@ void ui_menu_render(const ui_menu_t *m, ssd1306_handle_t disp)
     size_t count = 0;
     const app_param_meta_t *meta = menu_meta_at(m->index, &count);
     if (!meta) return;
+    bool is_action = menu_is_action_index(m->index, count);
 
     char line0[24];
     char line1[24];
@@ -227,16 +283,32 @@ void ui_menu_render(const ui_menu_t *m, ssd1306_handle_t disp)
     line6[0] = '\0';
 
     if (m->view == UI_MENU_VIEW_LIST) {
+        size_t total = menu_total_count(count);
         snprintf(line0, sizeof(line0), "Settings %u/%u",
-                 (unsigned)(m->index + 1), (unsigned)count);
-        snprintf(line1, sizeof(line1), "%s", meta->label ? meta->label : meta->name);
-
-        char val[16];
-        menu_format_value(meta, &m->working, val, sizeof(val));
-        snprintf(line3, sizeof(line3), "Val: %s%s%s",
-                 val,
-                 (meta->unit && meta->unit[0]) ? " " : "",
-                 (meta->unit && meta->unit[0]) ? meta->unit : "");
+                 (unsigned)(m->index + 1), (unsigned)total);
+        if (is_action) {
+            size_t action_idx = m->index - count;
+            char brief_a[24];
+            char brief_b[24];
+            snprintf(line1, sizeof(line1), "%s", k_action_labels[action_idx]);
+            menu_wrap_brief(k_action_brief[action_idx], brief_a, sizeof(brief_a), brief_b, sizeof(brief_b));
+            snprintf(line3, sizeof(line3), "%s", brief_a);
+            snprintf(line4, sizeof(line4), "%s", brief_b);
+            if (action_idx == MENU_ACTION_CAL) {
+                snprintf(line2, sizeof(line2), k_action_instr_fmt[action_idx],
+                         (unsigned)m->working.scale_cal_ref_g);
+            } else {
+                snprintf(line2, sizeof(line2), "%s", k_action_instr_fmt[action_idx]);
+            }
+        } else {
+            snprintf(line1, sizeof(line1), "%s", meta->label ? meta->label : meta->name);
+            char val[16];
+            menu_format_value(meta, &m->working, val, sizeof(val));
+            snprintf(line3, sizeof(line3), "Val: %s%s%s",
+                     val,
+                     (meta->unit && meta->unit[0]) ? " " : "",
+                     (meta->unit && meta->unit[0]) ? meta->unit : "");
+        }
     } else {
         char val[16];
         char defv[16];
