@@ -6,7 +6,7 @@
 #define APP_PARAMS_DEF_H
 
 // Bump APP_PARAMS_VERSION to force defaults reload.
-#define APP_PARAMS_VERSION 10
+#define APP_PARAMS_VERSION 14
 
 #define VAR(x)     x
 #define LABEL(x)   x
@@ -101,6 +101,25 @@
                  DEFAULT(6), MIN(1), MAX(20), STEP(1),                     \
                  BRIEF("Number of jars per run"),                          \
                  DETAIL("Stops after this many positions filled/tried - number of jar slots in the magazine disk"),               \
-                 GROUP("Mechanics / motion"))
+                 GROUP("Mechanics / motion"))                              \
+                                                                          \
+    /*=== Gate calibration ===*/                                           \
+    APP_PARAM_FLOAT(VAR(gate_open_deg), LABEL("Gate open deg"), UNIT("deg"), \
+                    DEFAULT(4.0f), MIN(0.0f), MAX(180.0f), STEP(1.0f),       \
+                    BRIEF("Servo open angle    (restart to apply)"),                              \
+                    DETAIL("Gate open angle in degrees"),                   \
+                    GROUP("Gate calibration"))                              \
+    APP_PARAM_FLOAT(VAR(gate_close_deg), LABEL("Gate close deg"), UNIT("deg"), \
+                    DEFAULT(102.5f), MIN(0.0f), MAX(180.0f), STEP(1.0f),     \
+                    BRIEF("Servo closed angle  (restart to apply)"),                            \
+                    DETAIL("Gate closed angle in degrees"),                 \
+                    GROUP("Gate calibration"))                              \
+                                                                           \
+    /*=== Scale calibration ===*/                                         \
+    APP_PARAM_U32(VAR(scale_cal_ref_g), LABEL("Scale cal weight"), UNIT("g"), \
+                  DEFAULT(500), MIN(50), MAX(5000), STEP(10),              \
+                  BRIEF("Reference weight used for scale calibration"),         \
+                  DETAIL("Used when running scale calibration"),           \
+                  GROUP("Scale calibration"))
 
 #endif // APP_PARAMS_DEF_H
