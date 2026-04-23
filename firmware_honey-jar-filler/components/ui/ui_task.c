@@ -113,6 +113,7 @@ static void ui_render_anim_block(uint8_t r, uint8_t g, uint8_t b, int pos)
     if (!s_strip) return;
     int count = CONFIG_WS2812_LED_COUNT;
     if (count <= 0) return;
+    int opposite_pos = (pos + (count / 2)) % count;
 
     uint8_t dr = (uint8_t)((r * UI_ANIM_DIM_PCT) / 100);
     uint8_t dg = (uint8_t)((g * UI_ANIM_DIM_PCT) / 100);
@@ -124,6 +125,8 @@ static void ui_render_anim_block(uint8_t r, uint8_t g, uint8_t b, int pos)
     for (int i = 0; i < UI_ANIM_BLOCK_LEN; ++i) {
         int idx = (pos + i) % count;
         ui_ws2812_set_pixel(idx, dr, dg, db);
+        int opposite_idx = (opposite_pos + i) % count;
+        ui_ws2812_set_pixel(opposite_idx, dr, dg, db);
     }
     (void)led_strip_refresh(s_strip);
 }

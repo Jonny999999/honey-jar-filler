@@ -22,7 +22,7 @@
 #define APP_PARAMS_DEF_LIST(APP_PARAM_FLOAT, APP_PARAM_U32, APP_PARAM_U8) \
     /*=== Target + verification ===*/                                    \
     APP_PARAM_U32(VAR(target_grams), LABEL("Target"), UNIT("g"),            \
-                    DEFAULT(150), MIN(10), MAX(2000), STEP(10),               \
+                    DEFAULT(150), MIN(10), MAX(2000), STEP(5),               \
                     BRIEF("Target filled mass per jar"),                    \
                     DETAIL("Final filled weight target for each jar (actual content, not including jar)"),      \
                     GROUP("Target + verification"))                         \
@@ -44,7 +44,7 @@
                                                                           \
     /*=== Honey flow tuning ===*/                                         \
     APP_PARAM_U32(VAR(near_close_delta_g), LABEL("Near-close threshold g"), UNIT("g"),   \
-                    DEFAULT(60), MIN(0), MAX(500), STEP(5),                 \
+                    DEFAULT(60), MIN(0), MAX(500), STEP(1),                 \
                     BRIEF("Grams missing to target, gate partially closes"),           \
                     DETAIL("Start slowing flow when this close to target"), \
                     GROUP("Honey flow tuning"))                             \
@@ -59,12 +59,12 @@
                     DETAIL("Caps full-open position to reduce max flow (e.g. small glass or water)"),      \
                     GROUP("Honey flow tuning"))                             \
     APP_PARAM_U32(VAR(close_early_g), LABEL("Close early threshold"), UNIT("g"),       \
-                    DEFAULT(150), MIN(0), MAX(500), STEP(5),                 \
+                    DEFAULT(150), MIN(0), MAX(500), STEP(1),                 \
                     BRIEF("Close before target to compensate drips"),      \
                     DETAIL("Thick honey usually needs a larger value; thin honey needs less - equals estimated in-flight mass"), \
                     GROUP("Honey flow tuning"))                             \
     APP_PARAM_U32(VAR(drip_delay_ms), LABEL("Drip delay"), UNIT("ms"),      \
-                  DEFAULT(4e3), MIN(0), MAX(30e3), STEP(100),             \
+                  DEFAULT(10e3), MIN(0), MAX(60e3), STEP(500),             \
                   BRIEF("Wait after closing gate for drips before verifying"),              \
                   DETAIL("Let residual honey fall into jar before verifying the weight"),              \
                   GROUP("Honey flow tuning"))                               \
