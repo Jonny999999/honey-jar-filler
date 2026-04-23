@@ -229,6 +229,17 @@ static bool stable_below(float value, float threshold, uint8_t *count, uint8_t r
     return *count >= required;
 }
 
+static uint8_t slot_count_sane(uint8_t configured_slots)
+{
+    return (configured_slots == 0) ? 1 : configured_slots;
+}
+
+static uint8_t slot_next_idx(uint8_t idx, uint8_t configured_slots)
+{
+    uint8_t slots = slot_count_sane(configured_slots);
+    return (uint8_t)((idx + 1) % slots);
+}
+
 static void task_filler_fsm(void *arg)
 {
     (void)arg;
@@ -244,6 +255,7 @@ static void task_filler_fsm(void *arg)
     uint8_t cnt_under = 0;
     uint8_t cnt_over = 0;
     uint8_t sample_count = 0;
+    uint8_t skipped_slots_streak = 0;
     int64_t last_sample_ts = 0;
 
     app_params_t params = {0};
@@ -293,6 +305,7 @@ static void task_filler_fsm(void *arg)
             case FILLER_FAULT:
                 filler_stop_all();
                 jar_tare_clear();
+                skipped_slots_streak = 0;
                 break;
             case FILLER_FIND_SLOT:
                 ESP_LOGD(TAG, "motor on (find slot)");
@@ -342,8 +355,9 @@ static void task_filler_fsm(void *arg)
             // Waiting for start request.
             filler_set_fault(FLT_NONE);
             if (filler_take_start_req()) {
-                ESP_LOGI(TAG, "start: slots_total=%u", (unsigned)params.slots_total);
+                ESP_LOGI(TAG, "start: carousel_slots=%u", (unsigned)slot_count_sane(params.slots_total));
                 filler_set_slot(0);
+                skipped_slots_streak = 0;
                 state = FILLER_FIND_SLOT;
                 filler_set_state(state);
             }
@@ -381,25 +395,40 @@ static void task_filler_fsm(void *arg)
                 break;
             }
             if (grams < params.empty_glass_min_g) {
-                ESP_LOGW(TAG, "no jar: %.1f g (min %.1f g) -> skip slot", (double)grams, (double)params.empty_glass_min_g);
                 uint8_t cur = filler_get_slot_idx();
-                uint8_t next = cur + 1;
-                ESP_LOGI(TAG, "slot skipped: %u -> %u (total=%u)",
-                         (unsigned)cur, (unsigned)next, (unsigned)params.slots_total);
+                uint8_t next = slot_next_idx(cur, params.slots_total);
+                skipped_slots_streak++;
+                ESP_LOGW(TAG, "no jar: %.1f g (min %.1f g) -> skip slot", (double)grams, (double)params.empty_glass_min_g);
+                ESP_LOGI(TAG, "slot unavailable: %u -> %u (skip streak=%u/%u)",
+                         (unsigned)cur, (unsigned)next,
+                         (unsigned)skipped_slots_streak, (unsigned)slot_count_sane(params.slots_total));
                 filler_set_slot(next);
-                state = (next >= params.slots_total) ? FILLER_DONE : FILLER_FIND_SLOT;
+                if (skipped_slots_streak >= slot_count_sane(params.slots_total)) {
+                    ESP_LOGI(TAG, "stop: full revolution without fillable jar");
+                    state = FILLER_DONE;
+                } else {
+                    state = FILLER_FIND_SLOT;
+                }
                 filler_set_state(state);
             } else if (grams > params.empty_glass_max_g) {
-                ESP_LOGW(TAG, "jar not empty: %.1f g (max %.1f g) -> skip slot", (double)grams, (double)params.empty_glass_max_g);
                 uint8_t cur = filler_get_slot_idx();
-                uint8_t next = cur + 1;
-                ESP_LOGI(TAG, "slot skipped: %u -> %u (total=%u)",
-                         (unsigned)cur, (unsigned)next, (unsigned)params.slots_total);
+                uint8_t next = slot_next_idx(cur, params.slots_total);
+                skipped_slots_streak++;
+                ESP_LOGW(TAG, "jar not empty: %.1f g (max %.1f g) -> skip slot", (double)grams, (double)params.empty_glass_max_g);
+                ESP_LOGI(TAG, "slot unavailable: %u -> %u (skip streak=%u/%u)",
+                         (unsigned)cur, (unsigned)next,
+                         (unsigned)skipped_slots_streak, (unsigned)slot_count_sane(params.slots_total));
                 filler_set_slot(next);
-                state = (next >= params.slots_total) ? FILLER_DONE : FILLER_FIND_SLOT;
+                if (skipped_slots_streak >= slot_count_sane(params.slots_total)) {
+                    ESP_LOGI(TAG, "stop: full revolution without fillable jar");
+                    state = FILLER_DONE;
+                } else {
+                    state = FILLER_FIND_SLOT;
+                }
                 filler_set_state(state);
             } else {
                 jar_tare_set(grams);
+                skipped_slots_streak = 0;
                 ESP_LOGI(TAG, "empty jar verified: %.1f g (tare set)", (double)grams);
                 state = FILLER_FILL;
                 filler_set_state(state);
@@ -503,22 +532,18 @@ static void task_filler_fsm(void *arg)
             } else if (sample_count >= THRESH_CONFIRM_COUNT) {
                 ESP_LOGI(TAG, "target verified: rel=%.1f g", (double)rel_g);
                 uint8_t cur = filler_get_slot_idx();
-                uint8_t next = cur + 1;
-                ESP_LOGI(TAG, "slot complete: %u -> %u (total=%u)",
-                         (unsigned)cur, (unsigned)next, (unsigned)params.slots_total);
+                uint8_t next = slot_next_idx(cur, params.slots_total);
+                ESP_LOGI(TAG, "slot complete: %u -> %u", (unsigned)cur, (unsigned)next);
                 filler_set_slot(next);
-                if (next >= params.slots_total) {
-                    state = FILLER_DONE;
-                } else {
-                    state = FILLER_FIND_SLOT;
-                }
+                skipped_slots_streak = 0;
+                state = FILLER_FIND_SLOT;
                 filler_set_state(state);
             }
             break;
         }
 
         case FILLER_DONE:
-            // Finished all slots; return to idle.
+            // Nothing fillable found in a full revolution; return to idle.
             state = FILLER_IDLE;
             filler_set_state(state);
             break;
@@ -529,6 +554,7 @@ static void task_filler_fsm(void *arg)
                 ESP_LOGI(TAG, "restart after fault");
                 filler_set_fault(FLT_NONE);
                 filler_set_slot(0);
+                skipped_slots_streak = 0;
                 state = FILLER_FIND_SLOT;
                 filler_set_state(state);
             }

@@ -97,10 +97,10 @@
                   BRIEF("Wait after slot found before verifying empty"),         \
                   DETAIL("Allows motor, jar and scale to settle before starting next step (verify + fill)"),             \
                   GROUP("Mechanics / motion"))                             \
-    APP_PARAM_U8(VAR(slots_total), LABEL("Slots total"), UNIT(""),         \
+    APP_PARAM_U8(VAR(slots_total), LABEL("Carousel slots"), UNIT(""),      \
                  DEFAULT(6), MIN(1), MAX(20), STEP(1),                     \
-                 BRIEF("Number of jars per run"),                          \
-                 DETAIL("Stops after this many positions filled/tried - number of jar slots in the magazine disk"),               \
+                 BRIEF("Physical jar positions on the carousel"),          \
+                 DETAIL("Used to track one full revolution. The run stops normally after a full lap without finding a fillable jar"), \
                  GROUP("Mechanics / motion"))                              \
                                                                           \
     /*=== Gate calibration ===*/                                           \
