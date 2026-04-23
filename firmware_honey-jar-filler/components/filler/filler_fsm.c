@@ -237,7 +237,7 @@ static void task_filler_fsm(void *arg)
     filler_state_t last_state = FILLER_DONE;
     int64_t state_enter_us = esp_timer_get_time();
     bool near_close_logged = false;
-    float close_early_g_cur = 0.0f;
+    float close_early_relax_g = 0.0f;
     uint8_t cnt_near_close = 0;
     uint8_t cnt_close_early = 0;
     uint8_t cnt_target = 0;
@@ -249,6 +249,8 @@ static void task_filler_fsm(void *arg)
     app_params_t params = {0};
 
     for (;;) {
+        app_params_get(&params);
+
         // Handle abort at any time.
         if (filler_take_abort_req()) {
             ESP_LOGW(TAG, "abort requested");
@@ -262,7 +264,6 @@ static void task_filler_fsm(void *arg)
         if (state != last_state) {
             filler_state_t prev_state = last_state;
             state_enter_us = esp_timer_get_time();
-            app_params_get(&params);
             near_close_logged = false;
             cnt_near_close = 0;
             cnt_close_early = 0;
@@ -311,7 +312,7 @@ static void task_filler_fsm(void *arg)
             case FILLER_FILL:
                 ESP_LOGD(TAG, "fill: gate open");
                 if (prev_state != FILLER_VERIFY_TARGET) {
-                    close_early_g_cur = (float)params.close_early_g;
+                    close_early_relax_g = 0.0f;
                 }
                 gate_set_percent_cached(params.max_gate_pct);
                 break;
@@ -413,6 +414,8 @@ static void task_filler_fsm(void *arg)
             float tare_g = 0.0f;
             bool has_tare = jar_tare_get(&tare_g);
             float rel_g = grams - (has_tare ? tare_g : 0.0f);
+            float close_early_g_cur = (float)params.close_early_g - close_early_relax_g;
+            if (close_early_g_cur < 0.0f) close_early_g_cur = 0.0f;
             float near_close = (float)params.target_grams - (float)params.near_close_delta_g;
             float close_early = (float)params.target_grams - close_early_g_cur;
             if ((esp_timer_get_time() - state_enter_us) > ((int64_t)params.fill_timeout_ms * 1000)) {
@@ -482,9 +485,14 @@ static void task_filler_fsm(void *arg)
                 float under = (float)params.target_grams - rel_g;
                 ESP_LOGI(TAG, "underweight: rel=%.1f g (-%.1f g, tol=-%.1f g) -> refill",
                          (double)rel_g, (double)under, (double)tol_low_g);
+                float close_early_g_cur = (float)params.close_early_g - close_early_relax_g;
                 if (close_early_g_cur > 0.0f) {
                     float prev_g = close_early_g_cur;
-                    close_early_g_cur -= CLOSE_EARLY_STEP_G;
+                    close_early_relax_g += CLOSE_EARLY_STEP_G;
+                    if (close_early_relax_g > (float)params.close_early_g) {
+                        close_early_relax_g = (float)params.close_early_g;
+                    }
+                    close_early_g_cur = (float)params.close_early_g - close_early_relax_g;
                     if (close_early_g_cur < 0.0f) close_early_g_cur = 0.0f;
                     ESP_LOGI(TAG, "relax close_early: %.1f g -> %.1f g",
                              (double)prev_g, (double)close_early_g_cur);

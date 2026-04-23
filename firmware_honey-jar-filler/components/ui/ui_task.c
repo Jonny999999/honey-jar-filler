@@ -305,7 +305,7 @@ static void task_ui(void *arg)
         }
 
         if (!ui_menu_is_active(&menu)) {
-            if (enc_long && (st == FILLER_IDLE || st == FILLER_FAULT)) {
+            if (enc_long) {
                 app_params_t params;
                 app_params_get(&params);
                 ui_menu_enter(&menu, &params);
@@ -315,6 +315,9 @@ static void task_ui(void *arg)
         }
 
         if (ui_menu_is_active(&menu)) {
+            if (st != FILLER_IDLE && st != FILLER_FAULT) {
+                ui_handle_button(st);
+            }
             if (enc_long) {
                 if (!ui_menu_on_long_press(&menu)) {
                     ui_menu_exit(&menu);
