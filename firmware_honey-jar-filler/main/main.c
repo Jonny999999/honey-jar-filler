@@ -566,9 +566,10 @@ void app_main(void)
     // Default to warnings; bump specific components as needed.
     esp_log_level_set("*", ESP_LOG_WARN);
     esp_log_level_set("main", ESP_LOG_WARN);
-    esp_log_level_set("app_params", ESP_LOG_WARN);
+    esp_log_level_set("app_params", ESP_LOG_INFO);
     esp_log_level_set("scale_hx711", ESP_LOG_WARN);
-    esp_log_level_set("ui_task", ESP_LOG_WARN);
+    esp_log_level_set("ui_task", ESP_LOG_INFO);
+    esp_log_level_set("ui_menu", ESP_LOG_INFO);
     esp_log_level_set("gate", ESP_LOG_WARN);
     esp_log_level_set("buzzer", ESP_LOG_WARN);
     esp_log_level_set("io_test", ESP_LOG_WARN);
@@ -578,6 +579,8 @@ void app_main(void)
 
     // Load persistent app parameters (targets/timeouts).
     app_params_init();
+    app_params_t app_params = {0};
+    app_params_get(&app_params);
 
 
     //=============================
@@ -634,6 +637,7 @@ void app_main(void)
     // init HX711 wrapper
     static scale_hx711_t scale;
     ESP_ERROR_CHECK(scale_hx711_init(&scale));
+    scale_hx711_set_default(&scale);
 
     #define SCALE_RUN_CALIBRATION 0
 #if SCALE_RUN_CALIBRATION //TODO: trigger this with UI
@@ -707,8 +711,8 @@ void app_main(void)
         .pwm_gpio = CONFIG_SERVO_PWM_GPIO,
         .en_gpio = CONFIG_SERVO_ENABLE_GPIO,
         // If mechanics are inverted, set open_deg < close_deg.
-        .open_deg = 4.0f,
-        .close_deg = 102.5f,
+        .open_deg = app_params.gate_open_deg,
+        .close_deg = app_params.gate_close_deg,
     };
     ESP_ERROR_CHECK(gate_init(&gate_cfg));
     if (CONFIG_DISABLE_SERVO) {

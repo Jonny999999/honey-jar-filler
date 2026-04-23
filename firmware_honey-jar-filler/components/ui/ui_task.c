@@ -15,6 +15,7 @@
 #include "filler_fsm.h"
 #include "led_strip.h"
 #include "scale_hx711.h"
+#include "ui_menu.h"
 
 // UI refresh rate.
 //#define UI_PERIOD_MS 200
@@ -24,7 +25,7 @@
 #define UI_BTN_DEBOUNCE_MS 50
 
 // Encoder step for target grams.
-#define UI_TARGET_STEP_G 10.0f
+#define UI_TARGET_STEP_G 10u
 
 // LED strip brightness limit (% of 255). Override in config.h.
 #define UI_WS2812_MAX_BRIGHTNESS_PCT CONFIG_WS2812_MAX_BRIGHTNESS_PCT
@@ -167,10 +168,11 @@ static void ui_handle_encoder(filler_state_t st, int32_t enc_delta, int64_t *las
 
     app_params_t p;
     app_params_get(&p);
-    p.target_grams += ((float)enc_delta * UI_TARGET_STEP_G);
-    if (p.target_grams < 0.0f) p.target_grams = 0.0f;
+    int32_t tgt = (int32_t)p.target_grams + (int32_t)enc_delta * (int32_t)UI_TARGET_STEP_G;
+    if (tgt < 0) tgt = 0;
+    p.target_grams = (uint32_t)tgt;
     (void)app_params_set(&p);
-    ESP_LOGI(TAG, "encoder: target=%.1f g", (double)p.target_grams);
+    ESP_LOGI(TAG, "encoder: target=%u g", (unsigned)p.target_grams);
 
     if (last_beep_us) {
         int64_t now_us = esp_timer_get_time();
@@ -219,9 +221,9 @@ static void ui_render(ssd1306_handle_t disp,
     ssd1306_draw_text(disp, 0, LINE2PIXEL(4), line2, true);
 
     // Line 3: action hint + target.
-    snprintf(line3, sizeof(line3), "Btn:%s  Tgt:%3.0fg",
+    snprintf(line3, sizeof(line3), "Btn:%s  Tgt:%ug",
              (st == FILLER_IDLE || st == FILLER_FAULT) ? "START" : "STOP",
-             (double)p->target_grams);
+             (unsigned)p->target_grams);
     ssd1306_draw_text(disp, 0, LINE2PIXEL(6), line3, true);
 
     ssd1306_display(disp);
@@ -237,6 +239,7 @@ static void task_ui(void *arg)
     int anim_pos = 0;
     bool anim_active = false;
     uint8_t base_r = 0, base_g = 0, base_b = 0;
+    ui_menu_t menu = {0};
 
     TickType_t next_refresh = xTaskGetTickCount() + pdMS_TO_TICKS(UI_PERIOD_MS);
     const TickType_t period = pdMS_TO_TICKS(UI_PERIOD_MS);
@@ -255,15 +258,23 @@ static void task_ui(void *arg)
             if (wait_anim < wait) wait = wait_anim;
         }
         int32_t enc_delta = 0;
+        bool enc_click = false;
+        bool enc_long = false;
 
         // Consume encoder events (bounded by the wait time computed above).
         if (s_enc_q) {
             rotary_encoder_event_t ev;
             if (xQueueReceive(s_enc_q, &ev, wait) == pdPASS) {
+                ESP_LOGD(TAG, "enc: type=%d diff=%d", (int)ev.type, (int)ev.diff);
                 if (ev.type == RE_ET_CHANGED) enc_delta += ev.diff;
+                if (ev.type == RE_ET_BTN_CLICKED) enc_click = true;
+                if (ev.type == RE_ET_BTN_LONG_PRESSED) enc_long = true;
                 // Drain any queued events quickly.
                 while (xQueueReceive(s_enc_q, &ev, 0) == pdPASS) {
+                    ESP_LOGD(TAG, "enc: type=%d diff=%d", (int)ev.type, (int)ev.diff);
                     if (ev.type == RE_ET_CHANGED) enc_delta += ev.diff;
+                    if (ev.type == RE_ET_BTN_CLICKED) enc_click = true;
+                    if (ev.type == RE_ET_BTN_LONG_PRESSED) enc_long = true;
                 }
             }
         } else {
@@ -290,8 +301,35 @@ static void task_ui(void *arg)
             next_anim = 0;
         }
 
-        ui_handle_button(st);
-        ui_handle_encoder(st, enc_delta, &last_beep_us);
+        if (!ui_menu_is_active(&menu)) {
+            if (enc_long && (st == FILLER_IDLE || st == FILLER_FAULT)) {
+                app_params_t params;
+                app_params_get(&params);
+                ui_menu_enter(&menu, &params);
+                ESP_LOGI(TAG, "menu: enter");
+                enc_long = false;
+            }
+        }
+
+        if (ui_menu_is_active(&menu)) {
+            if (enc_long) {
+                if (!ui_menu_on_long_press(&menu)) {
+                    ui_menu_exit(&menu);
+                    ESP_LOGI(TAG, "menu: exit");
+                }
+            }
+            if (enc_click) {
+                app_params_t apply;
+                if (ui_menu_on_click(&menu, &apply)) {
+                    (void)app_params_set(&apply);
+                    ESP_LOGI(TAG, "menu: saved");
+                }
+            }
+            ui_menu_on_rotate(&menu, enc_delta);
+        } else {
+            ui_handle_button(st);
+            ui_handle_encoder(st, enc_delta, &last_beep_us);
+        }
 
         // Run lightweight LED animation ticks only when active.
         if (anim_active) {
@@ -307,16 +345,20 @@ static void task_ui(void *arg)
 
         now_ticks = xTaskGetTickCount();
         if (now_ticks >= next_refresh) {
-            scale_latest_t latest = {0};
-            scale_latest_get(&latest);
+            if (ui_menu_is_active(&menu)) {
+                ui_menu_render(&menu, cfg.disp);
+            } else {
+                scale_latest_t latest = {0};
+                scale_latest_get(&latest);
 
-            app_params_t params;
-            app_params_get(&params);
+                app_params_t params;
+                app_params_get(&params);
 
-            uint8_t slot = filler_get_slot_idx();
-            float tare_g = 0.0f;
-            bool has_tare = filler_get_jar_tare(&tare_g);
-            ui_render(cfg.disp, &latest, &params, st, slot, flt, has_tare, tare_g);
+                uint8_t slot = filler_get_slot_idx();
+                float tare_g = 0.0f;
+                bool has_tare = filler_get_jar_tare(&tare_g);
+                ui_render(cfg.disp, &latest, &params, st, slot, flt, has_tare, tare_g);
+            }
             next_refresh = now_ticks + period;
         }
     }

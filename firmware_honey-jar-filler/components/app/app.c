@@ -1,10 +1,13 @@
 #include "app.h"
 
+#include <stdio.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "nvs.h"
 #include "nvs_flash.h"
 #include "esp_log.h"
+
+#include "app_params_def.h"
 
 #define NVS_NAMESPACE  "app"
 #define NVS_KEY_PARAMS "params_v1"
@@ -14,55 +17,61 @@ static app_params_t s_params;
 static const char *TAG = "app_params";
 
 // Bump to force defaults reload (when changing defaults/layout).
-#define APP_PARAMS_VERSION 10
+// APP_PARAMS_VERSION is defined in app_params_def.h
 
 // Centralized defaults for persistent parameters.
+static void app_params_apply_defaults(app_params_t *p)
+{
+    if (!p) return;
+    *p = (app_params_t){0};
+    // NOTE: bump APP_PARAMS_VERSION above to force defaults reload.
+    p->version = APP_PARAMS_VERSION;
+
+#define APP_PARAM_FLOAT(field, label, unit, def_val, min_val, max_val, step_val, brief, detail, group) \
+    p->field = (def_val);
+#define APP_PARAM_U32(field, label, unit, def_val, min_val, max_val, step_val, brief, detail, group)   \
+    p->field = (def_val);
+#define APP_PARAM_U8(field, label, unit, def_val, min_val, max_val, step_val, brief, detail, group)    \
+    p->field = (def_val);
+    APP_PARAMS_DEF_LIST(APP_PARAM_FLOAT, APP_PARAM_U32, APP_PARAM_U8)
+#undef APP_PARAM_FLOAT
+#undef APP_PARAM_U32
+#undef APP_PARAM_U8
+}
+
 static app_params_t app_params_defaults(void)
 {
-    app_params_t p = {
-        //=== Meta / versions ===
-        // NOTE: bump APP_PARAMS_VERSION above to force defaults reload.
-        .version            = APP_PARAMS_VERSION,
-
-        //=== Target + verification ===
-        // Target filled mass per jar (grams).
-        .target_grams       = 150.0f,
-        // Target tolerance (%) below target that triggers a refill.
-        .target_tol_low_pct = 3.0f,
-        // Target tolerance (%) above target that triggers a fault.
-        .target_tol_high_pct= 20.0f,
-        // Max time allowed in FILL before faulting (ms).
-        .fill_timeout_ms    = 180000,
-        // Empty jar weight window (grams) used to detect missing or already filled jars 
-        // (skips slot when outside this range)
-        .empty_glass_min_g  = 100.0f,
-        .empty_glass_max_g  = 200.0f,
-
-
-        //=== Honey flow tuning ===
-        // When within this many grams of target, partially close gate to slow flow.
-        .near_close_delta_g = 60.0f,
-        // Partial opening (%) used once near_close_delta_g is reached.
-        .near_close_gate_pct= 16.0f,
-        // Max gate opening (%) during bulk fill (cap to avoid over-speed).
-        .max_gate_pct       = 30.0f,
-        // Close this many % before target to compensate drip/in-flight volume.
-        // Thick honey usually needs a larger value; thin honey needs less.
-        .close_early_pct    = 10.0f,
-        // Wait after closing gate so drips fall into the jar (ms).
-        .drip_delay_ms      = 4000,
-
-        //=== Mechanics / motion ===
-        // Max time to find the position switch while advancing (ms).
-        .advance_timeout_ms = 4000,
-        // Ignore POS switch for this long after motor start (ms) (aka motor min time on)
-        .find_ignore_ms     = 500,
-        // Wait after slot found so motor/scale settles before weighing + verifying glass (ms).
-        .slot_settle_ms     = 1500,
-        // Total number of jars per run.
-        .slots_total        = 3,
-    };
+    app_params_t p;
+    app_params_apply_defaults(&p);
     return p;
+}
+
+static void app_params_log_all(const app_params_t *cur)
+{
+    ESP_LOGW(TAG, "app parameters (version=%u):", (unsigned)cur->version);
+
+#define APP_PARAM_FLOAT(field, label, unit, def_val, min_val, max_val, step_val, brief, detail, group) \
+    ESP_LOGW(TAG, "  %s=%.1f%s%s (default=%.1f min=%.1f max=%.1f step=%.1f) - %s", \
+             #field, (double)cur->field,                                       \
+             (unit && unit[0]) ? " " : "", (unit && unit[0]) ? unit : "",      \
+             (double)(def_val), (double)(min_val), (double)(max_val), (double)(step_val), \
+             brief);
+#define APP_PARAM_U32(field, label, unit, def_val, min_val, max_val, step_val, brief, detail, group) \
+    ESP_LOGW(TAG, "  %s=%u%s%s (def=%u min=%u max=%u step=%u) - %s",          \
+             #field, (unsigned)cur->field,                                    \
+             (unit && unit[0]) ? " " : "", (unit && unit[0]) ? unit : "",     \
+             (unsigned)(def_val), (unsigned)(min_val), (unsigned)(max_val), (unsigned)(step_val), \
+             brief);
+#define APP_PARAM_U8(field, label, unit, def_val, min_val, max_val, step_val, brief, detail, group) \
+    ESP_LOGW(TAG, "  %s=%u%s%s (def=%u min=%u max=%u step=%u) - %s",          \
+             #field, (unsigned)cur->field,                                    \
+             (unit && unit[0]) ? " " : "", (unit && unit[0]) ? unit : "",     \
+             (unsigned)(def_val), (unsigned)(min_val), (unsigned)(max_val), (unsigned)(step_val), \
+             brief);
+    APP_PARAMS_DEF_LIST(APP_PARAM_FLOAT, APP_PARAM_U32, APP_PARAM_U8)
+#undef APP_PARAM_FLOAT
+#undef APP_PARAM_U32
+#undef APP_PARAM_U8
 }
 
 // Update the in-RAM copy (caller must hold mutex).
@@ -110,6 +119,15 @@ void app_params_init(void)
         nvs_close(h);
         if (err != ESP_OK || len != sizeof(s_params) || s_params.version != APP_PARAMS_VERSION) {
             // Invalid or mismatched blob -> reset to defaults.
+            if (err == ESP_OK && s_params.version != APP_PARAMS_VERSION) {
+                ESP_LOGW(TAG,
+                         "params: version mismatch (nvs=%u, expected=%u) -> defaults",
+                         (unsigned)s_params.version, (unsigned)APP_PARAMS_VERSION);
+            } else if (err != ESP_OK) {
+                ESP_LOGW(TAG, "params: load failed (%s) -> defaults", esp_err_to_name(err));
+            } else {
+                ESP_LOGW(TAG, "params: blob size mismatch -> defaults");
+            }
             s_params = defaults;
             need_save = true;
         }
@@ -129,47 +147,15 @@ void app_params_init(void)
         }
     }
 
-    ESP_LOGI(TAG,
-             "params:\n"
-             "  === Meta ===\n"
-             "  version=%u (param defaults)\n"
-             "  === Target + verification ===\n"
-             "  target_grams=%.1f g\n"
-             "  target_tol_low_pct=%.1f %%\n"
-             "  target_tol_high_pct=%.1f %%\n"
-             "  fill_timeout_ms=%u\n"
-             "  === Honey flow tuning ===\n"
-             "  near_close_delta_g=%.1f g\n"
-             "  near_close_gate_pct=%.1f %%\n"
-             "  max_gate_pct=%.1f %%\n"
-             "  close_early_pct=%.1f %%\n"
-             "  drip_delay_ms=%u\n"
-             "  === Glass detection ===\n"
-             "  empty_glass_min_g=%.1f g\n"
-             "  empty_glass_max_g=%.1f g\n"
-             "  === Mechanics / motion ===\n"
-             "  advance_timeout_ms=%u\n"
-             "  find_ignore_ms=%u\n"
-             "  slot_settle_ms=%u\n"
-             "  slots_total=%u",
-             (unsigned)s_params.version,
-             (double)s_params.target_grams,
-             (double)s_params.target_tol_low_pct,
-             (double)s_params.target_tol_high_pct,
-             (unsigned)s_params.fill_timeout_ms,
-             (double)s_params.near_close_delta_g,
-             (double)s_params.near_close_gate_pct,
-             (double)s_params.max_gate_pct,
-             (double)s_params.close_early_pct,
-             (unsigned)s_params.drip_delay_ms,
-             (double)s_params.empty_glass_min_g,
-             (double)s_params.empty_glass_max_g,
-             (unsigned)s_params.advance_timeout_ms,
-             (unsigned)s_params.find_ignore_ms,
-             (unsigned)s_params.slot_settle_ms,
-             (unsigned)s_params.slots_total);
+    app_params_log_all(&s_params);
 
     xSemaphoreGive(s_params_mtx);
+}
+
+void app_params_defaults_get(app_params_t *out)
+{
+    if (!out) return;
+    app_params_apply_defaults(out);
 }
 
 void app_params_get(app_params_t *out)

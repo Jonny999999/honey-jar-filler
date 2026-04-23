@@ -1,4 +1,4 @@
-idf_component_register(SRCS "ui_task.c"
+idf_component_register(SRCS "ui_task.c" "ui_menu.c"
                        INCLUDE_DIRS "."
                        PRIV_INCLUDE_DIRS "../../main"
                        REQUIRES ssd1306 app filler driver encoder hx711 buzzer led_strip)
