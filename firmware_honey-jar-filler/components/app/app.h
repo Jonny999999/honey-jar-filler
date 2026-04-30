@@ -21,6 +21,9 @@ typedef enum {
     APP_PARAM_SCOPE_MACHINE,
 } app_param_scope_t;
 
+#define APP_PRESET_COUNT     4u
+#define APP_PRESET_NAME_MAX 16u
+
 typedef struct {
     //=== Meta / versions ===
     uint16_t version;               // bump to force defaults reload when layout/defaults change
@@ -69,6 +72,12 @@ bool      app_params_is_dirty(void);
 void      app_params_defaults_get(app_params_t *out);
 void      app_params_copy_scope(app_params_t *dst, const app_params_t *src, app_param_scope_t scope);
 const char *app_param_scope_name(app_param_scope_t scope);
+
+size_t    app_presets_count(void);
+uint8_t   app_presets_get_active_index(void);
+const char *app_presets_get_name(uint8_t index);
+esp_err_t app_presets_select(uint8_t index);
+
 const app_param_meta_t *app_params_meta_get(size_t *out_count);
 
 #ifdef __cplusplus
