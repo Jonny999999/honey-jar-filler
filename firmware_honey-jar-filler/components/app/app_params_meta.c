@@ -7,7 +7,7 @@
 const app_param_meta_t *app_params_meta_get(size_t *out_count)
 {
     static const app_param_meta_t meta[] = {
-#define APP_PARAM_FLOAT(field, label_txt, unit_txt, def_val, min_val, max_val, step_val, brief_txt, detail_txt, group_txt) \
+#define APP_PARAM_FLOAT(field, label_txt, unit_txt, def_val, min_val, max_val, step_val, brief_txt, detail_txt, group_txt, scope_val) \
         {                                                                    \
             .name = #field,                                                  \
             .label = label_txt,                                              \
@@ -16,13 +16,14 @@ const app_param_meta_t *app_params_meta_get(size_t *out_count)
             .desc_detail = detail_txt,                                       \
             .group = group_txt,                                              \
             .type = APP_PARAM_FLOAT,                                         \
+            .scope = scope_val,                                              \
             .offset = offsetof(app_params_t, field),                         \
             .def.f = (def_val),                                              \
             .min.f = (min_val),                                              \
             .max.f = (max_val),                                              \
             .step.f = (step_val),                                            \
         },
-#define APP_PARAM_U32(field, label_txt, unit_txt, def_val, min_val, max_val, step_val, brief_txt, detail_txt, group_txt) \
+#define APP_PARAM_U32(field, label_txt, unit_txt, def_val, min_val, max_val, step_val, brief_txt, detail_txt, group_txt, scope_val) \
         {                                                                    \
             .name = #field,                                                  \
             .label = label_txt,                                              \
@@ -31,13 +32,14 @@ const app_param_meta_t *app_params_meta_get(size_t *out_count)
             .desc_detail = detail_txt,                                       \
             .group = group_txt,                                              \
             .type = APP_PARAM_U32,                                           \
+            .scope = scope_val,                                              \
             .offset = offsetof(app_params_t, field),                         \
             .def.u32 = (def_val),                                            \
             .min.u32 = (min_val),                                            \
             .max.u32 = (max_val),                                            \
             .step.u32 = (step_val),                                          \
         },
-#define APP_PARAM_U8(field, label_txt, unit_txt, def_val, min_val, max_val, step_val, brief_txt, detail_txt, group_txt) \
+#define APP_PARAM_U8(field, label_txt, unit_txt, def_val, min_val, max_val, step_val, brief_txt, detail_txt, group_txt, scope_val) \
         {                                                                    \
             .name = #field,                                                  \
             .label = label_txt,                                              \
@@ -46,6 +48,7 @@ const app_param_meta_t *app_params_meta_get(size_t *out_count)
             .desc_detail = detail_txt,                                       \
             .group = group_txt,                                              \
             .type = APP_PARAM_U8,                                            \
+            .scope = scope_val,                                              \
             .offset = offsetof(app_params_t, field),                         \
             .def.u8 = (def_val),                                             \
             .min.u8 = (min_val),                                             \

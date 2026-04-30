@@ -1,6 +1,7 @@
 #ifndef APP_H
 #define APP_H
 
+#include <stdbool.h>
 #include <stdint.h>
 #include <stddef.h>
 #include "esp_err.h"
@@ -9,15 +10,26 @@
 extern "C" {
 #endif
 
+typedef enum {
+    APP_PARAM_FLOAT = 0,
+    APP_PARAM_U32,
+    APP_PARAM_U8,
+} app_param_type_t;
+
+typedef enum {
+    APP_PARAM_SCOPE_PRESET = 0,
+    APP_PARAM_SCOPE_MACHINE,
+} app_param_scope_t;
+
 typedef struct {
     //=== Meta / versions ===
     uint16_t version;               // bump to force defaults reload when layout/defaults change
 
-#define APP_PARAM_FLOAT(field, label, unit, def_val, min_val, max_val, step_val, brief, detail, group) \
+#define APP_PARAM_FLOAT(field, label, unit, def_val, min_val, max_val, step_val, brief, detail, group, scope) \
     float field;
-#define APP_PARAM_U32(field, label, unit, def_val, min_val, max_val, step_val, brief, detail, group)   \
+#define APP_PARAM_U32(field, label, unit, def_val, min_val, max_val, step_val, brief, detail, group, scope)   \
     uint32_t field;
-#define APP_PARAM_U8(field, label, unit, def_val, min_val, max_val, step_val, brief, detail, group)    \
+#define APP_PARAM_U8(field, label, unit, def_val, min_val, max_val, step_val, brief, detail, group, scope)    \
     uint8_t field;
 #include "app_params_def.h"
     APP_PARAMS_DEF_LIST(APP_PARAM_FLOAT, APP_PARAM_U32, APP_PARAM_U8)
@@ -25,12 +37,6 @@ typedef struct {
 #undef APP_PARAM_U32
 #undef APP_PARAM_U8
 } app_params_t;
-
-typedef enum {
-    APP_PARAM_FLOAT = 0,
-    APP_PARAM_U32,
-    APP_PARAM_U8,
-} app_param_type_t;
 
 typedef union {
     float    f;
@@ -46,6 +52,7 @@ typedef struct {
     const char       *desc_detail;
     const char       *group;
     app_param_type_t  type;
+    app_param_scope_t scope;
     size_t            offset;
     app_param_value_t def;
     app_param_value_t min;
@@ -55,8 +62,13 @@ typedef struct {
 
 void      app_params_init(void);
 void      app_params_get(app_params_t *out);
+esp_err_t app_params_set_runtime(const app_params_t *in);
+esp_err_t app_params_commit(void);
 esp_err_t app_params_set(const app_params_t *in);
+bool      app_params_is_dirty(void);
 void      app_params_defaults_get(app_params_t *out);
+void      app_params_copy_scope(app_params_t *dst, const app_params_t *src, app_param_scope_t scope);
+const char *app_param_scope_name(app_param_scope_t scope);
 const app_param_meta_t *app_params_meta_get(size_t *out_count);
 
 #ifdef __cplusplus
