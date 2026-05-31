@@ -41,6 +41,8 @@ static app_machine_store_t s_machine_store;
 static app_preset_store_t s_preset_store;
 static const char *TAG = "app_params";
 
+// Built-in preset names shown in the UI. Their default values are defined below
+// as overrides on top of the baseline defaults from app_params_def.h.
 static const char *k_preset_names[APP_PRESET_COUNT] = {
     "High viscosity",
     "Medium viscosity",
@@ -138,6 +140,8 @@ static bool app_params_blob_valid(const app_params_t *p)
     return p && p->version == APP_PARAMS_VERSION;
 }
 
+// Built-in preset defaults only override recipe-scoped fields. Shared machine
+// settings still come from the baseline defaults + NVS machine store.
 static void app_apply_builtin_preset_defaults(uint8_t index, app_params_t *p)
 {
     if (!p) return;

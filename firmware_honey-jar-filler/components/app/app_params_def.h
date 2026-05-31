@@ -20,6 +20,7 @@
 #define GROUP(x)  x
 
 #define APP_PARAMS_DEF_LIST(APP_PARAM_FLOAT, APP_PARAM_U32, APP_PARAM_U8) \
+    /*=== Preset-scoped recipe settings ===*/                             \
     /*=== Target + verification ===*/                                    \
     APP_PARAM_U32(VAR(target_grams), LABEL("Target"), UNIT("g"),            \
                     DEFAULT(150), MIN(10), MAX(2000), STEP(5),               \
@@ -69,6 +70,7 @@
                   DETAIL("Let residual honey fall into jar before verifying the weight"),              \
                   GROUP("Honey flow tuning"), APP_PARAM_SCOPE_PRESET)       \
                                                                           \
+    /*=== Machine-scoped shared settings ===*/                             \
     /*=== Glass detection ===*/                                           \
     APP_PARAM_U32(VAR(empty_glass_min_g), LABEL("Empty glass min"), UNIT("g"),     \
                     DEFAULT(100), MIN(0), MAX(1000), STEP(10),               \
