@@ -264,14 +264,30 @@ bool ui_menu_on_click(ui_menu_t *m, app_params_t *out_apply)
             return false;
         case MENU_HOME_TARE:
             ESP_LOGI(TAG, "action: tare");
-            (void)scale_hx711_tare_default(MENU_TARE_SAMPLES);
-            buzzer_beep_long(2);
+            {
+                esp_err_t err = scale_hx711_tare_default(MENU_TARE_SAMPLES);
+                if (err == ESP_OK) {
+                    ESP_LOGI(TAG, "action: tare ok");
+                    buzzer_beep_long(2);
+                } else {
+                    ESP_LOGW(TAG, "action: tare failed: %s", esp_err_to_name(err));
+                    buzzer_beep_long(1);
+                }
+            }
             app_params_get(&m->working);
             return false;
         case MENU_HOME_CAL:
             ESP_LOGI(TAG, "action: calibrate (%u g)", (unsigned)m->working.scale_cal_ref_g);
-            (void)scale_hx711_calibrate_default((float)m->working.scale_cal_ref_g, MENU_CAL_SAMPLES);
-            buzzer_beep_long(2);
+            {
+                esp_err_t err = scale_hx711_calibrate_default((float)m->working.scale_cal_ref_g, MENU_CAL_SAMPLES);
+                if (err == ESP_OK) {
+                    ESP_LOGI(TAG, "action: calibrate ok");
+                    buzzer_beep_long(2);
+                } else {
+                    ESP_LOGW(TAG, "action: calibrate failed: %s", esp_err_to_name(err));
+                    buzzer_beep_long(1);
+                }
+            }
             app_params_get(&m->working);
             return false;
         default:
