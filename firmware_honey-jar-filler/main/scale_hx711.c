@@ -66,7 +66,10 @@ static esp_err_t scale_nvs_load(scale_hx711_t *s)
 {
     nvs_handle_t h;
     esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &h);
-    if (err != ESP_OK) return err;
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "NVS: open for load failed: %s", esp_err_to_name(err));
+        return err;
+    }
 
     int32_t off = 0;
     float   sc  = 0.0f;
@@ -74,17 +77,29 @@ static esp_err_t scale_nvs_load(scale_hx711_t *s)
 
     // offset
     err = nvs_get_i32(h, NVS_KEY_OFFS, &off);
-    if (err != ESP_OK) { nvs_close(h); return err; }
+    if (err != ESP_OK) {
+        nvs_close(h);
+        ESP_LOGW(TAG, "NVS: missing key '%s': %s", NVS_KEY_OFFS, esp_err_to_name(err));
+        return err;
+    }
 
     // scale (float via blob)
     size_t len = sizeof(sc);
     err = nvs_get_blob(h, NVS_KEY_SCALE, &sc, &len);
-    if (err != ESP_OK || len != sizeof(sc)) { nvs_close(h); return (err == ESP_OK) ? ESP_ERR_INVALID_SIZE : err; }
+    if (err != ESP_OK || len != sizeof(sc)) {
+        nvs_close(h);
+        err = (err == ESP_OK) ? ESP_ERR_INVALID_SIZE : err;
+        ESP_LOGW(TAG, "NVS: invalid key '%s': %s", NVS_KEY_SCALE, esp_err_to_name(err));
+        return err;
+    }
 
     // valid flag
     err = nvs_get_u8(h, NVS_KEY_VALID, &ok);
     nvs_close(h);
-    if (err != ESP_OK) return err;
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "NVS: missing key '%s': %s", NVS_KEY_VALID, esp_err_to_name(err));
+        return err;
+    }
 
     s->offset_raw = off;
     s->scale_cpg  = (sc != 0.0f) ? sc : 1.0f;
@@ -126,8 +141,12 @@ static esp_err_t scale_nvs_save(const scale_hx711_t *s)
 static esp_err_t read_avg_counts(scale_hx711_t *s, uint16_t samples, int32_t *avg_out)
 {
     if (!avg_out || samples == 0) return ESP_ERR_INVALID_ARG;
+    ESP_LOGD(TAG, "read_avg_counts: start samples=%u", (unsigned)samples);
     // mutex to prevent collisions when e.g. running tare or calibration while polling
-    if (!scale_lock(s, MUTEX_TIMEOUT_MS)) return ESP_ERR_TIMEOUT;
+    if (!scale_lock(s, MUTEX_TIMEOUT_MS)) {
+        ESP_LOGW(TAG, "read_avg_counts: mutex timeout after %u ms", (unsigned)MUTEX_TIMEOUT_MS);
+        return ESP_ERR_TIMEOUT;
+    }
 
     // Make sure data is ready at least once before reading loop
     esp_err_t err = hx711_wait(&s->dev, 1000 /* ms timeout */);
@@ -145,6 +164,8 @@ static esp_err_t read_avg_counts(scale_hx711_t *s, uint16_t samples, int32_t *av
         ESP_LOGE(TAG, "hx711_read_average failed (%d)", err);
         return err;
     }
+
+    ESP_LOGD(TAG, "read_avg_counts: done avg_raw=%" PRId32, *avg_out);
 
     return ESP_OK;
 }
@@ -185,7 +206,11 @@ esp_err_t scale_hx711_init(scale_hx711_t *s)
 
     // try to load previous calibration from nvs
     ESP_LOGI(TAG, "init: trying to load old calibration from nvs...");
-    (void)scale_nvs_load(s); // keeps defaults unchanged if not found
+    err = scale_nvs_load(s); // keeps defaults unchanged if not found
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "init: keeping defaults (offset=%" PRId32 ", scale=%.6f, calibrated=%d)",
+                 s->offset_raw, s->scale_cpg, s->calibrated);
+    }
 
     ESP_LOGI(TAG, "init: HX711 init successful (DT=%d, SCK=%d)",
              (int)CONFIG_HX711_DT_GPIO, (int)CONFIG_HX711_SCK_GPIO);
@@ -198,6 +223,7 @@ esp_err_t scale_hx711_init(scale_hx711_t *s)
 esp_err_t scale_hx711_tare(scale_hx711_t *s, uint16_t samples)
 {
     if (!s) return ESP_ERR_INVALID_ARG;
+    ESP_LOGI(TAG, "TARE: start samples=%u", (unsigned)samples);
 
     int32_t avg_raw = 0;
     esp_err_t err = read_avg_counts(s, samples, &avg_raw);
@@ -209,7 +235,10 @@ esp_err_t scale_hx711_tare(scale_hx711_t *s, uint16_t samples)
     ESP_LOGI(TAG, "TARE: offset_raw=%" PRId32 " (avg of %u)", avg_raw, samples);
 
     // update persistent calibration in nvs
-    (void)scale_nvs_save(s);
+    err = scale_nvs_save(s);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "TARE: NVS save failed: %s", esp_err_to_name(err));
+    }
 
     return ESP_OK;
 }
@@ -222,6 +251,8 @@ esp_err_t scale_hx711_calibrate(scale_hx711_t *s,
 {
     if (!s) return ESP_ERR_INVALID_ARG;
     if (grams_on_scale <= 0.0f) return ESP_ERR_INVALID_ARG;
+    ESP_LOGI(TAG, "CALIBRATE: start ref=%.3f g samples=%u offset_raw=%" PRId32,
+             grams_on_scale, (unsigned)samples, s->offset_raw);
 
     int32_t avg_raw = 0;
     esp_err_t err = read_avg_counts(s, samples, &avg_raw);
@@ -239,11 +270,14 @@ esp_err_t scale_hx711_calibrate(scale_hx711_t *s,
     scale_unlock(s);
 
     ESP_LOGI(TAG,
-        "CALIBRATE: diff=%" PRId32 " counts @ %.3f g -> scale=%.6f counts/g",
-        diff, grams_on_scale, s->scale_cpg);
+        "CALIBRATE: raw=%" PRId32 " diff=%" PRId32 " counts @ %.3f g -> scale=%.6f counts/g",
+        avg_raw, diff, grams_on_scale, s->scale_cpg);
 
     // save new calibration to nvs (persistent - gets loaded after next startup/init)
-    (void)scale_nvs_save(s);
+    err = scale_nvs_save(s);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "CALIBRATE: NVS save failed: %s", esp_err_to_name(err));
+    }
 
     return ESP_OK;
 }
@@ -305,6 +339,9 @@ esp_err_t scale_hx711_read_grams(scale_hx711_t *s,
             grams /= s->scale_cpg;
         }
         *grams_out = grams;
+        ESP_LOGD(TAG,
+                 "read_grams: raw=%" PRId32 " offset=%" PRId32 " scale=%.6f grams=%.3f valid=%d",
+                 avg_raw, s->offset_raw, s->scale_cpg, grams, s->calibrated);
     }
 
     if (is_valid) {
