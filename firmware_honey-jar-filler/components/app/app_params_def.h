@@ -6,7 +6,7 @@
 #define APP_PARAMS_DEF_H
 
 // Bump APP_PARAMS_VERSION to force defaults reload.
-#define APP_PARAMS_VERSION 14
+#define APP_PARAMS_VERSION 15
 
 #define VAR(x)     x
 #define LABEL(x)   x
@@ -73,12 +73,12 @@
     /*=== Machine-scoped shared settings ===*/                             \
     /*=== Glass detection ===*/                                           \
     APP_PARAM_U32(VAR(empty_glass_min_g), LABEL("Empty glass min"), UNIT("g"),     \
-                    DEFAULT(100), MIN(0), MAX(1000), STEP(10),               \
+                    DEFAULT(150), MIN(0), MAX(1000), STEP(10),               \
                     BRIEF("Below this -> no jar"),                         \
                     DETAIL("Empty jar weight window; outside range skips slot"), \
                     GROUP("Glass detection"), APP_PARAM_SCOPE_MACHINE)      \
     APP_PARAM_U32(VAR(empty_glass_max_g), LABEL("Empty glass max"), UNIT("g"),     \
-                    DEFAULT(200), MIN(0), MAX(2000), STEP(10),               \
+                    DEFAULT(250), MIN(0), MAX(2000), STEP(10),               \
                     BRIEF("Above this -> jar not empty"),                  \
                     DETAIL("Empty jar weight window; outside range skips slot"), \
                     GROUP("Glass detection"), APP_PARAM_SCOPE_MACHINE)      \
@@ -112,7 +112,7 @@
                     DETAIL("Gate open angle in degrees"),                   \
                     GROUP("Gate calibration"), APP_PARAM_SCOPE_MACHINE)     \
     APP_PARAM_FLOAT(VAR(gate_close_deg), LABEL("Gate close deg"), UNIT("deg"), \
-                    DEFAULT(102.5f), MIN(0.0f), MAX(180.0f), STEP(1.0f),     \
+                    DEFAULT(101.5f), MIN(0.0f), MAX(180.0f), STEP(1.0f),     \
                     BRIEF("Servo closed angle  (restart to apply)"),                            \
                     DETAIL("Gate closed angle in degrees"),                 \
                     GROUP("Gate calibration"), APP_PARAM_SCOPE_MACHINE)     \

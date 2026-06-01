@@ -76,7 +76,7 @@ static app_params_t app_params_defaults(void)
     return p;
 }
 
-static void app_params_log_all(const app_params_t *cur)
+static void app_params_log_all(const app_params_t *cur, const app_params_t *defs)
 {
     ESP_LOGW(TAG, "app parameters (version=%u):", (unsigned)cur->version);
 
@@ -84,24 +84,29 @@ static void app_params_log_all(const app_params_t *cur)
     ESP_LOGW(TAG, "  %s=%.1f%s%s (default=%.1f min=%.1f max=%.1f step=%.1f scope=%s) - %s", \
              #field, (double)cur->field,                                       \
              (unit && unit[0]) ? " " : "", (unit && unit[0]) ? unit : "",      \
-             (double)(def_val), (double)(min_val), (double)(max_val), (double)(step_val), \
+             (double)defs->field, (double)(min_val), (double)(max_val), (double)(step_val), \
              app_param_scope_name(scope), brief);
 #define APP_PARAM_U32(field, label, unit, def_val, min_val, max_val, step_val, brief, detail, group, scope) \
     ESP_LOGW(TAG, "  %s=%u%s%s (def=%u min=%u max=%u step=%u scope=%s) - %s",  \
              #field, (unsigned)cur->field,                                    \
              (unit && unit[0]) ? " " : "", (unit && unit[0]) ? unit : "",     \
-             (unsigned)(def_val), (unsigned)(min_val), (unsigned)(max_val), (unsigned)(step_val), \
+             (unsigned)defs->field, (unsigned)(min_val), (unsigned)(max_val), (unsigned)(step_val), \
              app_param_scope_name(scope), brief);
 #define APP_PARAM_U8(field, label, unit, def_val, min_val, max_val, step_val, brief, detail, group, scope) \
     ESP_LOGW(TAG, "  %s=%u%s%s (def=%u min=%u max=%u step=%u scope=%s) - %s",  \
              #field, (unsigned)cur->field,                                    \
              (unit && unit[0]) ? " " : "", (unit && unit[0]) ? unit : "",     \
-             (unsigned)(def_val), (unsigned)(min_val), (unsigned)(max_val), (unsigned)(step_val), \
+             (unsigned)defs->field, (unsigned)(min_val), (unsigned)(max_val), (unsigned)(step_val), \
              app_param_scope_name(scope), brief);
     APP_PARAMS_DEF_LIST(APP_PARAM_FLOAT, APP_PARAM_U32, APP_PARAM_U8)
 #undef APP_PARAM_FLOAT
 #undef APP_PARAM_U32
 #undef APP_PARAM_U8
+}
+
+static app_params_t app_effective_defaults_for_preset(uint8_t index)
+{
+    return app_preset_defaults(index);
 }
 
 static void app_params_copy_field(uint8_t *dst_base,
@@ -148,22 +153,28 @@ static void app_apply_builtin_preset_defaults(uint8_t index, app_params_t *p)
 
     switch (index) {
     case 0: // High viscosity
-        p->fill_timeout_ms = 240000;
-        p->near_close_delta_g = 90;
-        p->near_close_gate_pct = 18;
-        p->max_gate_pct = 80;
-        p->close_early_g = 180;
-        p->drip_delay_ms = 14000;
+        p->target_grams = 500;
+        p->target_tol_low_g = 20;
+        p->target_tol_high_g = 50;
+        p->fill_timeout_ms = 600000;
+        p->near_close_delta_g = 30;
+        p->near_close_gate_pct = 35;
+        p->max_gate_pct = 98;
+        p->close_early_g = 10;
+        p->drip_delay_ms = 20000;
         break;
     case 1: // Medium viscosity
         break;
     case 2: // Low viscosity
-        p->fill_timeout_ms = 120000;
-        p->near_close_delta_g = 35;
-        p->near_close_gate_pct = 12;
-        p->max_gate_pct = 45;
-        p->close_early_g = 55;
-        p->drip_delay_ms = 3500;
+        p->target_grams = 480;
+        p->target_tol_low_g = 20;
+        p->target_tol_high_g = 52;
+        p->fill_timeout_ms = 600000;
+        p->near_close_delta_g = 110;
+        p->near_close_gate_pct = 14;
+        p->max_gate_pct = 22;
+        p->close_early_g = 5;
+        p->drip_delay_ms = 11000;
         break;
     case 3: // Testing
     default:
@@ -410,10 +421,12 @@ void app_params_init(void)
         }
     }
 
+    app_params_t effective_defaults = app_effective_defaults_for_preset(s_preset_store.active_index);
+
     ESP_LOGI(TAG, "active preset: %u '%s'",
              (unsigned)s_preset_store.active_index,
              app_presets_get_name(s_preset_store.active_index));
-    app_params_log_all(&s_params);
+    app_params_log_all(&s_params, &effective_defaults);
 
     xSemaphoreGive(s_params_mtx);
 }

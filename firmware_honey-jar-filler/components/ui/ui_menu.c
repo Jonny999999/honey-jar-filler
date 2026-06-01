@@ -26,18 +26,10 @@ typedef enum {
 
 static const char *k_home_labels[MENU_HOME_COUNT] = {
     "Select preset",
-    "Recipe settings",
+    "Preset settings",
     "Machine settings",
     "Tare scale",
     "Calibrate scale",
-};
-
-static const char *k_home_brief[MENU_HOME_COUNT] = {
-    "Load preset now",
-    "Active preset only",
-    "Shared by all presets",
-    "Set zero point",
-    "Use reference weight",
 };
 
 static void menu_format_value(const app_param_meta_t *meta,
@@ -143,6 +135,47 @@ static void menu_wrap_brief(const char *brief,
     } else if (line_b && len_b) {
         line_b[0] = '\0';
     }
+}
+
+static void menu_render_home_detail(const ui_menu_t *m,
+                                    char *line4,
+                                    size_t line4_len,
+                                    char *line5,
+                                    size_t line5_len,
+                                    char *line6,
+                                    size_t line6_len)
+{
+    menu_home_item_t item = (menu_home_item_t)m->index;
+    if (item >= MENU_HOME_COUNT) return;
+
+    switch (item) {
+    case MENU_HOME_PRESET:
+        snprintf(line4, line4_len, "Target + flow preset");
+        snprintf(line5, line5_len, "Click: preset list");
+        break;
+    case MENU_HOME_RECIPE:
+        snprintf(line4, line4_len, "Target, tol, honey");
+        snprintf(line5, line5_len, "Active preset only");
+        break;
+    case MENU_HOME_MACHINE:
+        snprintf(line4, line4_len, "Scale, servo, slots");
+        snprintf(line5, line5_len, "Shared by all presets");
+        break;
+    case MENU_HOME_TARE:
+        snprintf(line4, line4_len, "Empty scale + Click");
+        snprintf(line5, line5_len, "No jar / no weight");
+        break;
+    case MENU_HOME_CAL:
+        snprintf(line4, line4_len, "Place %u g + Click",
+                 (unsigned)m->working.scale_cal_ref_g);
+        snprintf(line5, line5_len, "Ref wt: %u g",
+                 (unsigned)m->working.scale_cal_ref_g);
+        break;
+    default:
+        break;
+    }
+    (void)line6;
+    (void)line6_len;
 }
 
 static const app_param_meta_t *menu_meta_by_scope(app_param_scope_t scope,
@@ -367,7 +400,7 @@ void ui_menu_render(const ui_menu_t *m, ssd1306_handle_t disp)
                  (unsigned)(m->index + 1), (unsigned)MENU_HOME_COUNT);
         snprintf(line1, sizeof(line1), "Preset: %.14s", preset);
         snprintf(line3, sizeof(line3), "> %.20s", k_home_labels[m->index]);
-        snprintf(line5, sizeof(line5), "%.20s", k_home_brief[m->index]);
+        menu_render_home_detail(m, line4, sizeof(line4), line5, sizeof(line5), line6, sizeof(line6));
         snprintf(line7, sizeof(line7), "Long: Exit");
     } else if (m->view == UI_MENU_VIEW_PRESET_LIST) {
         uint8_t active = app_presets_get_active_index();
@@ -377,8 +410,8 @@ void ui_menu_render(const ui_menu_t *m, ssd1306_handle_t disp)
                  (unsigned)(m->index + 1), (unsigned)app_presets_count());
         snprintf(line1, sizeof(line1), "> %.20s", selected);
         snprintf(line3, sizeof(line3), "Active: %.12s", active_name);
-        snprintf(line5, sizeof(line5), "Click: Load");
-        snprintf(line6, sizeof(line6), "Switch live");
+        snprintf(line5, sizeof(line5), "Click: Activate");
+        snprintf(line6, sizeof(line6), "Keeps machine cfg");
         snprintf(line7, sizeof(line7), "Long: Back");
     } else {
         size_t count = 0;
@@ -396,13 +429,13 @@ void ui_menu_render(const ui_menu_t *m, ssd1306_handle_t disp)
         const char *scope_title = (m->scope == APP_PARAM_SCOPE_PRESET) ? "Recipe" : "Machine";
         snprintf(line0, sizeof(line0), "%s %u/%u", scope_title,
                  (unsigned)(m->index + 1), (unsigned)count);
-        snprintf(line1, sizeof(line1), "%.20s", meta->label ? meta->label : meta->name);
         if (m->scope == APP_PARAM_SCOPE_PRESET) {
-            snprintf(line2, sizeof(line2), "Preset: %.13s",
+            snprintf(line1, sizeof(line1), "Preset: %.13s",
                      app_presets_get_name(app_presets_get_active_index()));
         } else {
-            snprintf(line2, sizeof(line2), "Shared global");
+            snprintf(line1, sizeof(line1), "Global machine");
         }
+        snprintf(line2, sizeof(line2), "%.20s", meta->label ? meta->label : meta->name);
         snprintf(line3, sizeof(line3), "%s%s%s",
                  (m->view == UI_MENU_VIEW_PARAM_EDIT) ? "> " : "V: ",
                  val,
