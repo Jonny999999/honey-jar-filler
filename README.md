@@ -56,6 +56,16 @@ idf.py build
 idf.py -p /dev/ttyUSB0 flash monitor
 ```
 
+## Firmware presets
+- Runtime parameters are still defined centrally in `firmware_honey-jar-filler/components/app/app_params_def.h`.
+- Each parameter there has one baseline default plus metadata such as min/max/step, UI text, and a scope:
+  `APP_PARAM_SCOPE_PRESET` for recipe-specific values and `APP_PARAM_SCOPE_MACHINE` for shared machine settings.
+- Built-in preset names and their default overrides live in `firmware_honey-jar-filler/components/app/app.c`.
+  These preset defaults only override recipe-scoped fields; they do not duplicate the full parameter list.
+- NVS stores shared machine settings separately from editable preset values:
+  `machine_v1` for shared settings and `presets_v1` for preset-specific values.
+- At boot, the active runtime config is rebuilt from baseline defaults + selected preset defaults + persisted machine settings + persisted preset values.
+
 ## Wiring (servo mount DIN cable)
 The cable with 15-pin DIN connector from the base assembly to the servo mount carries OLED, encoder, and servo signals + power.
 

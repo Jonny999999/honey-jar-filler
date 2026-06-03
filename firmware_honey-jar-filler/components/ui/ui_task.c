@@ -189,6 +189,7 @@ static void ui_handle_encoder(filler_state_t st, int32_t enc_delta, int64_t *las
 static void ui_render(ssd1306_handle_t disp,
                       const scale_latest_t *s,
                       const app_params_t *p,
+                      const char *preset_name,
                       filler_state_t st,
                       uint8_t slot,
                       filler_fault_t flt,
@@ -223,9 +224,9 @@ static void ui_render(ssd1306_handle_t disp,
     }
     ssd1306_draw_text(disp, 0, LINE2PIXEL(4), line2, true);
 
-    // Line 3: action hint + target.
-    snprintf(line3, sizeof(line3), "Btn:%s  Tgt:%ug",
-             (st == FILLER_IDLE || st == FILLER_FAULT) ? "START" : "STOP",
+    // Line 3: current preset + target.
+    snprintf(line3, sizeof(line3), "%.10s T:%ug",
+             (preset_name && preset_name[0]) ? preset_name : "?",
              (unsigned)p->target_grams);
     ssd1306_draw_text(disp, 0, LINE2PIXEL(6), line3, true);
 
@@ -359,11 +360,12 @@ static void task_ui(void *arg)
 
                 app_params_t params;
                 app_params_get(&params);
+                const char *preset_name = app_presets_get_name(app_presets_get_active_index());
 
                 uint8_t slot = filler_get_slot_idx();
                 float tare_g = 0.0f;
                 bool has_tare = filler_get_jar_tare(&tare_g);
-                ui_render(cfg.disp, &latest, &params, st, slot, flt, has_tare, tare_g);
+                ui_render(cfg.disp, &latest, &params, preset_name, st, slot, flt, has_tare, tare_g);
             }
             next_refresh = now_ticks + period;
         }

@@ -1,12 +1,12 @@
 // Parameter definitions for defaults + UI metadata.
-// Columns: name, label, unit, default, min, max, step, brief, detail, group.
+// Columns: name, label, unit, default, min, max, step, brief, detail, group, scope.
 // Use DEFAULT/MIN/MAX/STEP to make numeric fields easier to read.
 
 #ifndef APP_PARAMS_DEF_H
 #define APP_PARAMS_DEF_H
 
 // Bump APP_PARAMS_VERSION to force defaults reload.
-#define APP_PARAMS_VERSION 14
+#define APP_PARAMS_VERSION 15
 
 #define VAR(x)     x
 #define LABEL(x)   x
@@ -20,106 +20,108 @@
 #define GROUP(x)  x
 
 #define APP_PARAMS_DEF_LIST(APP_PARAM_FLOAT, APP_PARAM_U32, APP_PARAM_U8) \
+    /*=== Preset-scoped recipe settings ===*/                             \
     /*=== Target + verification ===*/                                    \
     APP_PARAM_U32(VAR(target_grams), LABEL("Target"), UNIT("g"),            \
                     DEFAULT(150), MIN(10), MAX(2000), STEP(5),               \
                     BRIEF("Target filled mass per jar"),                    \
                     DETAIL("Final filled weight target for each jar (actual content, not including jar)"),      \
-                    GROUP("Target + verification"))                         \
+                    GROUP("Target + verification"), APP_PARAM_SCOPE_PRESET) \
     APP_PARAM_U32(VAR(target_tol_low_g), LABEL("Tol below acceptable"), UNIT("g"),          \
                     DEFAULT(10), MIN(0), MAX(200), STEP(1),                  \
                     BRIEF("ok Below target, else -> refill"),                        \
                     DETAIL("Acceptable missing grams. If under target by this many grams, reopens gate"), \
-                    GROUP("Target + verification"))                         \
+                    GROUP("Target + verification"), APP_PARAM_SCOPE_PRESET) \
     APP_PARAM_U32(VAR(target_tol_high_g), LABEL("Tol above acceptable"), UNIT("g"),         \
                     DEFAULT(10), MIN(0), MAX(200), STEP(1),                 \
                     BRIEF("ok Above target, else -> fault"),                         \
                     DETAIL("If over target by this many grams, stop and fault"), \
-                    GROUP("Target + verification"))                         \
+                    GROUP("Target + verification"), APP_PARAM_SCOPE_PRESET) \
     APP_PARAM_U32(VAR(fill_timeout_ms), LABEL("Fill timeout"), UNIT("ms"),  \
                   DEFAULT(180e3), MIN(10e3), MAX(600e3), STEP(10e3),       \
                   BRIEF("Max time FILLING before fault"),                   \
                   DETAIL("Safety timeout to prevent endless filling. e.g. empty bucket / hardware issue"),      \
-                  GROUP("Target + verification"))                           \
+                  GROUP("Target + verification"), APP_PARAM_SCOPE_PRESET)   \
                                                                           \
     /*=== Honey flow tuning ===*/                                         \
     APP_PARAM_U32(VAR(near_close_delta_g), LABEL("Near-close threshold g"), UNIT("g"),   \
                     DEFAULT(60), MIN(0), MAX(500), STEP(1),                 \
                     BRIEF("Grams missing to target, gate partially closes"),           \
                     DETAIL("Start slowing flow when this close to target"), \
-                    GROUP("Honey flow tuning"))                             \
+                    GROUP("Honey flow tuning"), APP_PARAM_SCOPE_PRESET)     \
     APP_PARAM_U32(VAR(near_close_gate_pct), LABEL("Near-close gate %"), UNIT("%"), \
                     DEFAULT(20), MIN(1), MAX(100), STEP(1),                 \
                     BRIEF("Partial opening near target"),                  \
                     DETAIL("Gate opening used after near-close delta reached"), \
-                    GROUP("Honey flow tuning"))                             \
+                    GROUP("Honey flow tuning"), APP_PARAM_SCOPE_PRESET)     \
     APP_PARAM_U32(VAR(max_gate_pct), LABEL("Max gate %"), UNIT("%"),        \
                     DEFAULT(80), MIN(5), MAX(100), STEP(1),                 \
                     BRIEF("Max opening during initial bulk fill"),                 \
                     DETAIL("Caps full-open position to reduce max flow (e.g. small glass or water)"),      \
-                    GROUP("Honey flow tuning"))                             \
+                    GROUP("Honey flow tuning"), APP_PARAM_SCOPE_PRESET)     \
     APP_PARAM_U32(VAR(close_early_g), LABEL("Close early threshold"), UNIT("g"),       \
                     DEFAULT(150), MIN(0), MAX(500), STEP(1),                 \
                     BRIEF("Close before target to compensate drips"),      \
                     DETAIL("Thick honey usually needs a larger value; thin honey needs less - equals estimated in-flight mass"), \
-                    GROUP("Honey flow tuning"))                             \
+                    GROUP("Honey flow tuning"), APP_PARAM_SCOPE_PRESET)     \
     APP_PARAM_U32(VAR(drip_delay_ms), LABEL("Drip delay"), UNIT("ms"),      \
                   DEFAULT(10e3), MIN(0), MAX(60e3), STEP(500),             \
                   BRIEF("Wait after closing gate for drips before verifying"),              \
                   DETAIL("Let residual honey fall into jar before verifying the weight"),              \
-                  GROUP("Honey flow tuning"))                               \
+                  GROUP("Honey flow tuning"), APP_PARAM_SCOPE_PRESET)       \
                                                                           \
+    /*=== Machine-scoped shared settings ===*/                             \
     /*=== Glass detection ===*/                                           \
     APP_PARAM_U32(VAR(empty_glass_min_g), LABEL("Empty glass min"), UNIT("g"),     \
-                    DEFAULT(100), MIN(0), MAX(1000), STEP(10),               \
+                    DEFAULT(150), MIN(0), MAX(1000), STEP(10),               \
                     BRIEF("Below this -> no jar"),                         \
                     DETAIL("Empty jar weight window; outside range skips slot"), \
-                    GROUP("Glass detection"))                               \
+                    GROUP("Glass detection"), APP_PARAM_SCOPE_MACHINE)      \
     APP_PARAM_U32(VAR(empty_glass_max_g), LABEL("Empty glass max"), UNIT("g"),     \
-                    DEFAULT(200), MIN(0), MAX(2000), STEP(10),               \
+                    DEFAULT(250), MIN(0), MAX(2000), STEP(10),               \
                     BRIEF("Above this -> jar not empty"),                  \
                     DETAIL("Empty jar weight window; outside range skips slot"), \
-                    GROUP("Glass detection"))                               \
+                    GROUP("Glass detection"), APP_PARAM_SCOPE_MACHINE)      \
                                                                           \
     /*=== Mechanics / motion ===*/                                        \
     APP_PARAM_U32(VAR(advance_timeout_ms), LABEL("Advance timeout"), UNIT("ms"), \
                   DEFAULT(2000), MIN(200), MAX(10000), STEP(100),          \
                   BRIEF("Max time to find position switch"),              \
                   DETAIL("Motor stop timeout while searching for slot (dont spin forever, catch motor fault / sensor fault)"),  \
-                  GROUP("Mechanics / motion"))                             \
+                  GROUP("Mechanics / motion"), APP_PARAM_SCOPE_MACHINE)     \
     APP_PARAM_U32(VAR(find_ignore_ms), LABEL("Find ignore"), UNIT("ms"),   \
                   DEFAULT(500), MIN(0), MAX(2000), STEP(100),               \
                   BRIEF("Ignore POS switch after motor start"),           \
                   DETAIL("Prevents immediate stop when switch already low"), \
-                  GROUP("Mechanics / motion"))                             \
+                  GROUP("Mechanics / motion"), APP_PARAM_SCOPE_MACHINE)     \
     APP_PARAM_U32(VAR(slot_settle_ms), LABEL("Slot settle"), UNIT("ms"),   \
                   DEFAULT(1000), MIN(0), MAX(5000), STEP(100),            \
                   BRIEF("Wait after slot found before verifying empty"),         \
                   DETAIL("Allows motor, jar and scale to settle before starting next step (verify + fill)"),             \
-                  GROUP("Mechanics / motion"))                             \
+                  GROUP("Mechanics / motion"), APP_PARAM_SCOPE_MACHINE)     \
     APP_PARAM_U8(VAR(slots_total), LABEL("Carousel slots"), UNIT(""),      \
                  DEFAULT(6), MIN(1), MAX(20), STEP(1),                     \
                  BRIEF("Physical jar positions on the carousel"),          \
                  DETAIL("Used to track one full revolution. The run stops normally after a full lap without finding a fillable jar"), \
-                 GROUP("Mechanics / motion"))                              \
+                 GROUP("Mechanics / motion"), APP_PARAM_SCOPE_MACHINE)      \
                                                                           \
     /*=== Gate calibration ===*/                                           \
     APP_PARAM_FLOAT(VAR(gate_open_deg), LABEL("Gate open deg"), UNIT("deg"), \
                     DEFAULT(4.0f), MIN(0.0f), MAX(180.0f), STEP(1.0f),       \
                     BRIEF("Servo open angle    (restart to apply)"),                              \
                     DETAIL("Gate open angle in degrees"),                   \
-                    GROUP("Gate calibration"))                              \
+                    GROUP("Gate calibration"), APP_PARAM_SCOPE_MACHINE)     \
     APP_PARAM_FLOAT(VAR(gate_close_deg), LABEL("Gate close deg"), UNIT("deg"), \
-                    DEFAULT(102.5f), MIN(0.0f), MAX(180.0f), STEP(1.0f),     \
+                    DEFAULT(101.5f), MIN(0.0f), MAX(180.0f), STEP(1.0f),     \
                     BRIEF("Servo closed angle  (restart to apply)"),                            \
                     DETAIL("Gate closed angle in degrees"),                 \
-                    GROUP("Gate calibration"))                              \
+                    GROUP("Gate calibration"), APP_PARAM_SCOPE_MACHINE)     \
                                                                            \
     /*=== Scale calibration ===*/                                         \
     APP_PARAM_U32(VAR(scale_cal_ref_g), LABEL("Scale cal weight"), UNIT("g"), \
                   DEFAULT(500), MIN(50), MAX(5000), STEP(10),              \
                   BRIEF("Reference weight used for scale calibration"),         \
                   DETAIL("Used when running scale calibration"),           \
-                  GROUP("Scale calibration"))
+                  GROUP("Scale calibration"), APP_PARAM_SCOPE_MACHINE)
 
 #endif // APP_PARAMS_DEF_H
