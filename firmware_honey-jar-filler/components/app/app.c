@@ -41,6 +41,8 @@ static app_machine_store_t s_machine_store;
 static app_preset_store_t s_preset_store;
 static const char *TAG = "app_params";
 
+static app_params_t app_preset_defaults(uint8_t index);
+
 // Built-in preset names shown in the UI. Their default values are defined below
 // as overrides on top of the baseline defaults from app_params_def.h.
 static const char *k_preset_names[APP_PRESET_COUNT] = {

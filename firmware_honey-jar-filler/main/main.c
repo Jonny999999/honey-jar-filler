@@ -23,8 +23,12 @@
 #include "iotest.h"
 #include "scale_hx711.h"
 #include "app.h"
+#include "telemetry.h"
 
 static const char *TAG = "main";
+
+#define CONFIG_TASK_PRIO_TELEMETRY 2
+#define CONFIG_TASK_CORE_TELEMETRY tskNO_AFFINITY
 
 
 static led_strip_handle_t s_strip;
@@ -576,11 +580,19 @@ void app_main(void)
     esp_log_level_set("encoder_consumer", ESP_LOG_WARN);
     esp_log_level_set("scale_consumer", ESP_LOG_WARN);
     esp_log_level_set("filler_fsm", ESP_LOG_DEBUG);
+    esp_log_level_set("telemetry", ESP_LOG_INFO);
 
     // Load persistent app parameters (targets/timeouts).
     app_params_init();
     app_params_t app_params = {0};
     app_params_get(&app_params);
+
+    // Low-priority transport task for machine-readable telemetry. First step:
+    // start the backbone and publish a few lifecycle records only.
+    ESP_ERROR_CHECK(telemetry_start_task(CONFIG_TASK_PRIO_TELEMETRY, CONFIG_TASK_CORE_TELEMETRY));
+    (void)telemetry_publish_boot("firmware_start");
+    (void)telemetry_publish_preset(app_presets_get_active_index(),
+                                   app_presets_get_name(app_presets_get_active_index()));
 
 
     //=============================
