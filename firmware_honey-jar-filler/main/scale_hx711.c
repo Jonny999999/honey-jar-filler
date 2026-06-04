@@ -367,9 +367,14 @@ typedef struct {
     QueueHandle_t q;
 } poll_cfg_t;
 
+typedef struct {
+    TickType_t period;
+    QueueHandle_t q;
+} fake_poll_cfg_t;
+
 // Publish one telemetry sample using the real HX711 sample timestamp and a
 // lightweight snapshot of the current controller state.
-static void scale_publish_telemetry_sample(int64_t ts_us, float weight_g)
+static bool scale_publish_telemetry_sample(int64_t ts_us, float weight_g)
 {
     uint32_t run_id = filler_get_run_id();
     int32_t slot_idx = (int32_t)filler_get_slot_idx();
@@ -385,14 +390,46 @@ static void scale_publish_telemetry_sample(int64_t ts_us, float weight_g)
         relative_fill_g = weight_g - jar_tare_g;
     }
 
-    (void)telemetry_publish_sample_compact(ts_us,
-                                           run_id,
-                                           slot_idx,
-                                           state,
-                                           params.target_grams,
-                                           weight_g,
-                                           relative_fill_g,
-                                           gate_pct);
+    return telemetry_publish_sample_compact(ts_us,
+                                            run_id,
+                                            slot_idx,
+                                            state,
+                                            params.target_grams,
+                                            weight_g,
+                                            relative_fill_g,
+                                            gate_pct);
+}
+
+// Keep queue/latest publishing consistent between the real and fake producers.
+static void scale_publish_sample(QueueHandle_t q, int32_t raw, float grams, bool valid, int64_t ts_us)
+{
+    static int64_t s_last_drop_warn_us;
+
+    scale_latest_t latest = {
+        .raw = raw,
+        .grams = grams,
+        .valid = valid,
+        .ts_us = ts_us
+    };
+    scale_latest_set(&latest);
+
+    scale_sample_t msg = {
+        .raw = raw,
+        .grams = grams,
+        .valid = valid,
+        .ts_us = ts_us
+    };
+    if (xQueueSend(q, &msg, 0) != pdPASS) {
+        xQueueOverwrite(q, &msg);
+    }
+
+    if (!scale_publish_telemetry_sample(ts_us, grams)) {
+        int64_t now_us = esp_timer_get_time();
+        if (now_us - s_last_drop_warn_us > 1000000) {
+            s_last_drop_warn_us = now_us;
+            ESP_LOGW(TAG, "telemetry sample publish dropped");
+        }
+    }
 }
 
 static void task_scale_poll(void *arg)
@@ -414,26 +451,7 @@ static void task_scale_poll(void *arg)
         int32_t raw = 0; float g = 0.0f; bool ok = false;
         if (scale_hx711_read_grams(cfg.s, cfg.samples_avg, &raw, &g, &ok) == ESP_OK) {
             int64_t ts = esp_timer_get_time();
-            scale_latest_t latest = {
-                .raw = raw,
-                .grams = g,
-                .valid = ok,
-                .ts_us = ts
-            };
-            scale_latest_set(&latest);
-
-            scale_sample_t msg = {
-                .raw = raw,
-                .grams = g,
-                .valid = ok,
-                .ts_us = ts
-            };
-            if (xQueueSend(cfg.q, &msg, 0) != pdPASS) {
-                // if queue_len == 1 this overwrites; otherwise it's a no-op
-                xQueueOverwrite(cfg.q, &msg);
-            }
-
-            scale_publish_telemetry_sample(ts, g);
+            scale_publish_sample(cfg.q, raw, g, ok, ts);
         }
 
         // --- compute loop duration / overrun
@@ -471,6 +489,65 @@ static void task_scale_poll(void *arg)
     }
 }
 
+static float fake_scale_weight_for_step(uint32_t step)
+{
+    const uint32_t phase = step % 64u;
+
+    // One repeatable synthetic cycle: idle -> jar present -> fill ramp -> drip tail.
+    if (phase < 12u) {
+        return 0.0f;
+    }
+    if (phase < 20u) {
+        return 185.0f;
+    }
+    if (phase < 36u) {
+        const float frac = (float)(phase - 20u) / 16.0f;
+        return 185.0f + frac * 320.0f;
+    }
+    if (phase < 44u) {
+        const float frac = (float)(phase - 36u) / 8.0f;
+        return 505.0f + frac * 8.0f;
+    }
+    if (phase < 52u) {
+        const float frac = (float)(phase - 44u) / 8.0f;
+        return 513.0f - frac * 6.0f;
+    }
+    return 507.0f;
+}
+
+static void task_scale_fake_poll(void *arg)
+{
+    fake_poll_cfg_t cfg = *(fake_poll_cfg_t *)arg;
+    vPortFree(arg);
+
+    TickType_t last = xTaskGetTickCount();
+    uint32_t step = 0;
+
+    for (;;) {
+        float grams = fake_scale_weight_for_step(step++);
+        // Raw counts are synthetic here; grams are the meaningful test signal.
+        int32_t raw = (int32_t)(grams * 100.0f);
+        int64_t ts_us = esp_timer_get_time();
+
+        scale_publish_sample(cfg.q, raw, grams, true, ts_us);
+        vTaskDelayUntil(&last, cfg.period);
+    }
+}
+
+static esp_err_t scale_start_poll_task(TaskFunction_t task_fn,
+                                       const char *task_name,
+                                       void *cfg,
+                                       QueueHandle_t q)
+{
+    if (xTaskCreatePinnedToCore(task_fn, task_name, 4096, cfg,
+                                CONFIG_TASK_PRIO_HX711, NULL, CONFIG_TASK_CORE_HX711) != pdPASS) {
+        vPortFree(cfg);
+        vQueueDelete(q);
+        return ESP_ERR_NO_MEM;
+    }
+
+    return ESP_OK;
+}
 
 
 
@@ -494,13 +571,32 @@ esp_err_t scale_hx711_start_poll(scale_hx711_t *s,
     cfg->period = period;
     cfg->q = q;
 
-    // Pin to selected core and priority for reliable sampling.
-    if (xTaskCreatePinnedToCore(task_scale_poll, "scale_poll", 4096, cfg,
-                                CONFIG_TASK_PRIO_HX711, NULL, CONFIG_TASK_CORE_HX711) != pdPASS) {
-        vPortFree(cfg);
+    esp_err_t err = scale_start_poll_task(task_scale_poll, "scale_poll", cfg, q);
+    if (err != ESP_OK) return err;
+
+    *out_queue = q;
+    return ESP_OK;
+}
+
+esp_err_t scale_hx711_start_fake_poll(TickType_t period,
+                                      UBaseType_t queue_len,
+                                      QueueHandle_t *out_queue)
+{
+    if (!out_queue || queue_len == 0) return ESP_ERR_INVALID_ARG;
+
+    QueueHandle_t q = xQueueCreate(queue_len, sizeof(scale_sample_t));
+    if (!q) return ESP_ERR_NO_MEM;
+
+    fake_poll_cfg_t *cfg = pvPortMalloc(sizeof(*cfg));
+    if (!cfg) {
         vQueueDelete(q);
         return ESP_ERR_NO_MEM;
     }
+    cfg->period = period;
+    cfg->q = q;
+
+    esp_err_t err = scale_start_poll_task(task_scale_fake_poll, "scale_fake", cfg, q);
+    if (err != ESP_OK) return err;
 
     *out_queue = q;
     return ESP_OK;

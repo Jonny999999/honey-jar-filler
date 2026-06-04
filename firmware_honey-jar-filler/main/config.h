@@ -63,6 +63,12 @@
 #define CONFIG_HX711_POLL_INTERVAL_MS 280 //note: INTERVAL > COUNT * 90ms
 #define CONFIG_HX711_AVG_SAMPLE_COUNT 3  //note: COUNT < INTERVAL / 90ms
 
+// Startup policy for development:
+// - REQUIRED keeps the real machine strict and fails startup on missing scale HW.
+// - FAKE_READS bypasses the HX711 and publishes simulated samples instead.
+#define CONFIG_SCALE_REQUIRED       1
+#define CONFIG_SCALE_FAKE_READS     0
+
 
 
 //===============================
@@ -70,6 +76,9 @@
 //===============================
 #define CONFIG_DISPLAY_SDA_GPIO     GPIO_NUM_21
 #define CONFIG_DISPLAY_SCL_GPIO     GPIO_NUM_22
+// If the display is optional, startup will continue headless when probing fails.
+#define CONFIG_DISPLAY_REQUIRED     0
+#define CONFIG_DISPLAY_PROBE_TIMEOUT_MS 50
 
 
 
