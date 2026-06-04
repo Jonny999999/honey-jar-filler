@@ -5,6 +5,9 @@
 #include "scale_hx711.h"
 #include "nvs_flash.h"
 #include "nvs.h"
+#include "app.h"
+#include "filler_fsm.h"
+#include "telemetry.h"
 
 #define NVS_NAMESPACE  "hx711"
 #define NVS_KEY_OFFS   "offset"
@@ -364,6 +367,34 @@ typedef struct {
     QueueHandle_t q;
 } poll_cfg_t;
 
+// Publish one telemetry sample using the real HX711 sample timestamp and a
+// lightweight snapshot of the current controller state.
+static void scale_publish_telemetry_sample(int64_t ts_us, float weight_g)
+{
+    uint32_t run_id = filler_get_run_id();
+    int32_t slot_idx = (int32_t)filler_get_slot_idx();
+    uint32_t state = (uint32_t)filler_get_state();
+    float gate_pct = filler_get_gate_percent();
+
+    app_params_t params = {0};
+    app_params_get(&params);
+
+    float jar_tare_g = 0.0f;
+    float relative_fill_g = weight_g;
+    if (filler_get_jar_tare(&jar_tare_g)) {
+        relative_fill_g = weight_g - jar_tare_g;
+    }
+
+    (void)telemetry_publish_sample_compact(ts_us,
+                                           run_id,
+                                           slot_idx,
+                                           state,
+                                           params.target_grams,
+                                           weight_g,
+                                           relative_fill_g,
+                                           gate_pct);
+}
+
 static void task_scale_poll(void *arg)
 {
     poll_cfg_t cfg = *(poll_cfg_t*)arg;  // copy config locally
@@ -401,6 +432,8 @@ static void task_scale_poll(void *arg)
                 // if queue_len == 1 this overwrites; otherwise it's a no-op
                 xQueueOverwrite(cfg.q, &msg);
             }
+
+            scale_publish_telemetry_sample(ts, g);
         }
 
         // --- compute loop duration / overrun

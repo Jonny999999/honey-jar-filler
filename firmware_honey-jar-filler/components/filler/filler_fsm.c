@@ -14,6 +14,7 @@
 #include "motor.h"
 #include "config.h"
 #include "scale_hx711.h"
+#include "telemetry.h"
 
 // FSM loop period.
 #define FSM_TICK_MS 10
@@ -45,6 +46,7 @@ static volatile uint8_t s_slot_idx = 0;
 static volatile bool s_start_req = false;
 static volatile bool s_abort_req = false;
 static volatile bool s_has_jar_tare = false;
+static volatile uint32_t s_run_id = 0;
 static float s_jar_tare_g = 0.0f;
 static gate_cmd_t s_gate_cmd = GATE_CMD_NONE;
 static float s_gate_pct = -1.0f;
@@ -59,12 +61,19 @@ static void filler_set_state(filler_state_t st)
 static void filler_set_fault(filler_fault_t flt)
 {
     filler_fault_t prev;
+    uint32_t run_id;
+    uint8_t slot;
     taskENTER_CRITICAL(&s_lock);
     prev = s_fault;
     s_fault = flt;
+    run_id = s_run_id;
+    slot = s_slot_idx;
     taskEXIT_CRITICAL(&s_lock);
     if (flt != prev) {
         ESP_LOGW(TAG, "fault -> %s", filler_fault_name(flt));
+        if (flt != FLT_NONE) {
+            (void)telemetry_publish_fault(run_id, slot, filler_fault_name(flt));
+        }
     }
 }
 
@@ -129,7 +138,7 @@ static void filler_stop_all(void)
     motor_set(false);
     (void)gate_close();
     s_gate_cmd = GATE_CMD_CLOSE;
-    s_gate_pct = -1.0f;
+    s_gate_pct = 0.0f;
 }
 
 static void gate_open_cached(void)
@@ -137,7 +146,8 @@ static void gate_open_cached(void)
     if (s_gate_cmd != GATE_CMD_OPEN) {
         (void)gate_open();
         s_gate_cmd = GATE_CMD_OPEN;
-        s_gate_pct = -1.0f;
+        s_gate_pct = 100.0f;
+        (void)telemetry_publish_gate(filler_get_run_id(), filler_get_slot_idx(), s_gate_pct, "open");
     }
 }
 
@@ -146,7 +156,8 @@ static void gate_close_cached(void)
     if (s_gate_cmd != GATE_CMD_CLOSE) {
         (void)gate_close();
         s_gate_cmd = GATE_CMD_CLOSE;
-        s_gate_pct = -1.0f;
+        s_gate_pct = 0.0f;
+        (void)telemetry_publish_gate(filler_get_run_id(), filler_get_slot_idx(), s_gate_pct, "close");
     }
 }
 
@@ -156,6 +167,7 @@ static void gate_set_percent_cached(float pct)
         (void)gate_set_percent(pct);
         s_gate_cmd = GATE_CMD_PERCENT;
         s_gate_pct = pct;
+        (void)telemetry_publish_gate(filler_get_run_id(), filler_get_slot_idx(), s_gate_pct, "percent");
     }
 }
 
@@ -285,6 +297,10 @@ static void task_filler_fsm(void *arg)
             sample_count = 0;
             last_sample_ts = 0;
             ESP_LOGI(TAG, "state -> %s", filler_state_name(state));
+            (void)telemetry_publish_state(filler_get_run_id(),
+                                          filler_get_slot_idx(),
+                                          (uint32_t)state,
+                                          filler_state_name(state));
             last_state = state;
 
             // Audible state-change feedback.
@@ -303,6 +319,11 @@ static void task_filler_fsm(void *arg)
             case FILLER_IDLE:
             case FILLER_DONE:
             case FILLER_FAULT:
+                if (state == FILLER_FAULT) {
+                    (void)telemetry_publish_run_end(filler_get_run_id(),
+                                                    filler_get_slot_idx(),
+                                                    "fault");
+                }
                 filler_stop_all();
                 jar_tare_clear();
                 skipped_slots_streak = 0;
@@ -355,8 +376,12 @@ static void task_filler_fsm(void *arg)
             // Waiting for start request.
             filler_set_fault(FLT_NONE);
             if (filler_take_start_req()) {
+                taskENTER_CRITICAL(&s_lock);
+                s_run_id++;
+                taskEXIT_CRITICAL(&s_lock);
                 ESP_LOGI(TAG, "start: carousel_slots=%u", (unsigned)slot_count_sane(params.slots_total));
                 filler_set_slot(0);
+                (void)telemetry_publish_run_start(filler_get_run_id(), 0);
                 skipped_slots_streak = 0;
                 state = FILLER_FIND_SLOT;
                 filler_set_state(state);
@@ -544,6 +569,7 @@ static void task_filler_fsm(void *arg)
 
         case FILLER_DONE:
             // Nothing fillable found in a full revolution; return to idle.
+            (void)telemetry_publish_run_end(filler_get_run_id(), filler_get_slot_idx(), "done");
             state = FILLER_IDLE;
             filler_set_state(state);
             break;
@@ -551,9 +577,13 @@ static void task_filler_fsm(void *arg)
         case FILLER_FAULT:
             // Stop everything and wait for a new start request.
             if (filler_take_start_req()) {
+                taskENTER_CRITICAL(&s_lock);
+                s_run_id++;
+                taskEXIT_CRITICAL(&s_lock);
                 ESP_LOGI(TAG, "restart after fault");
                 filler_set_fault(FLT_NONE);
                 filler_set_slot(0);
+                (void)telemetry_publish_run_start(filler_get_run_id(), 0);
                 skipped_slots_streak = 0;
                 state = FILLER_FIND_SLOT;
                 filler_set_state(state);
@@ -608,6 +638,24 @@ filler_fault_t filler_get_fault(void)
     filler_fault_t v;
     taskENTER_CRITICAL(&s_lock);
     v = s_fault;
+    taskEXIT_CRITICAL(&s_lock);
+    return v;
+}
+
+uint32_t filler_get_run_id(void)
+{
+    uint32_t v;
+    taskENTER_CRITICAL(&s_lock);
+    v = s_run_id;
+    taskEXIT_CRITICAL(&s_lock);
+    return v;
+}
+
+float filler_get_gate_percent(void)
+{
+    float v;
+    taskENTER_CRITICAL(&s_lock);
+    v = s_gate_pct;
     taskEXIT_CRITICAL(&s_lock);
     return v;
 }

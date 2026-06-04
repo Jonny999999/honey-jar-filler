@@ -21,6 +21,7 @@ typedef enum {
     TELEMETRY_KIND_RUN_END,
     TELEMETRY_KIND_STATE,
     TELEMETRY_KIND_FAULT,
+    TELEMETRY_KIND_GATE,
     TELEMETRY_KIND_SAMPLE,
 } telemetry_kind_t;
 
@@ -29,12 +30,12 @@ typedef struct {
     telemetry_kind_t kind;
     uint32_t run_id;
     int32_t slot_idx;
-    int32_t raw;
+    uint32_t state;
+    uint32_t preset_index;
+    uint32_t target_g;
     float weight_g;
-    float value0;
-    float value1;
-    uint32_t u32_0;
-    uint32_t u32_1;
+    float relative_fill_g;
+    float gate_pct;
     char text[TELEMETRY_TEXT_MAX];
 } telemetry_record_t;
 
@@ -46,6 +47,20 @@ void telemetry_record_init(telemetry_record_t *rec, telemetry_kind_t kind);
 bool telemetry_publish_boot(const char *text);
 bool telemetry_publish_note(const char *text);
 bool telemetry_publish_preset(uint32_t preset_index, const char *preset_name);
+bool telemetry_publish_run_start(uint32_t run_id, int32_t slot_idx);
+bool telemetry_publish_run_end(uint32_t run_id, int32_t slot_idx, const char *reason);
+bool telemetry_publish_state(uint32_t run_id, int32_t slot_idx, uint32_t state, const char *state_name);
+bool telemetry_publish_fault(uint32_t run_id, int32_t slot_idx, const char *fault_name);
+bool telemetry_publish_gate(uint32_t run_id, int32_t slot_idx, float gate_pct, const char *label);
+bool telemetry_publish_sample(const telemetry_record_t *rec);
+bool telemetry_publish_sample_compact(int64_t ts_us,
+                                      uint32_t run_id,
+                                      int32_t slot_idx,
+                                      uint32_t state,
+                                      uint32_t target_g,
+                                      float weight_g,
+                                      float relative_fill_g,
+                                      float gate_pct);
 
 const char *telemetry_kind_name(telemetry_kind_t kind);
 

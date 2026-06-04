@@ -9,7 +9,7 @@
 #include "freertos/queue.h"
 #include "freertos/task.h"
 
-#define TELEMETRY_QUEUE_LEN 64u
+#define TELEMETRY_QUEUE_LEN 128u
 
 static QueueHandle_t s_queue;
 static TaskHandle_t s_task;
@@ -56,6 +56,7 @@ const char *telemetry_kind_name(telemetry_kind_t kind)
     case TELEMETRY_KIND_RUN_END:   return "run_end";
     case TELEMETRY_KIND_STATE:     return "state";
     case TELEMETRY_KIND_FAULT:     return "fault";
+    case TELEMETRY_KIND_GATE:      return "gate";
     case TELEMETRY_KIND_SAMPLE:    return "sample";
     default:                       return "?";
     }
@@ -68,7 +69,6 @@ void telemetry_record_init(telemetry_record_t *rec, telemetry_kind_t kind)
     rec->ts_us = esp_timer_get_time();
     rec->kind = kind;
     rec->slot_idx = -1;
-    rec->raw = 0;
 }
 
 bool telemetry_is_ready(void)
@@ -102,8 +102,94 @@ bool telemetry_publish_preset(uint32_t preset_index, const char *preset_name)
 {
     telemetry_record_t rec;
     telemetry_record_init(&rec, TELEMETRY_KIND_PRESET);
-    rec.u32_0 = preset_index;
+    rec.preset_index = preset_index;
     telemetry_copy_text(rec.text, sizeof(rec.text), preset_name);
+    return telemetry_publish(&rec);
+}
+
+bool telemetry_publish_run_start(uint32_t run_id, int32_t slot_idx)
+{
+    telemetry_record_t rec;
+    telemetry_record_init(&rec, TELEMETRY_KIND_RUN_START);
+    rec.run_id = run_id;
+    rec.slot_idx = slot_idx;
+    return telemetry_publish(&rec);
+}
+
+bool telemetry_publish_run_end(uint32_t run_id, int32_t slot_idx, const char *reason)
+{
+    telemetry_record_t rec;
+    telemetry_record_init(&rec, TELEMETRY_KIND_RUN_END);
+    rec.run_id = run_id;
+    rec.slot_idx = slot_idx;
+    telemetry_copy_text(rec.text, sizeof(rec.text), reason);
+    return telemetry_publish(&rec);
+}
+
+bool telemetry_publish_state(uint32_t run_id, int32_t slot_idx, uint32_t state, const char *state_name)
+{
+    telemetry_record_t rec;
+    telemetry_record_init(&rec, TELEMETRY_KIND_STATE);
+    rec.run_id = run_id;
+    rec.slot_idx = slot_idx;
+    rec.state = state;
+    telemetry_copy_text(rec.text, sizeof(rec.text), state_name);
+    return telemetry_publish(&rec);
+}
+
+bool telemetry_publish_fault(uint32_t run_id, int32_t slot_idx, const char *fault_name)
+{
+    telemetry_record_t rec;
+    telemetry_record_init(&rec, TELEMETRY_KIND_FAULT);
+    rec.run_id = run_id;
+    rec.slot_idx = slot_idx;
+    telemetry_copy_text(rec.text, sizeof(rec.text), fault_name);
+    return telemetry_publish(&rec);
+}
+
+bool telemetry_publish_gate(uint32_t run_id, int32_t slot_idx, float gate_pct, const char *label)
+{
+    telemetry_record_t rec;
+    telemetry_record_init(&rec, TELEMETRY_KIND_GATE);
+    rec.run_id = run_id;
+    rec.slot_idx = slot_idx;
+    rec.gate_pct = gate_pct;
+    telemetry_copy_text(rec.text, sizeof(rec.text), label);
+    return telemetry_publish(&rec);
+}
+
+bool telemetry_publish_sample(const telemetry_record_t *rec)
+{
+    if (!rec) return false;
+    telemetry_record_t copy = *rec;
+    if (copy.ts_us == 0) {
+        copy.ts_us = esp_timer_get_time();
+    }
+    copy.kind = TELEMETRY_KIND_SAMPLE;
+    return telemetry_publish(&copy);
+}
+
+bool telemetry_publish_sample_compact(int64_t ts_us,
+                                      uint32_t run_id,
+                                      int32_t slot_idx,
+                                      uint32_t state,
+                                      uint32_t target_g,
+                                      float weight_g,
+                                      float relative_fill_g,
+                                      float gate_pct)
+{
+    // Common fast-path for sampled process data: callers provide the values
+    // they already know, and telemetry owns the record layout/transport.
+    telemetry_record_t rec;
+    telemetry_record_init(&rec, TELEMETRY_KIND_SAMPLE);
+    rec.ts_us = ts_us;
+    rec.run_id = run_id;
+    rec.slot_idx = slot_idx;
+    rec.state = state;
+    rec.target_g = target_g;
+    rec.weight_g = weight_g;
+    rec.relative_fill_g = relative_fill_g;
+    rec.gate_pct = gate_pct;
     return telemetry_publish(&rec);
 }
 
@@ -112,21 +198,83 @@ static void telemetry_emit_record(const telemetry_record_t *rec)
     char text_escaped[(TELEMETRY_TEXT_MAX * 2) + 1];
     telemetry_escape_json(rec->text, text_escaped, sizeof(text_escaped));
 
-    printf("TEL {\"ts_us\":%" PRId64 ",\"kind\":\"%s\",\"run_id\":%" PRIu32
-           ",\"slot_idx\":%" PRId32 ",\"raw\":%" PRId32 ",\"weight_g\":%.3f"
-           ",\"value0\":%.3f,\"value1\":%.3f,\"u32_0\":%" PRIu32
-           ",\"u32_1\":%" PRIu32 ",\"text\":\"%s\"}\n",
-           rec->ts_us,
-           telemetry_kind_name(rec->kind),
-           rec->run_id,
-           rec->slot_idx,
-           rec->raw,
-           (double)rec->weight_g,
-           (double)rec->value0,
-           (double)rec->value1,
-           rec->u32_0,
-           rec->u32_1,
-           text_escaped);
+    // Keep the on-wire JSON compact and event-specific so later parsing and
+    // plotting scripts do not have to deal with many always-empty fields.
+    switch (rec->kind) {
+    case TELEMETRY_KIND_SAMPLE:
+        printf("TEL {\"ts_us\":%" PRId64 ",\"kind\":\"sample\",\"run_id\":%" PRIu32
+               ",\"slot_idx\":%" PRId32 ",\"state\":%" PRIu32 ",\"target_g\":%" PRIu32
+               ",\"weight_g\":%.3f,\"relative_fill_g\":%.3f,\"gate_pct\":%.3f}\n",
+               rec->ts_us,
+               rec->run_id,
+               rec->slot_idx,
+               rec->state,
+               rec->target_g,
+               (double)rec->weight_g,
+               (double)rec->relative_fill_g,
+               (double)rec->gate_pct);
+        break;
+    case TELEMETRY_KIND_STATE:
+        printf("TEL {\"ts_us\":%" PRId64 ",\"kind\":\"state\",\"run_id\":%" PRIu32
+               ",\"slot_idx\":%" PRId32 ",\"state\":%" PRIu32 ",\"text\":\"%s\"}\n",
+               rec->ts_us,
+               rec->run_id,
+               rec->slot_idx,
+               rec->state,
+               text_escaped);
+        break;
+    case TELEMETRY_KIND_GATE:
+        printf("TEL {\"ts_us\":%" PRId64 ",\"kind\":\"gate\",\"run_id\":%" PRIu32
+               ",\"slot_idx\":%" PRId32 ",\"gate_pct\":%.3f,\"text\":\"%s\"}\n",
+               rec->ts_us,
+               rec->run_id,
+               rec->slot_idx,
+               (double)rec->gate_pct,
+               text_escaped);
+        break;
+    case TELEMETRY_KIND_FAULT:
+        printf("TEL {\"ts_us\":%" PRId64 ",\"kind\":\"fault\",\"run_id\":%" PRIu32
+               ",\"slot_idx\":%" PRId32 ",\"text\":\"%s\"}\n",
+               rec->ts_us,
+               rec->run_id,
+               rec->slot_idx,
+               text_escaped);
+        break;
+    case TELEMETRY_KIND_RUN_START:
+        printf("TEL {\"ts_us\":%" PRId64 ",\"kind\":\"run_start\",\"run_id\":%" PRIu32
+               ",\"slot_idx\":%" PRId32 "}\n",
+               rec->ts_us,
+               rec->run_id,
+               rec->slot_idx);
+        break;
+    case TELEMETRY_KIND_RUN_END:
+        printf("TEL {\"ts_us\":%" PRId64 ",\"kind\":\"run_end\",\"run_id\":%" PRIu32
+               ",\"slot_idx\":%" PRId32 ",\"text\":\"%s\"}\n",
+               rec->ts_us,
+               rec->run_id,
+               rec->slot_idx,
+               text_escaped);
+        break;
+    case TELEMETRY_KIND_PRESET:
+        printf("TEL {\"ts_us\":%" PRId64 ",\"kind\":\"preset\",\"preset_index\":%" PRIu32
+               ",\"text\":\"%s\"}\n",
+               rec->ts_us,
+               rec->preset_index,
+               text_escaped);
+        break;
+    case TELEMETRY_KIND_BOOT:
+        printf("TEL {\"ts_us\":%" PRId64 ",\"kind\":\"boot\",\"text\":\"%s\"}\n",
+               rec->ts_us,
+               text_escaped);
+        break;
+    case TELEMETRY_KIND_NOTE:
+    default:
+        printf("TEL {\"ts_us\":%" PRId64 ",\"kind\":\"%s\",\"text\":\"%s\"}\n",
+               rec->ts_us,
+               telemetry_kind_name(rec->kind),
+               text_escaped);
+        break;
+    }
     fflush(stdout);
 }
 
