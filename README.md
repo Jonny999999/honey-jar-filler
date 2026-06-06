@@ -66,6 +66,52 @@ idf.py -p /dev/ttyUSB0 flash monitor
   `machine_v1` for shared settings and `presets_v1` for preset-specific values.
 - At boot, the active runtime config is rebuilt from baseline defaults + selected preset defaults + persisted machine settings + persisted preset values.
 
+## Telemetry tools
+- Structured telemetry is emitted on the normal UART console with a `TEL ` prefix and JSON payload.
+- Normal ESP logs and machine telemetry therefore share one serial stream, but the telemetry lines can be split cleanly on the host.
+- The intended workflow is:
+  1. capture a session from UART
+  2. keep the full console log for debugging
+  3. store telemetry separately as NDJSON
+  4. split runs and generate thesis figures from those files
+
+Current script layout:
+- `tools/telemetry/capture.py`
+  Fully usable serial capture tool. Replaces the basic `idf.py monitor` workflow for experiment sessions.
+- `tools/telemetry/split_runs.py`
+  Reserved for later offline re-splitting of runs from a captured session.
+- `tools/telemetry/plot_runs.py`
+  Reserved for later batch generation of thesis charts from run files.
+
+Session capture output:
+- `data/telemetry/<session>/session.log`
+  Full serial console output, including normal ESP logs and raw `TEL` lines.
+- `data/telemetry/<session>/telemetry.ndjson`
+  Only telemetry payload lines, one JSON object per line.
+- `data/telemetry/<session>/runs/run_0001.ndjson`
+  Per-run telemetry files created live from `run_start` / `run_end` events, including configurable pre/post context.
+- `data/telemetry/<session>/session_meta.json`
+  Port, baud rate, and capture timing settings.
+
+Example capture usage:
+```bash
+python3 tools/telemetry/capture.py --port /dev/ttyUSB0 --baud 115200
+```
+
+Useful options:
+- `--show-tel`
+  Also print the `TEL` lines in the terminal instead of only saving them to files.
+- `--pre-run-ms 2000 --post-run-ms 2000`
+  Keep more telemetry context around each detected run.
+- `--session-name my-test`
+  Use a fixed readable folder name instead of an auto timestamp.
+
+Goal of this tooling:
+- keep experiment data self-describing and reproducible
+- avoid manually filtering UART logs after each test
+- support later batch plotting to vector PDF/SVG figures for the thesis
+- preserve enough event context to compare different presets and control strategies cleanly
+
 ## Wiring (servo mount DIN cable)
 The cable with 15-pin DIN connector from the base assembly to the servo mount carries OLED, encoder, and servo signals + power.
 
