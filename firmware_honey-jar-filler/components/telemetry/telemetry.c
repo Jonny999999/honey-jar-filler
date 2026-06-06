@@ -46,6 +46,28 @@ static void telemetry_escape_json(const char *src, char *dst, size_t dst_len)
     dst[w] = '\0';
 }
 
+static void telemetry_emit_params_json(const app_params_t *params)
+{
+    // Run summaries embed the full active parameter snapshot so each recorded
+    // experiment stays self-describing even after presets evolve later.
+    if (!params) {
+        printf("\"version\":0");
+        return;
+    }
+
+    printf("\"version\":%u", (unsigned)params->version);
+#define APP_PARAM_FLOAT(field, label, unit, def_val, min_val, max_val, step_val, brief, detail, group, scope) \
+    printf(",\"%s\":%.3f", #field, (double)params->field);
+#define APP_PARAM_U32(field, label, unit, def_val, min_val, max_val, step_val, brief, detail, group, scope)   \
+    printf(",\"%s\":%u", #field, (unsigned)params->field);
+#define APP_PARAM_U8(field, label, unit, def_val, min_val, max_val, step_val, brief, detail, group, scope)    \
+    printf(",\"%s\":%u", #field, (unsigned)params->field);
+    APP_PARAMS_DEF_LIST(APP_PARAM_FLOAT, APP_PARAM_U32, APP_PARAM_U8)
+#undef APP_PARAM_FLOAT
+#undef APP_PARAM_U32
+#undef APP_PARAM_U8
+}
+
 const char *telemetry_kind_name(telemetry_kind_t kind)
 {
     switch (kind) {
@@ -54,6 +76,7 @@ const char *telemetry_kind_name(telemetry_kind_t kind)
     case TELEMETRY_KIND_PRESET:    return "preset";
     case TELEMETRY_KIND_RUN_START: return "run_start";
     case TELEMETRY_KIND_RUN_END:   return "run_end";
+    case TELEMETRY_KIND_RUN_SUMMARY:return "run_summary";
     case TELEMETRY_KIND_STATE:     return "state";
     case TELEMETRY_KIND_FAULT:     return "fault";
     case TELEMETRY_KIND_GATE:      return "gate";
@@ -123,6 +146,31 @@ bool telemetry_publish_run_end(uint32_t run_id, int32_t slot_idx, const char *re
     rec.run_id = run_id;
     rec.slot_idx = slot_idx;
     telemetry_copy_text(rec.text, sizeof(rec.text), reason);
+    return telemetry_publish(&rec);
+}
+
+bool telemetry_publish_run_summary(uint32_t run_id,
+                                   int32_t slot_idx,
+                                   const char *result,
+                                   const char *preset_name,
+                                   const char *strategy_name,
+                                   const app_params_t *params,
+                                   float final_weight_g,
+                                   float final_relative_fill_g)
+{
+    telemetry_record_t rec;
+    telemetry_record_init(&rec, TELEMETRY_KIND_RUN_SUMMARY);
+    rec.run_id = run_id;
+    rec.slot_idx = slot_idx;
+    rec.weight_g = final_weight_g;
+    rec.relative_fill_g = final_relative_fill_g;
+    if (params) {
+        rec.target_g = params->target_grams;
+        rec.params = *params;
+    }
+    telemetry_copy_text(rec.text, sizeof(rec.text), result);
+    telemetry_copy_text(rec.preset_name, sizeof(rec.preset_name), preset_name);
+    telemetry_copy_text(rec.strategy_name, sizeof(rec.strategy_name), strategy_name);
     return telemetry_publish(&rec);
 }
 
@@ -196,7 +244,11 @@ bool telemetry_publish_sample_compact(int64_t ts_us,
 static void telemetry_emit_record(const telemetry_record_t *rec)
 {
     char text_escaped[(TELEMETRY_TEXT_MAX * 2) + 1];
+    char preset_escaped[(TELEMETRY_NAME_MAX * 2) + 1];
+    char strategy_escaped[(TELEMETRY_NAME_MAX * 2) + 1];
     telemetry_escape_json(rec->text, text_escaped, sizeof(text_escaped));
+    telemetry_escape_json(rec->preset_name, preset_escaped, sizeof(preset_escaped));
+    telemetry_escape_json(rec->strategy_name, strategy_escaped, sizeof(strategy_escaped));
 
     // Keep the on-wire JSON compact and event-specific so later parsing and
     // plotting scripts do not have to deal with many always-empty fields.
@@ -254,6 +306,23 @@ static void telemetry_emit_record(const telemetry_record_t *rec)
                rec->run_id,
                rec->slot_idx,
                text_escaped);
+        break;
+    case TELEMETRY_KIND_RUN_SUMMARY:
+        printf("TEL {\"ts_us\":%" PRId64 ",\"kind\":\"run_summary\",\"run_id\":%" PRIu32
+               ",\"slot_idx\":%" PRId32 ",\"text\":\"%s\",\"preset_name\":\"%s\""
+               ",\"strategy_name\":\"%s\",\"target_g\":%" PRIu32
+               ",\"final_weight_g\":%.3f,\"final_relative_fill_g\":%.3f,\"params\":{",
+               rec->ts_us,
+               rec->run_id,
+               rec->slot_idx,
+               text_escaped,
+               preset_escaped,
+               strategy_escaped,
+               rec->target_g,
+               (double)rec->weight_g,
+               (double)rec->relative_fill_g);
+        telemetry_emit_params_json(&rec->params);
+        printf("}}\n");
         break;
     case TELEMETRY_KIND_PRESET:
         printf("TEL {\"ts_us\":%" PRId64 ",\"kind\":\"preset\",\"preset_index\":%" PRIu32

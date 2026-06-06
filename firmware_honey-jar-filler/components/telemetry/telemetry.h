@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "app.h"
 #include "esp_err.h"
 #include "freertos/FreeRTOS.h"
 
@@ -12,6 +13,7 @@ extern "C" {
 #endif
 
 #define TELEMETRY_TEXT_MAX 24u
+#define TELEMETRY_NAME_MAX 24u
 
 typedef enum {
     TELEMETRY_KIND_BOOT = 0,
@@ -19,6 +21,7 @@ typedef enum {
     TELEMETRY_KIND_PRESET,
     TELEMETRY_KIND_RUN_START,
     TELEMETRY_KIND_RUN_END,
+    TELEMETRY_KIND_RUN_SUMMARY,
     TELEMETRY_KIND_STATE,
     TELEMETRY_KIND_FAULT,
     TELEMETRY_KIND_GATE,
@@ -36,6 +39,9 @@ typedef struct {
     float weight_g;
     float relative_fill_g;
     float gate_pct;
+    char preset_name[TELEMETRY_NAME_MAX];
+    char strategy_name[TELEMETRY_NAME_MAX];
+    app_params_t params;
     char text[TELEMETRY_TEXT_MAX];
 } telemetry_record_t;
 
@@ -49,6 +55,14 @@ bool telemetry_publish_note(const char *text);
 bool telemetry_publish_preset(uint32_t preset_index, const char *preset_name);
 bool telemetry_publish_run_start(uint32_t run_id, int32_t slot_idx);
 bool telemetry_publish_run_end(uint32_t run_id, int32_t slot_idx, const char *reason);
+bool telemetry_publish_run_summary(uint32_t run_id,
+                                   int32_t slot_idx,
+                                   const char *result,
+                                   const char *preset_name,
+                                   const char *strategy_name,
+                                   const app_params_t *params,
+                                   float final_weight_g,
+                                   float final_relative_fill_g);
 bool telemetry_publish_state(uint32_t run_id, int32_t slot_idx, uint32_t state, const char *state_name);
 bool telemetry_publish_fault(uint32_t run_id, int32_t slot_idx, const char *fault_name);
 bool telemetry_publish_gate(uint32_t run_id, int32_t slot_idx, float gate_pct, const char *label);

@@ -29,6 +29,7 @@
 #define THRESH_CONFIRM_COUNT 4
 
 static const char *TAG = "filler_fsm";
+static const char *k_strategy_name = "heuristic";
 
 
 typedef enum {
@@ -252,6 +253,35 @@ static uint8_t slot_next_idx(uint8_t idx, uint8_t configured_slots)
     return (uint8_t)((idx + 1) % slots);
 }
 
+// Emit one compact end-of-run record that captures the tested preset,
+// strategy, final values, and the full runtime parameter snapshot.
+static void filler_publish_run_summary(const char *result,
+                                       uint32_t run_id,
+                                       uint8_t slot_idx,
+                                       const app_params_t *params)
+{
+    if (!params) return;
+
+    scale_latest_t latest = {0};
+    scale_latest_get(&latest);
+
+    float final_weight_g = latest.grams;
+    float final_relative_fill_g = final_weight_g;
+    float jar_tare_g = 0.0f;
+    if (filler_get_jar_tare(&jar_tare_g)) {
+        final_relative_fill_g -= jar_tare_g;
+    }
+
+    (void)telemetry_publish_run_summary(run_id,
+                                        slot_idx,
+                                        result,
+                                        app_presets_get_name(app_presets_get_active_index()),
+                                        k_strategy_name,
+                                        params,
+                                        final_weight_g,
+                                        final_relative_fill_g);
+}
+
 static void task_filler_fsm(void *arg)
 {
     (void)arg;
@@ -320,6 +350,10 @@ static void task_filler_fsm(void *arg)
             case FILLER_DONE:
             case FILLER_FAULT:
                 if (state == FILLER_FAULT) {
+                    filler_publish_run_summary("fault",
+                                               filler_get_run_id(),
+                                               filler_get_slot_idx(),
+                                               &params);
                     (void)telemetry_publish_run_end(filler_get_run_id(),
                                                     filler_get_slot_idx(),
                                                     "fault");
@@ -569,6 +603,10 @@ static void task_filler_fsm(void *arg)
 
         case FILLER_DONE:
             // Nothing fillable found in a full revolution; return to idle.
+            filler_publish_run_summary("done",
+                                       filler_get_run_id(),
+                                       filler_get_slot_idx(),
+                                       &params);
             (void)telemetry_publish_run_end(filler_get_run_id(), filler_get_slot_idx(), "done");
             state = FILLER_IDLE;
             filler_set_state(state);
