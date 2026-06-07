@@ -250,6 +250,10 @@ static void telemetry_emit_record(const telemetry_record_t *rec)
     telemetry_escape_json(rec->preset_name, preset_escaped, sizeof(preset_escaped));
     telemetry_escape_json(rec->strategy_name, strategy_escaped, sizeof(strategy_escaped));
 
+    // Hold stdout across the whole record so telemetry lines cannot interleave
+    // with other console writers while a JSON object is still being emitted.
+    flockfile(stdout);
+
     // Keep the on-wire JSON compact and event-specific so later parsing and
     // plotting scripts do not have to deal with many always-empty fields.
     switch (rec->kind) {
@@ -345,6 +349,7 @@ static void telemetry_emit_record(const telemetry_record_t *rec)
         break;
     }
     fflush(stdout);
+    funlockfile(stdout);
 }
 
 static void telemetry_task(void *arg)
