@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import re
 import sys
 from collections import deque
 from dataclasses import dataclass
@@ -13,7 +15,21 @@ from typing import TextIO
 import serial
 from serial.tools import list_ports
 
-from common import DEFAULT_OUTPUT_ROOT, ensure_session_dir, extract_tel_payload, parse_tel_payload
+try:
+    from .common import DEFAULT_OUTPUT_ROOT, ensure_session_dir, extract_tel_payload, parse_tel_payload
+except ImportError:
+    from common import DEFAULT_OUTPUT_ROOT, ensure_session_dir, extract_tel_payload, parse_tel_payload
+
+LOG_LEVEL_RE = re.compile(r"^(?P<level>[DIWEV]) \(\d+\) ")
+ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m")
+LOG_COLORS = {
+    "D": "\x1b[90m",       # gray
+    "V": "\x1b[90m",       # gray
+    "I": "\x1b[32m",       # green
+    "W": "\x1b[38;5;214m", # orange
+    "E": "\x1b[31m",       # red
+}
+ANSI_RESET = "\x1b[0m"
 
 
 @dataclass
@@ -53,7 +69,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=DEFAULT_OUTPUT_ROOT,
         help="Root folder for captured sessions",
     )
-    parser.add_argument("--session-name", help="Optional fixed session folder name")
+    parser.add_argument(
+        "--session-name",
+        help="Optional readable suffix added after the timestamped session folder name",
+    )
     parser.add_argument(
         "--pre-run-ms",
         type=int,
@@ -75,6 +94,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--encoding",
         default="utf-8",
         help="Serial text decoding to use for console output",
+    )
+    parser.add_argument(
+        "--color",
+        choices=("auto", "always", "never"),
+        default="auto",
+        help="Colorize ESP log levels in terminal output",
     )
     parser.add_argument(
         "--list-ports",
@@ -132,6 +157,35 @@ def close_run_capture(run: RunCapture | None) -> None:
     run.close()
 
 
+def should_colorize(mode: str) -> bool:
+    if mode == "always":
+        return True
+    if mode == "never":
+        return False
+    if os.environ.get("NO_COLOR"):
+        return False
+    return sys.stdout.isatty() and os.environ.get("TERM", "dumb") != "dumb"
+
+
+def colorize_console_line(line: str, enabled: bool) -> str:
+    if not enabled:
+        return line
+    if ANSI_ESCAPE_RE.search(line):
+        return line
+
+    match = LOG_LEVEL_RE.match(line)
+    if not match:
+        return line
+
+    color = LOG_COLORS.get(match.group("level"))
+    if not color:
+        return line
+
+    if line.endswith("\n"):
+        return f"{color}{line[:-1]}{ANSI_RESET}\n"
+    return f"{color}{line}{ANSI_RESET}"
+
+
 def main() -> int:
     args = build_arg_parser().parse_args()
     if args.list_ports:
@@ -158,6 +212,7 @@ def main() -> int:
     print(f"Opening serial port {port} @ {args.baud} baud", file=sys.stderr)
 
     serial_dev = serial.Serial(port=port, baudrate=args.baud, timeout=0.25)
+    colorize_logs = should_colorize(args.color)
 
     pre_run_buffer: deque[BufferedTelemetry] = deque()
     pre_run_us = args.pre_run_ms * 1000
@@ -175,7 +230,7 @@ def main() -> int:
 
             payload = extract_tel_payload(line)
             if payload is None:
-                sys.stdout.write(line)
+                sys.stdout.write(colorize_console_line(line, colorize_logs))
                 sys.stdout.flush()
                 continue
 
@@ -237,4 +292,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
