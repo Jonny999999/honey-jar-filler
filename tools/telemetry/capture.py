@@ -5,13 +5,14 @@ import argparse
 import json
 import os
 import re
+import shutil
 import sys
 import time
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import TextIO
+from typing import Any, TextIO
 
 import serial
 from serial.tools import list_ports
@@ -33,6 +34,22 @@ LOG_COLORS = {
 STATUS_BG = "\x1b[48;5;238m"
 STATUS_FG = "\x1b[97m"
 ANSI_RESET = "\x1b[0m"
+PLOT_BLOCKS = " ▁▂▃▄▅▆▇█"
+STATUS_KEY = "\x1b[38;5;153m"
+STATUS_VALUE = "\x1b[38;5;231m"
+STATUS_DIM = "\x1b[38;5;250m"
+STATUS_ACCENT = "\x1b[38;5;120m"
+STATUS_WARN = "\x1b[38;5;222m"
+CHART_AXIS = "\x1b[38;5;145m"
+CHART_BAR = "\x1b[38;5;117m"
+SUMMARY_TITLE = "\x1b[38;5;230m"
+SUMMARY_LABEL = "\x1b[38;5;153m"
+SUMMARY_VALUE = "\x1b[38;5;231m"
+SUMMARY_DIM = "\x1b[38;5;250m"
+HELP_TITLE = "\x1b[38;5;230m"
+HELP_LABEL = "\x1b[38;5;153m"
+HELP_VALUE = "\x1b[38;5;120m"
+HELP_DIM = "\x1b[38;5;250m"
 
 
 @dataclass
@@ -55,6 +72,22 @@ class RunCapture:
 
     def close(self) -> None:
         self.handle.close()
+
+
+@dataclass
+class LiveStatus:
+    preset_name: str = "?"
+    state_name: str = "?"
+    state_num: int = 0
+    last_fault: str = "-"
+    last_end_reason: str = "-"
+    run_id: int = 0
+    slot_idx: int = 0
+    target_g: float = 0.0
+    weight_g: float = 0.0
+    relative_fill_g: float = 0.0
+    gate_pct: float = 0.0
+    last_sample_ts_us: int | None = None
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -109,6 +142,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="List available serial ports and exit",
     )
+    parser.add_argument(
+        "--no-clear-start",
+        action="store_true",
+        help="Do not clear/reset the terminal at startup before live capture UI starts",
+    )
     return parser
 
 
@@ -121,6 +159,8 @@ def choose_serial_port(requested: str | None) -> str:
         raise SystemExit("No serial ports found. Use --port explicitly.")
     if len(ports) == 1:
         return ports[0]
+    if "/dev/ttyUSB0" in ports:
+        return "/dev/ttyUSB0"
 
     lines = ["Multiple serial ports found. Use --port explicitly:"]
     lines.extend(f"  {port}" for port in ports)
@@ -137,6 +177,62 @@ def print_serial_ports() -> None:
         print(f"{port.device}{desc}")
 
 
+def reset_terminal_state() -> None:
+    sys.stdout.write(f"{ANSI_RESET}\x1b[?25h\r")
+    sys.stdout.flush()
+
+
+def prepare_terminal_for_capture(*, clear_screen: bool) -> None:
+    reset_terminal_state()
+    if clear_screen and sys.stdout.isatty():
+        # Match the effect of a normal terminal clear closely enough to start
+        # the footer redraw logic from a known clean screen/cursor state.
+        sys.stdout.write("\x1b[2J\x1b[H")
+    sys.stdout.flush()
+
+
+def clip_ansi_text(text: str, max_visible: int) -> str:
+    if max_visible <= 0:
+        return ""
+
+    visible = 0
+    out: list[str] = []
+    i = 0
+    while i < len(text) and visible < max_visible:
+        if text[i] == "\x1b":
+            end = i + 1
+            while end < len(text) and text[end] != "m":
+                end += 1
+            if end < len(text):
+                end += 1
+            out.append(text[i:end])
+            i = end
+            continue
+        out.append(text[i])
+        visible += 1
+        i += 1
+    out.append(ANSI_RESET)
+    return "".join(out)
+
+
+def format_port_selection_note(requested: str | None) -> str | None:
+    if requested:
+        return None
+    ports = list(list_ports.comports())
+    if not ports:
+        return None
+    devices = [port.device for port in ports]
+    if len(devices) <= 1 and "/dev/ttyUSB0" not in devices:
+        return None
+
+    selected = "/dev/ttyUSB0" if "/dev/ttyUSB0" in devices else devices[0]
+    shown = ", ".join(devices)
+    return (
+        f"Available ports: {shown}. "
+        f"Selecting default {selected}. Override with --port."
+    )
+
+
 def write_session_meta(meta_path: Path, *, port: str, baud: int, pre_run_ms: int, post_run_ms: int) -> None:
     meta = {
         "captured_at": datetime.now().astimezone().isoformat(),
@@ -146,6 +242,29 @@ def write_session_meta(meta_path: Path, *, port: str, baud: int, pre_run_ms: int
         "post_run_ms": post_run_ms,
     }
     meta_path.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
+
+
+def print_usage_summary(*, status_line_enabled: bool) -> None:
+    sep = f"{HELP_DIM}{'=' * 72}{ANSI_RESET}"
+    lines = [
+        sep,
+        f"{HELP_TITLE}Telemetry Capture Quick Help{ANSI_RESET}",
+        f"  {HELP_LABEL}Basic:{ANSI_RESET} {HELP_VALUE}capture.py [--port /dev/ttyUSB0] [--baud 115200] [--session-name thick-honey-test]{ANSI_RESET}",
+        f"  {HELP_LABEL}Common flags:{ANSI_RESET}",
+        f"    {HELP_VALUE}--output-root <dir>{ANSI_RESET}   {HELP_DIM}change capture root folder{ANSI_RESET}",
+        f"    {HELP_VALUE}--pre-run-ms <ms>{ANSI_RESET}     {HELP_DIM}telemetry kept before run_start{ANSI_RESET}",
+        f"    {HELP_VALUE}--post-run-ms <ms>{ANSI_RESET}    {HELP_DIM}telemetry kept after run_end{ANSI_RESET}",
+        f"    {HELP_VALUE}--show-tel{ANSI_RESET}            {HELP_DIM}also print TEL JSON lines{ANSI_RESET}",
+        f"    {HELP_VALUE}--color auto|always|never{ANSI_RESET}",
+        f"    {HELP_VALUE}--list-ports{ANSI_RESET}          {HELP_DIM}list serial ports and exit{ANSI_RESET}",
+        f"    {HELP_VALUE}--no-clear-start{ANSI_RESET}      {HELP_DIM}keep existing terminal content on startup{ANSI_RESET}",
+        f"  {HELP_LABEL}More:{ANSI_RESET} {HELP_DIM}use --help for full argparse help{ANSI_RESET}",
+        sep,
+        f"{HELP_DIM}Starting live capture output below...{ANSI_RESET}",
+        sep,
+    ]
+    for line in lines:
+        print_status_note(status_line_enabled, line)
 
 
 def open_run_capture(runs_dir: Path, run_id: int) -> RunCapture:
@@ -164,25 +283,124 @@ def status_enabled() -> bool:
     return sys.stdout.isatty() and os.environ.get("TERM", "dumb") != "dumb"
 
 
-def clear_status_line(enabled: bool) -> None:
+def clear_status_lines(enabled: bool, line_count: int) -> None:
     if not enabled:
         return
+    if line_count <= 0:
+        return
+    for idx in range(line_count):
+        sys.stdout.write("\x1b[2K\r")
+        if idx != line_count - 1:
+            sys.stdout.write("\x1b[1B")
+    if line_count > 1:
+        sys.stdout.write(f"\x1b[{line_count - 1}A\r")
+    sys.stdout.flush()
+
+
+def print_status_block(enabled: bool, lines: list[str]) -> None:
+    if not enabled:
+        return
+    if not lines:
+        return
+    term_width = shutil.get_terminal_size((120, 24)).columns
+    rendered = []
+    for line in lines:
+        text = clip_ansi_text(line, max(0, term_width - 1))
+        rendered.append(f"{STATUS_BG}{STATUS_FG}{text}\x1b[K{ANSI_RESET}")
+    sys.stdout.write("\r" + "\n".join(rendered))
+    if len(lines) > 1:
+        sys.stdout.write(f"\x1b[{len(lines) - 1}A\r")
+    sys.stdout.flush()
+
+
+def leave_status_area(enabled: bool, line_count: int) -> None:
+    if not enabled:
+        return
+    clear_status_lines(True, line_count)
+    if line_count > 1:
+        sys.stdout.write(f"\x1b[{line_count - 1}B\r")
     sys.stdout.write("\x1b[2K\r")
     sys.stdout.flush()
 
 
-def print_status_line(enabled: bool, text: str) -> None:
+def detach_status_area(enabled: bool, line_count: int) -> None:
     if not enabled:
         return
-    sys.stdout.write(f"\x1b[2K\r{STATUS_BG}{STATUS_FG}{text}\x1b[K{ANSI_RESET}")
+    if line_count > 1:
+        sys.stdout.write(f"\x1b[{line_count - 1}B\r")
+    sys.stdout.write("\n")
+    sys.stdout.write(ANSI_RESET)
     sys.stdout.flush()
+
+
+def status_fmt_key(text: str) -> str:
+    return f"{STATUS_KEY}{text}{STATUS_FG}"
+
+
+def status_fmt_value(text: str, *, accent: bool = False, warn: bool = False, dim: bool = False) -> str:
+    color = STATUS_VALUE
+    if accent:
+        color = STATUS_ACCENT
+    elif warn:
+        color = STATUS_WARN
+    elif dim:
+        color = STATUS_DIM
+    return f"{color}{text}{STATUS_FG}"
+
+
+def print_shutdown_summary(
+    *,
+    interrupted: bool,
+    elapsed_s: float,
+    console_line_count: int,
+    tel_count: int,
+    run_count: int,
+    session_dir: Path,
+    session_log_path: Path,
+    telemetry_path: Path,
+) -> None:
+    title = "Capture stopped by user" if interrupted else "Capture finished"
+    sep = f"{SUMMARY_DIM}{'-' * 72}{ANSI_RESET}"
+    print(sep)
+    print(f"{SUMMARY_TITLE}{title}{ANSI_RESET}")
+    print(sep)
+    print(
+        f"  {SUMMARY_LABEL}Duration:{ANSI_RESET} "
+        f"{SUMMARY_VALUE}{elapsed_s:.1f}s{ANSI_RESET}"
+    )
+    print(
+        f"  {SUMMARY_LABEL}Console lines:{ANSI_RESET} "
+        f"{SUMMARY_VALUE}{console_line_count}{ANSI_RESET}"
+    )
+    print(
+        f"  {SUMMARY_LABEL}Telemetry rows:{ANSI_RESET} "
+        f"{SUMMARY_VALUE}{tel_count}{ANSI_RESET}"
+    )
+    print(
+        f"  {SUMMARY_LABEL}Runs:{ANSI_RESET} "
+        f"{SUMMARY_VALUE}{run_count}{ANSI_RESET}"
+    )
+    print()
+    print(f"  {SUMMARY_LABEL}Session dir:{ANSI_RESET}")
+    print(f"    {SUMMARY_VALUE}{session_dir}{ANSI_RESET}")
+    print(f"  {SUMMARY_LABEL}Session log:{ANSI_RESET}")
+    print(
+        f"    {SUMMARY_VALUE}{session_log_path}{ANSI_RESET} "
+        f"{SUMMARY_DIM}({session_log_path.stat().st_size} B){ANSI_RESET}"
+    )
+    print(f"  {SUMMARY_LABEL}Telemetry:{ANSI_RESET}")
+    print(
+        f"    {SUMMARY_VALUE}{telemetry_path}{ANSI_RESET} "
+        f"{SUMMARY_DIM}({telemetry_path.stat().st_size} B){ANSI_RESET}"
+    )
+    print(sep)
 
 
 def print_status_note(enabled: bool, text: str) -> None:
     if not enabled:
         print(text)
         return
-    clear_status_line(True)
+    clear_status_lines(True, 1)
     print(text)
 
 
@@ -217,9 +435,49 @@ def colorize_console_line(line: str, enabled: bool) -> str:
 
 def write_console_line(line: str, *, status_line_enabled: bool, colorize_logs: bool) -> None:
     if status_line_enabled:
-        clear_status_line(True)
+        clear_status_lines(True, 8)
     sys.stdout.write(colorize_console_line(line, colorize_logs))
     sys.stdout.flush()
+
+
+def format_float(value: float) -> str:
+    return f"{value:.1f}"
+
+
+def normalize_state_name(state_name: str, state_num: int) -> str:
+    if state_name and state_name != "?":
+        return state_name
+    return str(state_num)
+
+
+def build_weight_plot(samples: deque[float], width: int, height: int, min_g: float, max_g: float) -> list[str]:
+    if width <= 0 or height <= 0:
+        return []
+
+    rows = [[" " for _ in range(width)] for _ in range(height)]
+    recent = list(samples)[-width:]
+    if not recent:
+        recent = []
+    pad = width - len(recent)
+
+    span = max(max_g - min_g, 1.0)
+    total_levels = height * 8
+    for x, value in enumerate(recent, start=pad):
+        clipped = min(max(value, min_g), max_g)
+        filled_levels = int(round(((clipped - min_g) / span) * total_levels))
+        filled_levels = max(0, min(total_levels, filled_levels))
+        for row_idx in range(height):
+            row_base = (height - 1 - row_idx) * 8
+            cell_fill = max(0, min(8, filled_levels - row_base))
+            rows[row_idx][x] = PLOT_BLOCKS[cell_fill]
+
+    labels = []
+    for row_idx, row in enumerate(rows):
+        y = max_g - ((max_g - min_g) * row_idx / max(height - 1, 1))
+        labels.append(
+            f"{CHART_AXIS}{int(round(y)):>3}|{STATUS_FG}{CHART_BAR}{''.join(row)}{STATUS_FG}"
+        )
+    return labels
 
 
 def main() -> int:
@@ -228,6 +486,7 @@ def main() -> int:
         print_serial_ports()
         return 0
 
+    prepare_terminal_for_capture(clear_screen=not args.no_clear_start)
     port = choose_serial_port(args.port)
     session_dir = ensure_session_dir(args.output_root, args.session_name)
     runs_dir = session_dir / "runs"
@@ -245,7 +504,11 @@ def main() -> int:
     telemetry_log = (session_dir / "telemetry.ndjson").open("w", encoding="utf-8", buffering=1)
 
     status_line_enabled = status_enabled()
+    print_usage_summary(status_line_enabled=status_line_enabled)
     print_status_note(status_line_enabled, f"Telemetry session: {session_dir}")
+    port_note = format_port_selection_note(args.port)
+    if port_note:
+        print_status_note(status_line_enabled, port_note)
     print_status_note(status_line_enabled, f"Opening serial port {port} @ {args.baud} baud")
 
     serial_dev = serial.Serial(port=port, baudrate=args.baud, timeout=0.25)
@@ -257,8 +520,14 @@ def main() -> int:
     current_run: RunCapture | None = None
     tel_count = 0
     run_count = 0
+    console_line_count = 0
     last_status_refresh = 0.0
     pending_bytes = bytearray()
+    live = LiveStatus()
+    weight_history: deque[float] = deque(maxlen=180)
+    status_line_count = 8
+    started_at = time.monotonic()
+    interrupted = False
 
     def refresh_status(force: bool = False) -> None:
         nonlocal last_status_refresh
@@ -268,9 +537,38 @@ def main() -> int:
         if not force and (now - last_status_refresh) < 0.1:
             return
         active = f"run={current_run.run_id}" if current_run is not None else "run=idle"
-        print_status_line(
+        term_width = shutil.get_terminal_size((120, 24)).columns
+        plot_width = max(24, min(108, term_width - 5))
+        plot_lines = build_weight_plot(weight_history, plot_width, 5, 0.0, 500.0)
+        clear_status_lines(True, status_line_count)
+        print_status_block(
             True,
-            f"[capture] session={session_dir.name} port={port} tel={tel_count} runs={run_count} {active}",
+            [
+                (
+                    f"{status_fmt_key('[capture]')} "
+                    f"{status_fmt_key('session=')}{status_fmt_value(session_dir.name, dim=True)} "
+                    f"{status_fmt_key('port=')}{status_fmt_value(port)} "
+                    f"{status_fmt_key('tel=')}{status_fmt_value(str(tel_count), accent=True)} "
+                    f"{status_fmt_key('runs=')}{status_fmt_value(str(run_count), accent=True)} "
+                    f"{status_fmt_key('run=')}{status_fmt_value(active.split('=', 1)[1])}"
+                ),
+                (
+                    f"{status_fmt_key('[live]')} "
+                    f"{status_fmt_key('preset=')}{status_fmt_value(live.preset_name[:18])} "
+                    f"{status_fmt_key('state=')}{status_fmt_value(normalize_state_name(live.state_name, live.state_num)[:18], accent=True)} "
+                    f"{status_fmt_key('fault=')}{status_fmt_value(live.last_fault[:18], warn=(live.last_fault != '-'), dim=(live.last_fault == '-'))}"
+                ),
+                (
+                    f"{status_fmt_key('[live]')} "
+                    f"{status_fmt_key('weight=')}{status_fmt_value(f'{format_float(live.weight_g)}g', accent=True)} "
+                    f"{status_fmt_key('rel=')}{status_fmt_value(f'{format_float(live.relative_fill_g)}g')} "
+                    f"{status_fmt_key('target=')}{status_fmt_value(f'{int(live.target_g)}g')} "
+                    f"{status_fmt_key('gate=')}{status_fmt_value(f'{format_float(live.gate_pct)}%')} "
+                    f"{status_fmt_key('slot=')}{status_fmt_value(str(live.slot_idx))} "
+                    f"{status_fmt_key('end=')}{status_fmt_value(live.last_end_reason[:12], dim=(live.last_end_reason == '-'))}"
+                ),
+                *plot_lines,
+            ],
         )
         last_status_refresh = now
 
@@ -278,8 +576,10 @@ def main() -> int:
         nonlocal current_run
         nonlocal run_count
         nonlocal tel_count
+        nonlocal console_line_count
 
         session_log.write(line)
+        console_line_count += 1
 
         payload = extract_tel_payload(line)
         if payload is None:
@@ -304,6 +604,8 @@ def main() -> int:
         if record is None:
             refresh_status()
             return
+
+        update_live_status(live, weight_history, record)
 
         ts_us_raw = record.get("ts_us")
         ts_us = int(ts_us_raw) if isinstance(ts_us_raw, int) else None
@@ -341,6 +643,69 @@ def main() -> int:
         pre_run_buffer.append(BufferedTelemetry(ts_us=ts_us, payload=payload))
         refresh_status()
 
+    def update_live_status(status: LiveStatus, history: deque[float], record: dict[str, Any]) -> None:
+        kind = record.get("kind")
+        if kind == "preset":
+            preset_name = record.get("text")
+            if isinstance(preset_name, str) and preset_name:
+                status.preset_name = preset_name
+            return
+        if kind == "state":
+            state_name = record.get("text")
+            if isinstance(state_name, str) and state_name:
+                status.state_name = state_name
+            state = record.get("state")
+            if isinstance(state, int):
+                status.state_num = state
+            run_id = record.get("run_id")
+            slot_idx = record.get("slot_idx")
+            if isinstance(run_id, int):
+                status.run_id = run_id
+            if isinstance(slot_idx, int):
+                status.slot_idx = slot_idx
+            return
+        if kind == "fault":
+            fault_name = record.get("text")
+            if isinstance(fault_name, str) and fault_name:
+                status.last_fault = fault_name
+            return
+        if kind == "run_end":
+            reason = record.get("text")
+            if isinstance(reason, str) and reason:
+                status.last_end_reason = reason
+            return
+        if kind != "sample":
+            return
+
+        run_id = record.get("run_id")
+        slot_idx = record.get("slot_idx")
+        state = record.get("state")
+        target_g = record.get("target_g")
+        weight_g = record.get("weight_g")
+        rel_g = record.get("relative_fill_g")
+        gate_pct = record.get("gate_pct")
+        ts_us = record.get("ts_us")
+
+        if isinstance(run_id, int):
+            status.run_id = run_id
+        if isinstance(slot_idx, int):
+            status.slot_idx = slot_idx
+        if isinstance(state, int):
+            status.state_num = state
+            if status.state_name == "?":
+                status.state_name = str(state)
+        if isinstance(target_g, (int, float)):
+            status.target_g = float(target_g)
+        if isinstance(weight_g, (int, float)):
+            status.weight_g = float(weight_g)
+            history.append(status.weight_g)
+        if isinstance(rel_g, (int, float)):
+            status.relative_fill_g = float(rel_g)
+        if isinstance(gate_pct, (int, float)):
+            status.gate_pct = float(gate_pct)
+        if isinstance(ts_us, int):
+            status.last_sample_ts_us = ts_us
+
     try:
         while True:
             raw = serial_dev.read(serial_dev.in_waiting or 1)
@@ -359,15 +724,32 @@ def main() -> int:
                 handle_console_line(line)
 
     except KeyboardInterrupt:
-        clear_status_line(status_line_enabled)
-        print("Capture stopped by user.")
-        return 0
+        interrupted = True
     finally:
-        clear_status_line(status_line_enabled)
+        if status_line_enabled:
+            detach_status_area(status_line_enabled, status_line_count)
+        reset_terminal_state()
+        session_log.flush()
+        telemetry_log.flush()
         close_run_capture(current_run)
         telemetry_log.close()
         session_log.close()
         serial_dev.close()
+
+    elapsed_s = time.monotonic() - started_at
+    session_log_path = session_dir / "session.log"
+    telemetry_path = session_dir / "telemetry.ndjson"
+    print_shutdown_summary(
+        interrupted=interrupted,
+        elapsed_s=elapsed_s,
+        console_line_count=console_line_count,
+        tel_count=tel_count,
+        run_count=run_count,
+        session_dir=session_dir,
+        session_log_path=session_log_path,
+        telemetry_path=telemetry_path,
+    )
+    return 0
 
 
 if __name__ == "__main__":

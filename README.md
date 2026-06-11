@@ -77,7 +77,7 @@ idf.py -p /dev/ttyUSB0 flash monitor
 
 Current script layout:
 - `tools/telemetry/capture.py`
-  Fully usable serial capture tool. Replaces the basic `idf.py monitor` workflow for experiment sessions.
+  Fully usable serial capture tool. Replaces the basic `idf.py monitor` workflow for experiment sessions and shows a live status line with telemetry counters.
 - `tools/telemetry/split_runs.py`
   Reserved for later offline re-splitting of runs from a captured session.
 - `tools/telemetry/plot_runs.py`
@@ -104,13 +104,15 @@ Useful options:
 - `--pre-run-ms 2000 --post-run-ms 2000`
   Keep more telemetry context around each detected run.
 - `--session-name my-test`
-  Use a fixed readable folder name instead of an auto timestamp.
+  Add a readable suffix after the timestamp, for example
+  `2026.06.07_22:30-x-my-test`.
 
 Goal of this tooling:
 - keep experiment data self-describing and reproducible
 - avoid manually filtering UART logs after each test
 - support later batch plotting to vector PDF/SVG figures for the thesis
 - preserve enough event context to compare different presets and control strategies cleanly
+- make it obvious during capture that the custom telemetry tool is running, not plain `idf.py monitor`
 
 ## Wiring (servo mount DIN cable)
 The cable with 15-pin DIN connector from the base assembly to the servo mount carries OLED, encoder, and servo signals + power.
