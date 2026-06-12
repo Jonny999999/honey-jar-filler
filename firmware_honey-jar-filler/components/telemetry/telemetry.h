@@ -21,6 +21,7 @@ typedef enum {
     TELEMETRY_KIND_PRESET,
     TELEMETRY_KIND_RUN_START,
     TELEMETRY_KIND_RUN_END,
+    TELEMETRY_KIND_FILL_START,
     TELEMETRY_KIND_RUN_SUMMARY,
     TELEMETRY_KIND_STATE,
     TELEMETRY_KIND_FAULT,
@@ -36,6 +37,8 @@ typedef struct {
     uint32_t state;
     uint32_t preset_index;
     uint32_t target_g;
+    uint32_t scale_period_ms_cfg;
+    uint32_t fsm_period_ms_cfg;
     float weight_g;
     float relative_fill_g;
     float gate_pct;
@@ -55,6 +58,14 @@ bool telemetry_publish_note(const char *text);
 bool telemetry_publish_preset(uint32_t preset_index, const char *preset_name);
 bool telemetry_publish_run_start(uint32_t run_id, int32_t slot_idx);
 bool telemetry_publish_run_end(uint32_t run_id, int32_t slot_idx, const char *reason);
+bool telemetry_publish_fill_start(uint32_t run_id,
+                                  int32_t slot_idx,
+                                  const char *preset_name,
+                                  const char *strategy_name,
+                                  const app_params_t *params,
+                                  float base_weight_g,
+                                  uint32_t scale_period_ms_cfg,
+                                  uint32_t fsm_period_ms_cfg);
 bool telemetry_publish_run_summary(uint32_t run_id,
                                    int32_t slot_idx,
                                    const char *result,
@@ -62,7 +73,9 @@ bool telemetry_publish_run_summary(uint32_t run_id,
                                    const char *strategy_name,
                                    const app_params_t *params,
                                    float final_weight_g,
-                                   float final_relative_fill_g);
+                                   float final_relative_fill_g,
+                                   uint32_t scale_period_ms_cfg,
+                                   uint32_t fsm_period_ms_cfg);
 bool telemetry_publish_state(uint32_t run_id, int32_t slot_idx, uint32_t state, const char *state_name);
 bool telemetry_publish_fault(uint32_t run_id, int32_t slot_idx, const char *fault_name);
 bool telemetry_publish_gate(uint32_t run_id, int32_t slot_idx, float gate_pct, const char *label);

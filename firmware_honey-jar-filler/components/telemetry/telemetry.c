@@ -76,6 +76,7 @@ const char *telemetry_kind_name(telemetry_kind_t kind)
     case TELEMETRY_KIND_PRESET:    return "preset";
     case TELEMETRY_KIND_RUN_START: return "run_start";
     case TELEMETRY_KIND_RUN_END:   return "run_end";
+    case TELEMETRY_KIND_FILL_START:return "fill_start";
     case TELEMETRY_KIND_RUN_SUMMARY:return "run_summary";
     case TELEMETRY_KIND_STATE:     return "state";
     case TELEMETRY_KIND_FAULT:     return "fault";
@@ -149,6 +150,32 @@ bool telemetry_publish_run_end(uint32_t run_id, int32_t slot_idx, const char *re
     return telemetry_publish(&rec);
 }
 
+bool telemetry_publish_fill_start(uint32_t run_id,
+                                  int32_t slot_idx,
+                                  const char *preset_name,
+                                  const char *strategy_name,
+                                  const app_params_t *params,
+                                  float base_weight_g,
+                                  uint32_t scale_period_ms_cfg,
+                                  uint32_t fsm_period_ms_cfg)
+{
+    telemetry_record_t rec;
+    telemetry_record_init(&rec, TELEMETRY_KIND_FILL_START);
+    rec.run_id = run_id;
+    rec.slot_idx = slot_idx;
+    rec.weight_g = base_weight_g;
+    rec.scale_period_ms_cfg = scale_period_ms_cfg;
+    rec.fsm_period_ms_cfg = fsm_period_ms_cfg;
+    if (params) {
+        rec.target_g = params->target_grams;
+        rec.params = *params;
+    }
+    telemetry_copy_text(rec.text, sizeof(rec.text), "start");
+    telemetry_copy_text(rec.preset_name, sizeof(rec.preset_name), preset_name);
+    telemetry_copy_text(rec.strategy_name, sizeof(rec.strategy_name), strategy_name);
+    return telemetry_publish(&rec);
+}
+
 bool telemetry_publish_run_summary(uint32_t run_id,
                                    int32_t slot_idx,
                                    const char *result,
@@ -156,7 +183,9 @@ bool telemetry_publish_run_summary(uint32_t run_id,
                                    const char *strategy_name,
                                    const app_params_t *params,
                                    float final_weight_g,
-                                   float final_relative_fill_g)
+                                   float final_relative_fill_g,
+                                   uint32_t scale_period_ms_cfg,
+                                   uint32_t fsm_period_ms_cfg)
 {
     telemetry_record_t rec;
     telemetry_record_init(&rec, TELEMETRY_KIND_RUN_SUMMARY);
@@ -164,6 +193,8 @@ bool telemetry_publish_run_summary(uint32_t run_id,
     rec.slot_idx = slot_idx;
     rec.weight_g = final_weight_g;
     rec.relative_fill_g = final_relative_fill_g;
+    rec.scale_period_ms_cfg = scale_period_ms_cfg;
+    rec.fsm_period_ms_cfg = fsm_period_ms_cfg;
     if (params) {
         rec.target_g = params->target_grams;
         rec.params = *params;
@@ -311,11 +342,12 @@ static void telemetry_emit_record(const telemetry_record_t *rec)
                rec->slot_idx,
                text_escaped);
         break;
-    case TELEMETRY_KIND_RUN_SUMMARY:
-        printf("TEL {\"ts_us\":%" PRId64 ",\"kind\":\"run_summary\",\"run_id\":%" PRIu32
+    case TELEMETRY_KIND_FILL_START:
+        printf("TEL {\"ts_us\":%" PRId64 ",\"kind\":\"fill_start\",\"run_id\":%" PRIu32
                ",\"slot_idx\":%" PRId32 ",\"text\":\"%s\",\"preset_name\":\"%s\""
                ",\"strategy_name\":\"%s\",\"target_g\":%" PRIu32
-               ",\"final_weight_g\":%.3f,\"final_relative_fill_g\":%.3f,\"params\":{",
+               ",\"base_weight_g\":%.3f,\"scale_period_ms_cfg\":%" PRIu32
+               ",\"fsm_period_ms_cfg\":%" PRIu32 ",\"params\":{",
                rec->ts_us,
                rec->run_id,
                rec->slot_idx,
@@ -324,7 +356,29 @@ static void telemetry_emit_record(const telemetry_record_t *rec)
                strategy_escaped,
                rec->target_g,
                (double)rec->weight_g,
-               (double)rec->relative_fill_g);
+               rec->scale_period_ms_cfg,
+               rec->fsm_period_ms_cfg);
+        telemetry_emit_params_json(&rec->params);
+        printf("}}\n");
+        break;
+    case TELEMETRY_KIND_RUN_SUMMARY:
+        printf("TEL {\"ts_us\":%" PRId64 ",\"kind\":\"run_summary\",\"run_id\":%" PRIu32
+               ",\"slot_idx\":%" PRId32 ",\"text\":\"%s\",\"preset_name\":\"%s\""
+               ",\"strategy_name\":\"%s\",\"target_g\":%" PRIu32
+               ",\"final_weight_g\":%.3f,\"final_relative_fill_g\":%.3f"
+               ",\"scale_period_ms_cfg\":%" PRIu32 ",\"fsm_period_ms_cfg\":%" PRIu32
+               ",\"params\":{",
+               rec->ts_us,
+               rec->run_id,
+               rec->slot_idx,
+               text_escaped,
+               preset_escaped,
+               strategy_escaped,
+               rec->target_g,
+               (double)rec->weight_g,
+               (double)rec->relative_fill_g,
+               rec->scale_period_ms_cfg,
+               rec->fsm_period_ms_cfg);
         telemetry_emit_params_json(&rec->params);
         printf("}}\n");
         break;

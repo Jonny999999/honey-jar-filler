@@ -142,34 +142,40 @@ static void filler_stop_all(void)
     s_gate_pct = 0.0f;
 }
 
-static void gate_open_cached(void)
-{
-    if (s_gate_cmd != GATE_CMD_OPEN) {
-        (void)gate_open();
-        s_gate_cmd = GATE_CMD_OPEN;
-        s_gate_pct = 100.0f;
-        (void)telemetry_publish_gate(filler_get_run_id(), filler_get_slot_idx(), s_gate_pct, "open");
-    }
-}
-
-static void gate_close_cached(void)
+static void gate_close_cached_label(const char *label)
 {
     if (s_gate_cmd != GATE_CMD_CLOSE) {
         (void)gate_close();
         s_gate_cmd = GATE_CMD_CLOSE;
         s_gate_pct = 0.0f;
-        (void)telemetry_publish_gate(filler_get_run_id(), filler_get_slot_idx(), s_gate_pct, "close");
+        (void)telemetry_publish_gate(filler_get_run_id(),
+                                     filler_get_slot_idx(),
+                                     s_gate_pct,
+                                     label ? label : "close");
     }
 }
 
-static void gate_set_percent_cached(float pct)
+static void gate_close_cached(void)
+{
+    gate_close_cached_label("close");
+}
+
+static void gate_set_percent_cached_label(float pct, const char *label)
 {
     if (s_gate_cmd != GATE_CMD_PERCENT || s_gate_pct != pct) {
         (void)gate_set_percent(pct);
         s_gate_cmd = GATE_CMD_PERCENT;
         s_gate_pct = pct;
-        (void)telemetry_publish_gate(filler_get_run_id(), filler_get_slot_idx(), s_gate_pct, "percent");
+        (void)telemetry_publish_gate(filler_get_run_id(),
+                                     filler_get_slot_idx(),
+                                     s_gate_pct,
+                                     label ? label : "percent");
     }
+}
+
+static void gate_set_percent_cached(float pct)
+{
+    gate_set_percent_cached_label(pct, "percent");
 }
 
 static bool scale_is_stale(const scale_latest_t *s)
@@ -279,7 +285,25 @@ static void filler_publish_run_summary(const char *result,
                                         k_strategy_name,
                                         params,
                                         final_weight_g,
-                                        final_relative_fill_g);
+                                        final_relative_fill_g,
+                                        CONFIG_HX711_POLL_INTERVAL_MS,
+                                        FSM_TICK_MS);
+}
+
+static void filler_publish_fill_start(uint32_t run_id,
+                                      uint8_t slot_idx,
+                                      const app_params_t *params,
+                                      float base_weight_g)
+{
+    if (!params) return;
+    (void)telemetry_publish_fill_start(run_id,
+                                       slot_idx,
+                                       app_presets_get_name(app_presets_get_active_index()),
+                                       k_strategy_name,
+                                       params,
+                                       base_weight_g,
+                                       CONFIG_HX711_POLL_INTERVAL_MS,
+                                       FSM_TICK_MS);
 }
 
 static void task_filler_fsm(void *arg)
@@ -377,16 +401,23 @@ static void task_filler_fsm(void *arg)
                 motor_set(false);
                 gate_close_cached();
                 break;
-            case FILLER_FILL:
+            case FILLER_FILL: {
                 ESP_LOGD(TAG, "fill: gate open");
                 if (prev_state != FILLER_VERIFY_TARGET) {
                     close_early_relax_g = 0.0f;
                 }
-                gate_set_percent_cached(params.max_gate_pct);
+                scale_latest_t entry_latest = {0};
+                scale_latest_get(&entry_latest);
+                filler_publish_fill_start(filler_get_run_id(),
+                                          filler_get_slot_idx(),
+                                          &params,
+                                          entry_latest.grams);
+                gate_set_percent_cached_label(params.max_gate_pct, "max_gate");
                 break;
+            }
             case FILLER_DRIP_WAIT:
                 ESP_LOGD(TAG, "drip wait: gate closed");
-                gate_close_cached();
+                gate_close_cached_label("drip_wait");
                 break;
             case FILLER_VERIFY_TARGET:
                 ESP_LOGD(TAG, "verify target: gate closed");
@@ -520,13 +551,13 @@ static void task_filler_fsm(void *arg)
             }
             if (new_sample && stable_above(rel_g, (float)params.target_grams, &cnt_target, THRESH_CONFIRM_COUNT)) {
                 ESP_LOGI(TAG, "target reached: rel=%.1f g abs=%.1f g", (double)rel_g, (double)grams);
-                gate_close_cached();
+                gate_close_cached_label("target");
                 state = FILLER_DRIP_WAIT;
                 filler_set_state(state);
             } else if (new_sample && stable_above(rel_g, close_early, &cnt_close_early, THRESH_CONFIRM_COUNT)) {
                 ESP_LOGI(TAG, "close-early reached: rel=%.1f g (offset %.1f g)",
                          (double)rel_g, (double)close_early_g_cur);
-                gate_close_cached();
+                gate_close_cached_label("close_early");
                 state = FILLER_DRIP_WAIT;
                 filler_set_state(state);
             } else if (new_sample && stable_above(rel_g, near_close, &cnt_near_close, THRESH_CONFIRM_COUNT)) {
@@ -534,9 +565,9 @@ static void task_filler_fsm(void *arg)
                     ESP_LOGD(TAG, "near close: rel=%.1f g -> partial gate", (double)rel_g);
                     near_close_logged = true;
                 }
-                gate_set_percent_cached(params.near_close_gate_pct);
+                gate_set_percent_cached_label(params.near_close_gate_pct, "near_close");
             } else {
-                gate_set_percent_cached(params.max_gate_pct);
+                gate_set_percent_cached_label(params.max_gate_pct, "max_gate");
             }
             break;
         }
