@@ -79,9 +79,13 @@ Current script layout:
 - `tools/telemetry/capture.py`
   Fully usable serial capture tool. Replaces the basic `idf.py monitor` workflow for experiment sessions and shows a live status line with telemetry counters.
 - `tools/telemetry/split_runs.py`
-  Reserved for later offline re-splitting of runs from a captured session.
+  Offline splitter that converts one captured session into per-fill NDJSON files.
+  It detects jar filling windows from `state=FILL`, adds configurable pre/post context,
+  and writes `fills/index.json` plus `fill_0001.ndjson`, `fill_0002.ndjson`, ...
 - `tools/telemetry/plot_runs.py`
-  Reserved for later batch generation of thesis charts from run files.
+  Offline chart exporter for thesis figures. It writes both a plain LaTeX-ready
+  chart and a debug variant with metadata, based on fill mass, gate percentage,
+  and FSM state overlays.
 
 Session capture output:
 - `data/telemetry/<session>/session.log`
@@ -90,12 +94,23 @@ Session capture output:
   Only telemetry payload lines, one JSON object per line.
 - `data/telemetry/<session>/runs/run_0001.ndjson`
   Per-run telemetry files created live from `run_start` / `run_end` events, including configurable pre/post context.
+- `data/telemetry/<session>/fills/index.json`
+  Offline manifest of detected jar-fill windows with timing, preset, and parameter metadata.
+- `data/telemetry/<session>/fills/fill_0001.ndjson`
+  One offline per-fill telemetry slice intended for plotting and later comparison.
 - `data/telemetry/<session>/session_meta.json`
   Port, baud rate, and capture timing settings.
 
 Example capture usage:
 ```bash
 python3 tools/telemetry/capture.py --port /dev/ttyUSB0 --baud 115200
+```
+
+Example offline workflow:
+```bash
+python3 tools/telemetry/split_runs.py data/telemetry/2026.06.12_11:39-x-test --force
+python3 tools/telemetry/plot_runs.py data/telemetry/2026.06.12_11:39-x-test/fills --list
+python3 tools/telemetry/plot_runs.py data/telemetry/2026.06.12_11:39-x-test/fills --fills 1,3 --format pdf --format svg
 ```
 
 Useful options:
