@@ -18,9 +18,9 @@ import serial
 from serial.tools import list_ports
 
 try:
-    from .common import DEFAULT_OUTPUT_ROOT, ensure_session_dir, extract_tel_payload, parse_tel_payload
+    from .src.common import DEFAULT_OUTPUT_ROOT, ensure_session_dir, extract_tel_payload, parse_tel_payload
 except ImportError:
-    from common import DEFAULT_OUTPUT_ROOT, ensure_session_dir, extract_tel_payload, parse_tel_payload
+    from src.common import DEFAULT_OUTPUT_ROOT, ensure_session_dir, extract_tel_payload, parse_tel_payload
 
 LOG_LEVEL_RE = re.compile(r"^(?P<level>[DIWEV]) \(\d+\) ")
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m")

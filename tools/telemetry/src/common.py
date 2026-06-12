@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 TEL_PREFIX = "TEL "
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_OUTPUT_ROOT = REPO_ROOT / "data" / "telemetry"
 
 

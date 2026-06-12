@@ -76,6 +76,13 @@ idf.py -p /dev/ttyUSB0 flash monitor
   4. split runs and generate thesis figures from those files
 
 Current script layout:
+- `tools/telemetry/telemetry_tui.py`
+  Recommended interactive wrapper / TUI entrypoint. Guides the user through
+  capture, split, and plotting with session discovery, defaults, and command
+  previews, while still calling the underlying scripts directly.
+- `tools/telemetry/src/`
+  Internal shared helpers for the telemetry scripts. Not intended to be run
+  directly.
 - `tools/telemetry/capture.py`
   Fully usable serial capture tool. Replaces the basic `idf.py monitor` workflow for experiment sessions and shows a live status line with telemetry counters.
 - `tools/telemetry/split_runs.py`
@@ -104,6 +111,11 @@ Session capture output:
 Example capture usage:
 ```bash
 python3 tools/telemetry/capture.py --port /dev/ttyUSB0 --baud 115200
+```
+
+Recommended interactive workflow:
+```bash
+python3 tools/telemetry/telemetry_tui.py
 ```
 
 Example offline workflow:

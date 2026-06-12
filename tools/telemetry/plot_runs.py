@@ -16,6 +16,7 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
 
 from analysis import (
     FillRun,
@@ -39,12 +40,18 @@ STATE_COLORS = {
     "VERIFY_TARGET": "#dcfce7",
     "DONE": "#e5e7eb",
     "IDLE": "#f8fafc",
+    "FAULT": "#fecaca",
 }
 STATE_LABELS_DE = {
+    "IDLE": "Bereit",
+    "FIND_SLOT": "Bereit",
+    "SLOT_SETTLE": "Beruhigen",
     "VERIFY_EMPTY": "Leerprüfung",
     "FILL": "Füllen",
     "DRIP_WAIT": "Nachtropfen",
     "VERIFY_TARGET": "Zielprüfung",
+    "DONE": "Fertig",
+    "FAULT": "Störung",
 }
 GATE_LABELS_DE = {
     "max_gate": "Voll öffnen",
@@ -62,6 +69,8 @@ LINE_FILL_MASS = "#c81e1e"
 LINE_GATE = "#7e22ce"
 LINE_TARGET = "#1f5f3a"
 LINE_FAULT = "#b91c1c"
+STATE_BAND_EDGE = "#94a3b8"
+STATE_BAND_KEYS = {"FILL", "DRIP_WAIT", "VERIFY_TARGET", "FAULT"}
 
 
 def _parse_fill_selection(value: str) -> list[int]:
@@ -182,6 +191,18 @@ def _state_label_de(record: dict[str, Any]) -> str:
     return STATE_LABELS_DE.get(text, text or "Zustand")
 
 
+def _format_state_band_label(state_name: str, width_s: float) -> str | None:
+    label = STATE_LABELS_DE.get(state_name)
+    if not label:
+        return None
+    if width_s < 0.35:
+        return None
+    if width_s >= 1.15:
+        duration = f"{width_s:.2f}".replace(".", ",")
+        return f"{label}\n({duration} s)"
+    return label
+
+
 def _series_from_samples(
     fill_run: FillRun,
     samples: list[dict[str, Any]],
@@ -240,6 +261,81 @@ def _plot_state_background(
             va="top",
             fontsize=8,
             color="#334155",
+        )
+
+
+def _plot_state_band(
+    ax: Any,
+    fill_run: FillRun,
+    states: list[dict[str, Any]],
+) -> None:
+    if not states:
+        return
+
+    span_end_us = fill_run.window_end_us
+    band_y = 0.91
+    band_h = 0.065
+    segments: list[tuple[str, float, float]] = []
+
+    if fill_run.window_start_us < fill_run.focus_start_us:
+        segments.append(
+            (
+                "IDLE",
+                (fill_run.window_start_us - fill_run.focus_start_us) / 1_000_000.0,
+                0.0,
+            )
+        )
+
+    for index, state_record in enumerate(states):
+        state_name = str(state_record.get("text", "")).strip() or "STATE"
+        start_us = _ts_us(state_record)
+        end_us = span_end_us
+        if index + 1 < len(states):
+            end_us = _ts_us(states[index + 1])
+
+        if start_us < fill_run.focus_start_us:
+            continue
+        if state_name not in STATE_BAND_KEYS:
+            continue
+
+        x0 = (start_us - fill_run.focus_start_us) / 1_000_000.0
+        x1 = (end_us - fill_run.focus_start_us) / 1_000_000.0
+        segments.append((state_name, x0, x1))
+
+    for state_name, x0, x1 in segments:
+        width = max(0.0, x1 - x0)
+        if width <= 0.0:
+            continue
+
+        rect = Rectangle(
+            (x0, band_y),
+            width,
+            band_h,
+            transform=ax.get_xaxis_transform(),
+            facecolor=STATE_COLORS.get(state_name, "#e2e8f0"),
+            edgecolor=STATE_BAND_EDGE,
+            linewidth=0.6,
+            alpha=0.95,
+            zorder=1,
+            clip_on=False,
+        )
+        ax.add_patch(rect)
+
+        label = _format_state_band_label(state_name, width)
+        if label is None:
+            continue
+        ax.text(
+            x0 + width / 2.0,
+            band_y + band_h / 2.0,
+            label,
+            transform=ax.get_xaxis_transform(),
+            ha="center",
+            va="center",
+            fontsize=7.0,
+            color="#1e293b",
+            zorder=2,
+            clip_on=True,
+            linespacing=0.9,
         )
 
 
@@ -389,6 +485,7 @@ def _render_fill_variant(
     *,
     debug: bool,
     legend_placement: str,
+    state_style: str,
 ) -> list[Path]:
     samples = _sample_events(records)
     if not samples:
@@ -413,7 +510,10 @@ def _render_fill_variant(
         meta_ax = None
     ax2 = ax.twinx()
 
-    _plot_state_background(ax, fill_run, states, show_labels=False)
+    if state_style == "background":
+        _plot_state_background(ax, fill_run, states, show_labels=False)
+    elif state_style == "band":
+        _plot_state_band(ax, fill_run, states)
     if debug:
         _annotate_state_badges(ax, fill_run, states)
 
@@ -478,7 +578,7 @@ def _render_fill_variant(
         legend_kwargs.update(
             {
                 "loc": "upper left",
-                "bbox_to_anchor": (0.015, 0.985),
+                "bbox_to_anchor": (0.015, 0.905 if state_style == "band" else 0.985),
             }
         )
     else:
@@ -511,6 +611,7 @@ def _plot_fill(
     output_dir: Path,
     formats: list[str],
     legend_placement: str,
+    state_style: str,
 ) -> list[Path]:
     exported = _render_fill_variant(
         session_dir,
@@ -520,6 +621,7 @@ def _plot_fill(
         formats,
         debug=True,
         legend_placement=legend_placement,
+        state_style=state_style,
     )
     exported.extend(
         _render_fill_variant(
@@ -530,6 +632,7 @@ def _plot_fill(
             formats,
             debug=False,
             legend_placement=legend_placement,
+            state_style=state_style,
         )
     )
     return exported
@@ -581,6 +684,12 @@ def main() -> int:
         default="outside",
         help="Place the one-line legend inside the chart or outside below it",
     )
+    parser.add_argument(
+        "--state-style",
+        choices=["background", "band", "none"],
+        default="none",
+        help="Visualize firmware states as the existing full-height background, a compact top band, or disable it",
+    )
     args = parser.parse_args()
 
     session_dir, fill_runs, fill_records = _load_input(
@@ -614,6 +723,7 @@ def main() -> int:
                 output_dir=output_dir,
                 formats=formats,
                 legend_placement=args.legend_placement,
+                state_style=args.state_style,
             )
         )
 
