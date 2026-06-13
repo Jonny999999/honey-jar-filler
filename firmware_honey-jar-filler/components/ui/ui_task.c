@@ -196,6 +196,8 @@ static void ui_render(ssd1306_handle_t disp,
                       bool has_tare,
                       float tare_g)
 {
+    if (!disp) return;
+
     char line1[24];
     char line2[32];
     char line3[32];
@@ -352,9 +354,11 @@ static void task_ui(void *arg)
 
         now_ticks = xTaskGetTickCount();
         if (now_ticks >= next_refresh) {
-            if (ui_menu_is_active(&menu)) {
+            // Headless mode keeps buttons and LED status active even when no OLED
+            // is connected on the current board.
+            if (cfg.disp && ui_menu_is_active(&menu)) {
                 ui_menu_render(&menu, cfg.disp);
-            } else {
+            } else if (cfg.disp) {
                 scale_latest_t latest = {0};
                 scale_latest_get(&latest);
 

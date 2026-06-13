@@ -10,6 +10,9 @@ settings.json
 .idea/
 *.log
 
+# python
+**/__pycache__
+
 # ESP-IDF default build directory
 build
 sdkconfig.old
@@ -44,6 +47,9 @@ screenshots
 
 
 # === project specific ===
+# telemetry captures / generated plots
+data/telemetry/
+
 # cad
 cad/parts/import_raw
 **/exports/**/*.stl
