@@ -51,6 +51,9 @@ typedef struct {
     float predicted_remaining_g;
     float rel_at_first_close_g;
     float target_g;
+    float manual_gate_pct;
+    bool manual_pending_advance;
+    uint8_t manual_next_slot;
 } filler_strategy_runtime_t;
 
 typedef struct {
@@ -78,6 +81,8 @@ typedef struct {
     bool (*require_fresh_or_fault)(const char *ctx, const scale_latest_t *s, filler_state_t *state);
     void (*set_fault)(filler_fault_t flt);
     bool (*jar_tare_get)(float *out_grams);
+    bool (*take_start_request)(void);
+    int32_t (*take_manual_gate_delta)(void);
     void (*gate_close_label)(const char *label);
     void (*gate_set_percent_label)(float pct, const char *label);
     void (*set_slot)(uint8_t idx);

@@ -56,6 +56,7 @@ typedef struct {
 void filler_start_task(UBaseType_t prio, BaseType_t core); // creates the FSM task
 void filler_request_start(void);  // set an atomic flag
 void filler_request_abort(void);  // set an atomic flag
+void filler_request_manual_gate_delta(int32_t delta_pct_steps); // accumulate manual gate change requests
 filler_state_t filler_get_state(void);
 uint8_t filler_get_slot_idx(void);
 filler_fault_t filler_get_fault(void);

@@ -42,6 +42,7 @@ static volatile filler_fault_t s_fault = FLT_NONE;
 static volatile uint8_t s_slot_idx = 0;
 static volatile bool s_start_req = false;
 static volatile bool s_abort_req = false;
+static volatile int32_t s_manual_gate_delta_steps = 0;
 static volatile bool s_has_jar_tare = false;
 static volatile uint32_t s_run_id = 0;
 static float s_jar_tare_g = 0.0f;
@@ -111,6 +112,23 @@ static bool filler_take_abort_req(void)
     return v;
 }
 
+static int32_t filler_take_manual_gate_delta(void)
+{
+    int32_t v;
+    taskENTER_CRITICAL(&s_lock);
+    v = s_manual_gate_delta_steps;
+    s_manual_gate_delta_steps = 0;
+    taskEXIT_CRITICAL(&s_lock);
+    return v;
+}
+
+static void filler_clear_manual_gate_delta(void)
+{
+    taskENTER_CRITICAL(&s_lock);
+    s_manual_gate_delta_steps = 0;
+    taskEXIT_CRITICAL(&s_lock);
+}
+
 static void filler_set_slot(uint8_t idx)
 {
     taskENTER_CRITICAL(&s_lock);
@@ -153,6 +171,7 @@ static void filler_stop_all(void)
     (void)gate_close();
     s_gate_cmd = GATE_CMD_CLOSE;
     s_gate_pct = 0.0f;
+    filler_clear_manual_gate_delta();
 }
 
 static void gate_close_cached_label(const char *label)
@@ -329,6 +348,8 @@ static void task_filler_fsm(void *arg)
         .require_fresh_or_fault = scale_require_fresh_or_fault,
         .set_fault = filler_set_fault,
         .jar_tare_get = jar_tare_get,
+        .take_start_request = filler_take_start_req,
+        .take_manual_gate_delta = filler_take_manual_gate_delta,
         .gate_close_label = gate_close_cached_label,
         .gate_set_percent_label = gate_set_percent_cached_label,
         .set_slot = filler_set_slot,
@@ -380,6 +401,7 @@ static void task_filler_fsm(void *arg)
             case FILLER_DONE:
             case FILLER_FAULT:
                 filler_clear_strategy_sample_telemetry();
+                filler_clear_manual_gate_delta();
                 if (state == FILLER_FAULT) {
                     filler_publish_run_summary("fault",
                                                filler_get_run_id(),
@@ -396,18 +418,21 @@ static void task_filler_fsm(void *arg)
                 break;
             case FILLER_FIND_SLOT:
                 filler_clear_strategy_sample_telemetry();
+                filler_clear_manual_gate_delta();
                 ESP_LOGD(TAG, "motor on (find slot)");
                 motor_set(true);
                 jar_tare_clear();
                 break;
             case FILLER_VERIFY_EMPTY:
                 filler_clear_strategy_sample_telemetry();
+                filler_clear_manual_gate_delta();
                 ESP_LOGD(TAG, "verify empty: motor off, gate closed");
                 motor_set(false);
                 gate_close_cached();
                 break;
             case FILLER_SLOT_SETTLE:
                 filler_clear_strategy_sample_telemetry();
+                filler_clear_manual_gate_delta();
                 ESP_LOGD(TAG, "slot settle: motor off, gate closed");
                 motor_set(false);
                 gate_close_cached();
@@ -487,7 +512,14 @@ static void task_filler_fsm(void *arg)
             // Let the motor stop fully before reading the scale.
             int64_t elapsed_us = esp_timer_get_time() - state_enter_us;
             if (elapsed_us >= ((int64_t)params.slot_settle_ms * 1000)) {
-                state = FILLER_VERIFY_EMPTY;
+                if (active_strategy == APP_FILL_STRATEGY_MANUAL) {
+                    skipped_slots_streak = 0;
+                    jar_tare_clear();
+                    ESP_LOGI(TAG, "manual mode: slot positioned -> enter fill without jar check");
+                    state = FILLER_FILL;
+                } else {
+                    state = FILLER_VERIFY_EMPTY;
+                }
                 filler_set_state(state);
             }
             break;
@@ -641,6 +673,16 @@ void filler_request_abort(void)
 {
     taskENTER_CRITICAL(&s_lock);
     s_abort_req = true;
+    taskEXIT_CRITICAL(&s_lock);
+}
+
+void filler_request_manual_gate_delta(int32_t delta_pct_steps)
+{
+    if (delta_pct_steps == 0) return;
+    taskENTER_CRITICAL(&s_lock);
+    s_manual_gate_delta_steps += delta_pct_steps;
+    if (s_manual_gate_delta_steps > 1000) s_manual_gate_delta_steps = 1000;
+    if (s_manual_gate_delta_steps < -1000) s_manual_gate_delta_steps = -1000;
     taskEXIT_CRITICAL(&s_lock);
 }
 

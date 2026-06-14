@@ -2,6 +2,7 @@
 
 extern const filler_strategy_ops_t g_filler_strategy_heuristic_ops;
 extern const filler_strategy_ops_t g_filler_strategy_adaptive_heuristic_ops;
+extern const filler_strategy_ops_t g_filler_strategy_manual_ops;
 
 const filler_strategy_ops_t *filler_strategy_ops_for_app(app_fill_strategy_t strategy)
 {
@@ -10,6 +11,8 @@ const filler_strategy_ops_t *filler_strategy_ops_for_app(app_fill_strategy_t str
         return &g_filler_strategy_heuristic_ops;
     case APP_FILL_STRATEGY_ADAPTIVE_HEURISTIC:
         return &g_filler_strategy_adaptive_heuristic_ops;
+    case APP_FILL_STRATEGY_MANUAL:
+        return &g_filler_strategy_manual_ops;
     default:
         return &g_filler_strategy_heuristic_ops;
     }

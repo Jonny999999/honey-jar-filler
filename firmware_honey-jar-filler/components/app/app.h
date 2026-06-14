@@ -24,6 +24,7 @@ typedef enum {
 typedef enum {
     APP_FILL_STRATEGY_HEURISTIC = 0,
     APP_FILL_STRATEGY_ADAPTIVE_HEURISTIC,
+    APP_FILL_STRATEGY_MANUAL,
     APP_FILL_STRATEGY_COUNT,
 } app_fill_strategy_t;
 
