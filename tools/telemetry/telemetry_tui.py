@@ -392,6 +392,7 @@ def action_plot(output_root: Path) -> None:
         [
             "Uses fills/index.json when available, otherwise plots directly from the session.",
             "Exports both plain and debug chart variants.",
+            "Supports optional Zustandsband and Füllraten-Darstellung.",
             "Keeps the existing plotting script as the source of truth.",
         ],
     )
@@ -415,6 +416,20 @@ def action_plot(output_root: Path) -> None:
         [("n", "none"), ("b", "compact top band"), ("g", "full background")],
         "n",
     )
+    show_rate = prompt_choice(
+        "Fill-rate telemetry",
+        [("n", "none"), ("f", "filtered only"), ("b", "raw + filtered")],
+        "n",
+    )
+    rate_layout = "s"
+    if show_rate != "n":
+        print(style("Overlay keeps one compact chart but uses an extra right axis for g/s.", FG_HINT))
+        print(style("Subplot keeps units visually cleaner and is usually the better thesis default.", FG_HINT))
+        rate_layout = prompt_choice(
+            "Rate layout",
+            [("s", "separate subplot"), ("o", "overlay in same chart")],
+            "s",
+        )
     format_choice = prompt_choice(
         "Export formats",
         [("1", "pdf"), ("2", "pdf + svg"), ("3", "pdf + svg + png")],
@@ -430,6 +445,10 @@ def action_plot(output_root: Path) -> None:
         "outside" if legend == "o" else "inside",
         "--state-style",
         {"n": "none", "b": "band", "g": "background"}[state_style],
+        "--show-rate",
+        {"n": "none", "f": "filtered", "b": "both"}[show_rate],
+        "--rate-layout",
+        "overlay" if rate_layout == "o" else "subplot",
     ]
     if fill_ids:
         cmd.extend(["--fills", fill_ids])

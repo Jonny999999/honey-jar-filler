@@ -43,6 +43,10 @@ typedef struct {
     float filtered_rate_gps;
     float predicted_remaining_g;
     float measured_dead_time_s;
+    float measured_post_close_gain_g;
+    // Adaptive mode publishes learned/live-adapted values here. Fixed
+    // heuristic mode reuses the same fields for the currently active static
+    // thresholds/waits so comparison charts can share common axes/labels.
     float learned_dead_time_s;
     float learned_post_close_gain_g;
     float learned_fast_rate_gps;

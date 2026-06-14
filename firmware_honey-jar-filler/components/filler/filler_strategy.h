@@ -41,6 +41,7 @@ typedef struct {
     uint16_t slow_rate_count;
     float measured_dead_time_s;
     float measured_post_close_gain_g;
+    float rate_at_close_gps;
     float learned_dead_time_s;
     float learned_post_close_gain_g;
     float learned_fast_rate_gps;
@@ -65,8 +66,12 @@ typedef struct {
     float measured_post_close_gain_g;
     float measured_fast_rate_gps;
     float measured_slow_rate_gps;
+    float rate_at_close_gps;
+    float fill_duration_s;
     float drip_wait_used_ms;
     uint32_t refill_count;
+    // "next_*" values are meaningful for adaptive mode. Fixed/manual
+    // strategies leave them at zero because no cross-run learning is applied.
     float next_dead_time_s;
     float next_post_close_gain_g;
     float next_fast_rate_gps;

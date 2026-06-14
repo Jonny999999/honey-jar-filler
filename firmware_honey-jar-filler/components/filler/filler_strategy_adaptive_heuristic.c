@@ -313,6 +313,7 @@ static void publish_runtime_snapshot(filler_strategy_runtime_t *rt, const filler
         .filtered_rate_gps = rt->filtered_rate_gps,
         .predicted_remaining_g = rt->predicted_remaining_g,
         .measured_dead_time_s = rt->measured_dead_time_s,
+        .measured_post_close_gain_g = rt->measured_post_close_gain_g,
         .learned_dead_time_s = rt->learned_dead_time_s,
         .learned_post_close_gain_g = rt->learned_post_close_gain_g,
         .learned_fast_rate_gps = rt->learned_fast_rate_gps,
@@ -385,6 +386,7 @@ static void mark_first_close(filler_strategy_runtime_t *rt, const filler_strateg
     rt->first_close_ts_us = tick->latest->ts_us;
     rt->rel_at_first_close_g = tick->latest->grams - rt->run_base_weight_g;
     rt->last_gain_ts_us = rt->first_close_ts_us;
+    rt->rate_at_close_gps = (rt->filtered_rate_gps > 0.0f) ? rt->filtered_rate_gps : rt->raw_rate_gps;
 }
 
 static float safe_rate_limit_gps(const filler_strategy_runtime_t *rt)
@@ -416,6 +418,9 @@ static void publish_summary_and_learn(filler_strategy_runtime_t *rt,
     float final_rel_g = tick->latest->grams - rt->run_base_weight_g;
     float fast_avg = (rt->fast_rate_count > 0) ? (rt->fast_rate_sum_gps / (float)rt->fast_rate_count) : 0.0f;
     float slow_avg = (rt->slow_rate_count > 0) ? (rt->slow_rate_sum_gps / (float)rt->slow_rate_count) : 0.0f;
+    float fill_duration_s = (rt->fill_open_ts_us > 0)
+        ? ((float)(tick->now_us - rt->fill_open_ts_us) / 1000000.0f)
+        : 0.0f;
     float settled_wait_ms = rt->first_close_seen && rt->last_gain_ts_us >= rt->first_close_ts_us
         ? ((float)(rt->last_gain_ts_us - rt->first_close_ts_us) / 1000.0f) + DRIP_WAIT_SETTLE_MARGIN_MS
         : rt->adapted_drip_wait_ms;
@@ -468,6 +473,8 @@ static void publish_summary_and_learn(filler_strategy_runtime_t *rt,
         .measured_post_close_gain_g = rt->measured_post_close_gain_g,
         .measured_fast_rate_gps = fast_avg,
         .measured_slow_rate_gps = slow_avg,
+        .rate_at_close_gps = rt->rate_at_close_gps,
+        .fill_duration_s = fill_duration_s,
         .drip_wait_used_ms = rt->adapted_drip_wait_ms,
         .refill_count = rt->refill_count,
         .next_dead_time_s = entry->dead_time_s,
@@ -524,6 +531,8 @@ static void adaptive_on_enter(filler_strategy_runtime_t *rt,
                      (double)rt->close_early_relax_g);
         }
 
+        rt->last_rate_ts_us = 0;
+        rt->last_rel_g = 0.0f;
         reset_state_counters(rt);
         rt->learned_dead_time_s = entry->dead_time_s;
         rt->learned_post_close_gain_g = entry->post_close_gain_g;

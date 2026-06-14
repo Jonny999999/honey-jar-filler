@@ -314,6 +314,8 @@ static void filler_publish_fill_summary(uint32_t run_id,
     rec.measured_post_close_gain_g = summary->measured_post_close_gain_g;
     rec.measured_fast_rate_gps = summary->measured_fast_rate_gps;
     rec.measured_slow_rate_gps = summary->measured_slow_rate_gps;
+    rec.rate_at_close_gps = summary->rate_at_close_gps;
+    rec.fill_duration_s = summary->fill_duration_s;
     rec.adapted_drip_wait_ms = summary->drip_wait_used_ms;
     rec.refill_count = summary->refill_count;
     rec.learned_dead_time_s = summary->next_dead_time_s;

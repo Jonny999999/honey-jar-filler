@@ -409,6 +409,7 @@ static bool scale_publish_telemetry_sample(int64_t ts_us, float weight_g)
         rec.rate_filtered_gps = strategy_sample.filtered_rate_gps;
         rec.predicted_remaining_g = strategy_sample.predicted_remaining_g;
         rec.measured_dead_time_s = strategy_sample.measured_dead_time_s;
+        rec.measured_post_close_gain_g = strategy_sample.measured_post_close_gain_g;
         rec.learned_dead_time_s = strategy_sample.learned_dead_time_s;
         rec.learned_post_close_gain_g = strategy_sample.learned_post_close_gain_g;
         rec.learned_fast_rate_gps = strategy_sample.learned_fast_rate_gps;

@@ -48,6 +48,8 @@ typedef struct {
     float rate_filtered_gps;
     float predicted_remaining_g;
     float measured_dead_time_s;
+    float rate_at_close_gps;
+    float fill_duration_s;
     float learned_dead_time_s;
     float learned_post_close_gain_g;
     float learned_fast_rate_gps;

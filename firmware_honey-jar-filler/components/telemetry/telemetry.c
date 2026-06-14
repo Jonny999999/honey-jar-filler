@@ -304,7 +304,8 @@ static void telemetry_emit_record(const telemetry_record_t *rec)
         if (strategy_escaped[0] || text_escaped[0]) {
             printf(",\"strategy_name\":\"%s\",\"gate_phase\":\"%s\""
                    ",\"rate_raw_gps\":%.3f,\"rate_filtered_gps\":%.3f"
-                   ",\"predicted_remaining_g\":%.3f,\"dead_time_s\":%.3f"
+                   ",\"predicted_remaining_g\":%.3f,\"measured_dead_time_s\":%.3f"
+                   ",\"measured_post_close_gain_g\":%.3f"
                    ",\"learned_dead_time_s\":%.3f,\"learned_post_close_gain_g\":%.3f"
                    ",\"learned_fast_rate_gps\":%.3f,\"learned_slow_rate_gps\":%.3f"
                    ",\"adapted_near_close_g\":%.3f,\"adapted_close_early_g\":%.3f"
@@ -315,6 +316,7 @@ static void telemetry_emit_record(const telemetry_record_t *rec)
                    (double)rec->rate_filtered_gps,
                    (double)rec->predicted_remaining_g,
                    (double)rec->measured_dead_time_s,
+                   (double)rec->measured_post_close_gain_g,
                    (double)rec->learned_dead_time_s,
                    (double)rec->learned_post_close_gain_g,
                    (double)rec->learned_fast_rate_gps,
@@ -393,7 +395,8 @@ static void telemetry_emit_record(const telemetry_record_t *rec)
                ",\"final_mass_g\":%.3f,\"final_relative_fill_g\":%.3f"
                ",\"fill_error_g\":%.3f,\"measured_dead_time_s\":%.3f"
                ",\"measured_post_close_gain_g\":%.3f,\"measured_fast_rate_gps\":%.3f"
-               ",\"measured_slow_rate_gps\":%.3f,\"drip_wait_used_ms\":%.3f"
+               ",\"measured_slow_rate_gps\":%.3f,\"rate_at_close_gps\":%.3f"
+               ",\"fill_duration_s\":%.3f,\"drip_wait_used_ms\":%.3f"
                ",\"refill_count\":%" PRIu32 ",\"next_dead_time_s\":%.3f"
                ",\"next_post_close_gain_g\":%.3f,\"next_fast_rate_gps\":%.3f"
                ",\"next_slow_rate_gps\":%.3f,\"next_near_close_g\":%.3f"
@@ -413,6 +416,8 @@ static void telemetry_emit_record(const telemetry_record_t *rec)
                (double)rec->measured_post_close_gain_g,
                (double)rec->measured_fast_rate_gps,
                (double)rec->measured_slow_rate_gps,
+               (double)rec->rate_at_close_gps,
+               (double)rec->fill_duration_s,
                (double)rec->adapted_drip_wait_ms,
                rec->refill_count,
                (double)rec->learned_dead_time_s,

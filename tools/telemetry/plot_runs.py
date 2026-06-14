@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import os
 import tempfile
+import textwrap
 from pathlib import Path
 from typing import Any
 
@@ -73,6 +74,7 @@ LINE_RATE_RAW = "#94a3b8"
 LINE_RATE_FILTERED = "#2563eb"
 STATE_BAND_EDGE = "#94a3b8"
 STATE_BAND_KEYS = {"FILL", "DRIP_WAIT", "VERIFY_TARGET", "FAULT"}
+RATE_AXIS_LABEL = "Füllrate [g/s]"
 
 
 def _parse_fill_selection(value: str) -> list[int]:
@@ -519,68 +521,81 @@ def _draw_debug_metadata(
     summary = _fill_summary_record(records, fill_run)
     first_adaptive_sample = _first_adaptive_sample(records, fill_run)
 
+    session_text = session_dir.name
+    wrapped_session = "\n".join(textwrap.wrap(session_text, width=42)) or session_text
+
     general_lines = [
-        ("Session", session_dir.name),
         ("Fill id", str(fill_run.fill_id)),
         ("Run", str(fill_run.run_id)),
         ("Slot", str(fill_run.slot_idx)),
         ("Preset", fill_run.preset_name or "?"),
+        ("Strategie", fill_run.strategy_name or "?"),
         ("Focus duration", f"{fill_run.focus_duration_s:.2f} s"),
         ("Window", f"{fill_run.window_duration_s:.2f} s"),
-        ("End", fill_run.end_reason),
+        ("Ende", fill_run.end_reason),
     ]
     if base_weight_g is not None:
-        general_lines.append(("Base weight", f"{base_weight_g:.2f} g"))
+        general_lines.append(("Leermasse", f"{base_weight_g:.2f} g"))
     if fill_run.end_weight_g is not None and base_weight_g is not None:
-        general_lines.append(("Final fill mass", f"{fill_run.end_weight_g - base_weight_g:.2f} g"))
-    if fill_run.strategy_name:
-        general_lines.append(("Strategy", fill_run.strategy_name))
+        general_lines.append(("Endmasse Füllung", f"{fill_run.end_weight_g - base_weight_g:.2f} g"))
     if fill_run.scale_period_ms_cfg is not None:
-        general_lines.append(("Scale period cfg", f"{fill_run.scale_period_ms_cfg:.0f} ms"))
+        general_lines.append(("Waage Sollperiode", f"{fill_run.scale_period_ms_cfg:.0f} ms"))
     if fill_run.scale_period_ms_avg is not None:
-        general_lines.append(("Scale period avg", f"{fill_run.scale_period_ms_avg:.1f} ms"))
+        general_lines.append(("Waage Istperiode", f"{fill_run.scale_period_ms_avg:.1f} ms"))
     if fill_run.scale_rate_hz_avg is not None:
-        general_lines.append(("Scale rate avg", f"{fill_run.scale_rate_hz_avg:.2f} Hz"))
+        general_lines.append(("Waagenrate", f"{fill_run.scale_rate_hz_avg:.2f} Hz"))
     if fill_run.fsm_period_ms_cfg is not None:
-        general_lines.append(("FSM period cfg", f"{fill_run.fsm_period_ms_cfg:.0f} ms"))
+        general_lines.append(("FSM Sollperiode", f"{fill_run.fsm_period_ms_cfg:.0f} ms"))
 
     preset_lines = [
         (label, _format_param_value(label, value))
         for label, value in important_params(fill_run)
     ]
 
-    adaptive_run_lines: list[tuple[str, str]] = []
+    result_lines: list[tuple[str, str]] = []
+    runtime_lines: list[tuple[str, str]] = []
     adaptive_next_lines: list[tuple[str, str]] = []
+
     if first_adaptive_sample is not None:
-        adaptive_run_lines.extend(
+        runtime_lines.extend(
             [
-                ("Near close used", _format_meta_value(_float_value(first_adaptive_sample, "adapted_near_close_g"), "g", 1)),
-                ("Close early used", _format_meta_value(_float_value(first_adaptive_sample, "adapted_close_early_g"), "g", 1)),
-                ("Drip wait start", _format_meta_value(_float_value(first_adaptive_sample, "adapted_drip_wait_ms"), "ms", 0)),
-                ("Dead time est.", _format_meta_value(_float_value(first_adaptive_sample, "learned_dead_time_s"), "s", 3)),
-                ("Post-close est.", _format_meta_value(_float_value(first_adaptive_sample, "learned_post_close_gain_g"), "g", 1)),
+                ("Nahe Schließen", _format_meta_value(_float_value(first_adaptive_sample, "adapted_near_close_g"), "g", 1)),
+                ("Früh schließen", _format_meta_value(_float_value(first_adaptive_sample, "adapted_close_early_g"), "g", 1)),
+                ("Nachtropfen Start", _format_meta_value(_float_value(first_adaptive_sample, "adapted_drip_wait_ms"), "ms", 0)),
+                ("Totzeit Schätzwert", _format_meta_value(_float_value(first_adaptive_sample, "learned_dead_time_s"), "s", 3)),
+                ("Nachlauf Schätzwert", _format_meta_value(_float_value(first_adaptive_sample, "learned_post_close_gain_g"), "g", 1)),
             ]
         )
     if summary is not None:
-        adaptive_run_lines.extend(
+        result_lines.extend(
             [
+                ("Ergebnis", str(summary.get("text", "?"))),
+                ("Zielmasse", _format_meta_value(_float_value(summary, "target_g"), "g", 1)),
+                ("Endmasse", _format_meta_value(_float_value(summary, "final_mass_g"), "g", 1)),
+                ("Fehler", _format_meta_value(_float_value(summary, "fill_error_g"), "g", 1)),
+                ("Fülldauer", _format_meta_value(_float_value(summary, "fill_duration_s"), "s", 2)),
                 ("Refills", _format_meta_value(summary.get("refill_count"))),
-                ("Dead time run", _format_meta_value(_float_value(summary, "measured_dead_time_s"), "s", 3)),
-                ("Post-close run", _format_meta_value(_float_value(summary, "measured_post_close_gain_g"), "g", 1)),
-                ("Fast rate run", _format_meta_value(_float_value(summary, "measured_fast_rate_gps"), "g/s", 1)),
-                ("Slow rate run", _format_meta_value(_float_value(summary, "measured_slow_rate_gps"), "g/s", 1)),
-                ("Drip wait used", _format_meta_value(_float_value(summary, "drip_wait_used_ms"), "ms", 0)),
+            ]
+        )
+        runtime_lines.extend(
+            [
+                ("Totzeit Messung", _format_meta_value(_float_value(summary, "measured_dead_time_s"), "s", 3)),
+                ("Nachlauf Messung", _format_meta_value(_float_value(summary, "measured_post_close_gain_g"), "g", 1)),
+                ("Rate schnell", _format_meta_value(_float_value(summary, "measured_fast_rate_gps"), "g/s", 1)),
+                ("Rate reduziert", _format_meta_value(_float_value(summary, "measured_slow_rate_gps"), "g/s", 1)),
+                ("Rate beim Schließen", _format_meta_value(_float_value(summary, "rate_at_close_gps"), "g/s", 1)),
+                ("Nachtropfen Ist", _format_meta_value(_float_value(summary, "drip_wait_used_ms"), "ms", 0)),
             ]
         )
         adaptive_next_lines.extend(
             [
-                ("Learned dead time", _format_meta_value(_float_value(summary, "next_dead_time_s"), "s", 3)),
-                ("Learned post-close", _format_meta_value(_float_value(summary, "next_post_close_gain_g"), "g", 1)),
-                ("Learned fast rate", _format_meta_value(_float_value(summary, "next_fast_rate_gps"), "g/s", 1)),
-                ("Learned slow rate", _format_meta_value(_float_value(summary, "next_slow_rate_gps"), "g/s", 1)),
-                ("Next drip wait", _format_meta_value(_float_value(summary, "next_drip_wait_ms"), "ms", 0)),
-                ("Last near-close", _format_meta_value(_float_value(summary, "next_near_close_g"), "g", 1)),
-                ("Last close-early", _format_meta_value(_float_value(summary, "next_close_early_g"), "g", 1)),
+                ("Nächste Totzeit", _format_meta_value(_float_value(summary, "next_dead_time_s"), "s", 3)),
+                ("Nächster Nachlauf", _format_meta_value(_float_value(summary, "next_post_close_gain_g"), "g", 1)),
+                ("Nächste Rate schnell", _format_meta_value(_float_value(summary, "next_fast_rate_gps"), "g/s", 1)),
+                ("Nächste Rate reduziert", _format_meta_value(_float_value(summary, "next_slow_rate_gps"), "g/s", 1)),
+                ("Nächstes Nachtropfen", _format_meta_value(_float_value(summary, "next_drip_wait_ms"), "ms", 0)),
+                ("Nächstes Nahe Schließen", _format_meta_value(_float_value(summary, "next_near_close_g"), "g", 1)),
+                ("Nächstes Früh schließen", _format_meta_value(_float_value(summary, "next_close_early_g"), "g", 1)),
             ]
         )
 
@@ -594,17 +609,23 @@ def _draw_debug_metadata(
         color="#0f172a",
         fontweight="bold",
     )
-    left_y = 0.94
-    right_y = 0.94
-    left_y = _draw_meta_section(meta_ax, "Run", general_lines, x_label=0.0, x_value=0.28, y_start=left_y)
-    _draw_meta_section(meta_ax, "Preset params", preset_lines, x_label=0.0, x_value=0.28, y_start=left_y)
-    right_y = _draw_meta_section(meta_ax, "Adaptive run", adaptive_run_lines, x_label=0.54, x_value=0.84, y_start=right_y)
-    _draw_meta_section(meta_ax, "Adaptive next", adaptive_next_lines, x_label=0.54, x_value=0.84, y_start=right_y)
+    meta_ax.text(0.0, 0.955, "Session", ha="left", va="top", fontsize=8.2, color="#475569")
+    meta_ax.text(0.0, 0.925, wrapped_session, ha="left", va="top", fontsize=8.2, color="#0f172a", linespacing=1.05)
+    session_lines = max(1, wrapped_session.count("\n") + 1)
+    y_after_session = 0.925 - (session_lines * 0.042) - 0.045
+
+    left_y = y_after_session
+    right_y = y_after_session
+    left_y = _draw_meta_section(meta_ax, "Lauf", general_lines, x_label=0.0, x_value=0.30, y_start=left_y)
+    left_y = _draw_meta_section(meta_ax, "Ergebnis", result_lines, x_label=0.0, x_value=0.30, y_start=left_y)
+    _draw_meta_section(meta_ax, "Preset-Parameter", preset_lines, x_label=0.0, x_value=0.30, y_start=left_y)
+    right_y = _draw_meta_section(meta_ax, "Laufzeitwerte", runtime_lines, x_label=0.56, x_value=0.86, y_start=right_y)
+    _draw_meta_section(meta_ax, "Adaptionswerte", adaptive_next_lines, x_label=0.56, x_value=0.86, y_start=right_y)
 
 
-def _create_figure_axes(*, debug: bool, show_rate: str) -> tuple[Any, Any, Any | None, Any | None]:
+def _create_figure_axes(*, debug: bool, show_rate: str, rate_layout: str) -> tuple[Any, Any, Any | None, Any | None]:
     want_rate = show_rate != "none"
-    if debug and want_rate:
+    if debug and want_rate and rate_layout == "subplot":
         fig = plt.figure(
             figsize=(PLAIN_FIGURE_SIZE[0] + DEBUG_META_WIDTH, PLAIN_FIGURE_SIZE[1]),
             constrained_layout=True,
@@ -628,12 +649,19 @@ def _create_figure_axes(*, debug: bool, show_rate: str) -> tuple[Any, Any, Any |
             constrained_layout=True,
         )
         meta_ax.axis("off")
+        if want_rate and rate_layout == "overlay":
+            rate_ax = ax.twinx()
+            return fig, ax, rate_ax, meta_ax
         return fig, ax, None, meta_ax
-    if want_rate:
+    if want_rate and rate_layout == "subplot":
         fig = plt.figure(figsize=PLAIN_FIGURE_SIZE, constrained_layout=True)
         gs = fig.add_gridspec(2, 1, height_ratios=[3.8, 1.15])
         ax = fig.add_subplot(gs[0, 0])
         rate_ax = fig.add_subplot(gs[1, 0], sharex=ax)
+        return fig, ax, rate_ax, None
+    if want_rate and rate_layout == "overlay":
+        fig, ax = plt.subplots(figsize=PLAIN_FIGURE_SIZE, constrained_layout=True)
+        rate_ax = ax.twinx()
         return fig, ax, rate_ax, None
     fig, ax = plt.subplots(figsize=PLAIN_FIGURE_SIZE, constrained_layout=True)
     return fig, ax, None, None
@@ -646,6 +674,7 @@ def _plot_rate_panel(
     filtered_rate: list[float | None],
     *,
     show_rate: str,
+    overlay: bool,
 ) -> None:
     plotted_any = False
     if show_rate in {"both"}:
@@ -654,9 +683,10 @@ def _plot_rate_panel(
                 x_samples,
                 raw_rate,
                 color=LINE_RATE_RAW,
-                linewidth=1.0,
+                linewidth=1.0 if overlay else 1.0,
                 label="Rohrate [g/s]",
-                zorder=2,
+                zorder=6 if overlay else 2,
+                alpha=0.85 if overlay else 1.0,
             )
             plotted_any = True
     if show_rate in {"filtered", "both"}:
@@ -665,17 +695,31 @@ def _plot_rate_panel(
                 x_samples,
                 filtered_rate,
                 color=LINE_RATE_FILTERED,
-                linewidth=1.6,
+                linewidth=1.2 if overlay else 1.6,
                 label="Gefilterte Rate [g/s]",
-                zorder=3,
+                zorder=7 if overlay else 3,
+                alpha=0.9 if overlay else 1.0,
             )
             plotted_any = True
-    rate_ax.set_ylabel("Füllrate [g/s]")
-    rate_ax.set_xlabel("Zeit relativ zum Füllbeginn [s]")
-    rate_ax.grid(True, axis="both", color="#cbd5e1", linewidth=0.6, alpha=0.55)
-    rate_ax.set_axisbelow(True)
-    if plotted_any:
-        rate_ax.legend(frameon=False, loc="upper right", ncol=2, borderaxespad=0.2)
+    if overlay:
+        rate_ax.set_ylabel(RATE_AXIS_LABEL, color=LINE_RATE_FILTERED)
+    else:
+        rate_ax.set_ylabel(RATE_AXIS_LABEL)
+    if not overlay:
+        rate_ax.set_xlabel("Zeit relativ zum Füllbeginn [s]")
+        rate_ax.grid(True, axis="both", color="#cbd5e1", linewidth=0.6, alpha=0.55)
+        rate_ax.set_axisbelow(True)
+    else:
+        rate_ax.spines["right"].set_position(("axes", 1.10))
+        rate_ax.tick_params(axis="y", colors=LINE_RATE_FILTERED, labelsize=9)
+        rate_ax.spines["right"].set_color(LINE_RATE_FILTERED)
+    if plotted_any and not overlay:
+        rate_ax.legend(
+            frameon=False,
+            loc="upper right",
+            ncol=2 if not overlay else 1,
+            borderaxespad=0.2,
+        )
     else:
         rate_ax.text(
             0.5,
@@ -700,6 +744,7 @@ def _render_fill_variant(
     legend_placement: str,
     state_style: str,
     show_rate: str,
+    rate_layout: str,
 ) -> list[Path]:
     samples = _sample_events(records)
     if not samples:
@@ -711,8 +756,9 @@ def _render_fill_variant(
     x_samples, y_fill_mass, y_gate, raw_rate, filtered_rate, base_weight_g = _series_from_samples(fill_run, samples)
 
     _figure_style()
-    fig, ax, rate_ax, meta_ax = _create_figure_axes(debug=debug, show_rate=show_rate)
+    fig, ax, rate_ax, meta_ax = _create_figure_axes(debug=debug, show_rate=show_rate, rate_layout=rate_layout)
     ax2 = ax.twinx()
+    overlay_rate = rate_ax is not None and show_rate != "none" and rate_layout == "overlay"
 
     if state_style == "background":
         _plot_state_background(ax, fill_run, states, show_labels=False)
@@ -762,7 +808,7 @@ def _render_fill_variant(
     _annotate_gate_events(ax2, fill_run, gates, samples)
     _annotate_faults(ax, fill_run, faults)
 
-    if rate_ax is None:
+    if rate_ax is None or overlay_rate:
         ax.set_xlabel("Zeit relativ zum Füllbeginn [s]")
     else:
         ax.tick_params(labelbottom=False)
@@ -779,13 +825,18 @@ def _render_fill_variant(
             raw_rate,
             filtered_rate,
             show_rate=show_rate,
+            overlay=overlay_rate,
         )
 
     handles1, labels1 = ax.get_legend_handles_labels()
     handles2, labels2 = ax2.get_legend_handles_labels()
+    handles3: list[Any] = []
+    labels3: list[str] = []
+    if overlay_rate:
+        handles3, labels3 = rate_ax.get_legend_handles_labels()
     legend_kwargs = {
-        "handles": handles1 + handles2,
-        "labels": labels1 + labels2,
+        "handles": handles1 + handles2 + handles3,
+        "labels": labels1 + labels2 + labels3,
         "frameon": False,
         "ncol": 3,
         "borderaxespad": 0.0,
@@ -801,7 +852,7 @@ def _render_fill_variant(
         legend_kwargs.update(
             {
                 "loc": "upper center",
-                "bbox_to_anchor": (0.5, -0.14),
+                "bbox_to_anchor": (0.5, -0.14 if not overlay_rate else -0.16),
             }
         )
     ax.legend(**legend_kwargs)
@@ -829,6 +880,7 @@ def _plot_fill(
     legend_placement: str,
     state_style: str,
     show_rate: str,
+    rate_layout: str,
 ) -> list[Path]:
     exported = _render_fill_variant(
         session_dir,
@@ -840,6 +892,7 @@ def _plot_fill(
         legend_placement=legend_placement,
         state_style=state_style,
         show_rate=show_rate,
+        rate_layout=rate_layout,
     )
     exported.extend(
         _render_fill_variant(
@@ -852,6 +905,7 @@ def _plot_fill(
             legend_placement=legend_placement,
             state_style=state_style,
             show_rate=show_rate,
+            rate_layout=rate_layout,
         )
     )
     return exported
@@ -913,7 +967,13 @@ def main() -> int:
         "--show-rate",
         choices=["none", "filtered", "both"],
         default="none",
-        help="Optionally add a second subplot with fill-rate telemetry for adaptive-strategy debugging",
+        help="Show fill-rate telemetry in addition to mass and gate traces",
+    )
+    parser.add_argument(
+        "--rate-layout",
+        choices=["subplot", "overlay"],
+        default="subplot",
+        help="Draw rate telemetry in a dedicated subplot or overlaid with a separate right axis",
     )
     args = parser.parse_args()
 
@@ -950,6 +1010,7 @@ def main() -> int:
                 legend_placement=args.legend_placement,
                 state_style=args.state_style,
                 show_rate=args.show_rate,
+                rate_layout=args.rate_layout,
             )
         )
 
@@ -960,6 +1021,7 @@ def main() -> int:
     print("Variants: debug, plain")
     print(f"Legend:   {args.legend_placement}")
     print(f"Rate:     {args.show_rate}")
+    print(f"Layout:   {args.rate_layout}")
     print()
     for fill_run in selected_fills:
         print(format_fill_brief(fill_run))
