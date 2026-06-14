@@ -15,6 +15,7 @@
 #include "config.h"
 #include "scale_hx711.h"
 #include "telemetry.h"
+#include "filler_strategy.h"
 
 // FSM loop period.
 #define FSM_TICK_MS 10
@@ -22,14 +23,7 @@
 // Consider scale stale if no update for this long.
 #define SCALE_STALE_US (2 * 1000 * 1000)
 
-// Step used to relax close-early offset after an underweight retry (grams).
-#define CLOSE_EARLY_STEP_G 4.0f
-
-// Require consecutive samples to confirm threshold crossings.
-#define THRESH_CONFIRM_COUNT 4
-
 static const char *TAG = "filler_fsm";
-static const char *k_strategy_name = "heuristic";
 
 
 typedef enum {
@@ -173,11 +167,6 @@ static void gate_set_percent_cached_label(float pct, const char *label)
     }
 }
 
-static void gate_set_percent_cached(float pct)
-{
-    gate_set_percent_cached_label(pct, "percent");
-}
-
 static bool scale_is_stale(const scale_latest_t *s)
 {
     if (!s) return true;
@@ -206,48 +195,6 @@ static bool scale_require_fresh_or_fault(const char *ctx,
     return false;
 }
 
-static bool stable_above(float value, float threshold, uint8_t *count, uint8_t required)
-{
-    if (!count || required == 0) return value >= threshold;
-    if (value >= threshold) {
-        if (*count < required) {
-            (*count)++;
-            ESP_LOGD(TAG, "stable_above: %.1f >= %.1f -> %u/%u", (double)value, (double)threshold,
-                     (unsigned)*count, (unsigned)required);
-        }
-    } else {
-        if (*count != 0) {
-            ESP_LOGD(TAG, "stable_above: %.1f < %.1f -> reset", (double)value, (double)threshold);
-        }
-        *count = 0;
-    }
-    if (*count >= required) {
-        ESP_LOGD(TAG, "stable_above: %.1f >= %.1f -> true", (double)value, (double)threshold);
-    }
-    return *count >= required;
-}
-
-static bool stable_below(float value, float threshold, uint8_t *count, uint8_t required)
-{
-    if (!count || required == 0) return value <= threshold;
-    if (value <= threshold) {
-        if (*count < required) {
-            (*count)++;
-            ESP_LOGD(TAG, "stable_below: %.1f <= %.1f -> %u/%u", (double)value, (double)threshold,
-                     (unsigned)*count, (unsigned)required);
-        }
-    } else {
-        if (*count != 0) {
-            ESP_LOGD(TAG, "stable_below: %.1f > %.1f -> reset", (double)value, (double)threshold);
-        }
-        *count = 0;
-    }
-    if (*count >= required) {
-        ESP_LOGD(TAG, "stable_below: %.1f <= %.1f -> true", (double)value, (double)threshold);
-    }
-    return *count >= required;
-}
-
 static uint8_t slot_count_sane(uint8_t configured_slots)
 {
     return (configured_slots == 0) ? 1 : configured_slots;
@@ -264,6 +211,7 @@ static uint8_t slot_next_idx(uint8_t idx, uint8_t configured_slots)
 static void filler_publish_run_summary(const char *result,
                                        uint32_t run_id,
                                        uint8_t slot_idx,
+                                       const char *strategy_name,
                                        const app_params_t *params)
 {
     if (!params) return;
@@ -282,7 +230,7 @@ static void filler_publish_run_summary(const char *result,
                                         slot_idx,
                                         result,
                                         app_presets_get_name(app_presets_get_active_index()),
-                                        k_strategy_name,
+                                        strategy_name ? strategy_name : "?",
                                         params,
                                         final_weight_g,
                                         final_relative_fill_g,
@@ -292,6 +240,7 @@ static void filler_publish_run_summary(const char *result,
 
 static void filler_publish_fill_start(uint32_t run_id,
                                       uint8_t slot_idx,
+                                      const char *strategy_name,
                                       const app_params_t *params,
                                       float base_weight_g)
 {
@@ -299,7 +248,7 @@ static void filler_publish_fill_start(uint32_t run_id,
     (void)telemetry_publish_fill_start(run_id,
                                        slot_idx,
                                        app_presets_get_name(app_presets_get_active_index()),
-                                       k_strategy_name,
+                                       strategy_name ? strategy_name : "?",
                                        params,
                                        base_weight_g,
                                        CONFIG_HX711_POLL_INTERVAL_MS,
@@ -313,18 +262,23 @@ static void task_filler_fsm(void *arg)
     filler_state_t state = FILLER_IDLE;
     filler_state_t last_state = FILLER_DONE;
     int64_t state_enter_us = esp_timer_get_time();
-    bool near_close_logged = false;
-    float close_early_relax_g = 0.0f;
-    uint8_t cnt_near_close = 0;
-    uint8_t cnt_close_early = 0;
-    uint8_t cnt_target = 0;
-    uint8_t cnt_under = 0;
-    uint8_t cnt_over = 0;
-    uint8_t sample_count = 0;
     uint8_t skipped_slots_streak = 0;
     int64_t last_sample_ts = 0;
 
     app_params_t params = {0};
+    app_fill_strategy_t active_strategy = app_fill_strategy_get_active();
+    const filler_strategy_ops_t *strategy_ops = filler_strategy_ops_for_app(active_strategy);
+    filler_strategy_runtime_t strategy_rt = {0};
+    const filler_strategy_env_t strategy_env = {
+        .require_fresh_or_fault = scale_require_fresh_or_fault,
+        .set_fault = filler_set_fault,
+        .jar_tare_get = jar_tare_get,
+        .gate_close_label = gate_close_cached_label,
+        .gate_set_percent_label = gate_set_percent_cached_label,
+        .set_slot = filler_set_slot,
+        .slot_next_idx = slot_next_idx,
+        .publish_fill_start = filler_publish_fill_start,
+    };
 
     for (;;) {
         app_params_get(&params);
@@ -342,13 +296,6 @@ static void task_filler_fsm(void *arg)
         if (state != last_state) {
             filler_state_t prev_state = last_state;
             state_enter_us = esp_timer_get_time();
-            near_close_logged = false;
-            cnt_near_close = 0;
-            cnt_close_early = 0;
-            cnt_target = 0;
-            cnt_under = 0;
-            cnt_over = 0;
-            sample_count = 0;
             last_sample_ts = 0;
             ESP_LOGI(TAG, "state -> %s", filler_state_name(state));
             (void)telemetry_publish_state(filler_get_run_id(),
@@ -377,6 +324,7 @@ static void task_filler_fsm(void *arg)
                     filler_publish_run_summary("fault",
                                                filler_get_run_id(),
                                                filler_get_slot_idx(),
+                                               app_fill_strategy_get_name(active_strategy),
                                                &params);
                     (void)telemetry_publish_run_end(filler_get_run_id(),
                                                     filler_get_slot_idx(),
@@ -401,28 +349,26 @@ static void task_filler_fsm(void *arg)
                 motor_set(false);
                 gate_close_cached();
                 break;
-            case FILLER_FILL: {
-                ESP_LOGD(TAG, "fill: gate open");
-                if (prev_state != FILLER_VERIFY_TARGET) {
-                    close_early_relax_g = 0.0f;
-                }
+            case FILLER_FILL:
+            case FILLER_DRIP_WAIT:
+            case FILLER_VERIFY_TARGET: {
                 scale_latest_t entry_latest = {0};
                 scale_latest_get(&entry_latest);
-                filler_publish_fill_start(filler_get_run_id(),
-                                          filler_get_slot_idx(),
-                                          &params,
-                                          entry_latest.grams);
-                gate_set_percent_cached_label(params.max_gate_pct, "max_gate");
+                filler_strategy_tick_t enter_tick = {
+                    .now_us = state_enter_us,
+                    .state_enter_us = state_enter_us,
+                    .run_id = filler_get_run_id(),
+                    .slot_idx = filler_get_slot_idx(),
+                    .new_sample = false,
+                    .latest = &entry_latest,
+                    .params = &params,
+                    .strategy_name = app_fill_strategy_get_name(active_strategy),
+                };
+                if (strategy_ops && strategy_ops->on_enter) {
+                    strategy_ops->on_enter(&strategy_rt, state, prev_state, &strategy_env, &enter_tick);
+                }
                 break;
             }
-            case FILLER_DRIP_WAIT:
-                ESP_LOGD(TAG, "drip wait: gate closed");
-                gate_close_cached_label("drip_wait");
-                break;
-            case FILLER_VERIFY_TARGET:
-                ESP_LOGD(TAG, "verify target: gate closed");
-                gate_close_cached();
-                break;
             }
         }
 
@@ -433,7 +379,6 @@ static void task_filler_fsm(void *arg)
         bool new_sample = (latest.ts_us != 0 && latest.ts_us != last_sample_ts);
         if (new_sample) {
             last_sample_ts = latest.ts_us;
-            if (sample_count < 255) sample_count++;
         }
 
         switch (state) {
@@ -441,10 +386,14 @@ static void task_filler_fsm(void *arg)
             // Waiting for start request.
             filler_set_fault(FLT_NONE);
             if (filler_take_start_req()) {
+                active_strategy = app_fill_strategy_get_active();
+                strategy_ops = filler_strategy_ops_for_app(active_strategy);
                 taskENTER_CRITICAL(&s_lock);
                 s_run_id++;
                 taskEXIT_CRITICAL(&s_lock);
-                ESP_LOGI(TAG, "start: carousel_slots=%u", (unsigned)slot_count_sane(params.slots_total));
+                ESP_LOGI(TAG, "start: carousel_slots=%u strategy=%s",
+                         (unsigned)slot_count_sane(params.slots_total),
+                         app_fill_strategy_get_name(active_strategy));
                 filler_set_slot(0);
                 (void)telemetry_publish_run_start(filler_get_run_id(), 0);
                 skipped_slots_streak = 0;
@@ -526,107 +475,45 @@ static void task_filler_fsm(void *arg)
             break;
 
         case FILLER_FILL: {
-            // Open gate fully, then partially close near target.
-            if (!scale_require_fresh_or_fault("fill", &latest, &state)) {
-                break;
-            }
-            float tare_g = 0.0f;
-            bool has_tare = jar_tare_get(&tare_g);
-            float rel_g = grams - (has_tare ? tare_g : 0.0f);
-            float close_early_g_cur = (float)params.close_early_g - close_early_relax_g;
-            if (close_early_g_cur < 0.0f) close_early_g_cur = 0.0f;
-            float near_close = (float)params.target_grams - (float)params.near_close_delta_g;
-            float close_early = (float)params.target_grams - close_early_g_cur;
-            if ((esp_timer_get_time() - state_enter_us) > ((int64_t)params.fill_timeout_ms * 1000)) {
-                ESP_LOGE(TAG, "fill timeout");
-                gate_close_cached();
-                filler_set_fault(FLT_SERVO_TIMEOUT);
-                state = FILLER_FAULT;
-                filler_set_state(state);
-                break;
-            }
-            if (!new_sample) {
-                // Keep last gate position until a fresh sample arrives.
-                break;
-            }
-            if (new_sample && stable_above(rel_g, (float)params.target_grams, &cnt_target, THRESH_CONFIRM_COUNT)) {
-                ESP_LOGI(TAG, "target reached: rel=%.1f g abs=%.1f g", (double)rel_g, (double)grams);
-                gate_close_cached_label("target");
-                state = FILLER_DRIP_WAIT;
-                filler_set_state(state);
-            } else if (new_sample && stable_above(rel_g, close_early, &cnt_close_early, THRESH_CONFIRM_COUNT)) {
-                ESP_LOGI(TAG, "close-early reached: rel=%.1f g (offset %.1f g)",
-                         (double)rel_g, (double)close_early_g_cur);
-                gate_close_cached_label("close_early");
-                state = FILLER_DRIP_WAIT;
-                filler_set_state(state);
-            } else if (new_sample && stable_above(rel_g, near_close, &cnt_near_close, THRESH_CONFIRM_COUNT)) {
-                if (!near_close_logged) {
-                    ESP_LOGD(TAG, "near close: rel=%.1f g -> partial gate", (double)rel_g);
-                    near_close_logged = true;
+            filler_strategy_tick_t tick = {
+                .now_us = esp_timer_get_time(),
+                .state_enter_us = state_enter_us,
+                .run_id = filler_get_run_id(),
+                .slot_idx = filler_get_slot_idx(),
+                .new_sample = new_sample,
+                .latest = &latest,
+                .params = &params,
+                .strategy_name = app_fill_strategy_get_name(active_strategy),
+            };
+            filler_state_t next_state = strategy_ops ? strategy_ops->step(&strategy_rt, state, &strategy_env, &tick) : state;
+            if (next_state != state) {
+                if (next_state == FILLER_FIND_SLOT) {
+                    skipped_slots_streak = 0;
                 }
-                gate_set_percent_cached_label(params.near_close_gate_pct, "near_close");
-            } else {
-                gate_set_percent_cached_label(params.max_gate_pct, "max_gate");
-            }
-            break;
-        }
-
-        case FILLER_DRIP_WAIT: {
-            // Wait for honey to drip after closing gate.
-            int64_t elapsed_us = esp_timer_get_time() - state_enter_us;
-            if (elapsed_us >= ((int64_t)params.drip_delay_ms * 1000)) {
-                state = FILLER_VERIFY_TARGET;
+                state = next_state;
                 filler_set_state(state);
             }
             break;
         }
 
+        case FILLER_DRIP_WAIT:
         case FILLER_VERIFY_TARGET: {
-            // Check target window; re-fill if low, fault if high.
-            if (!scale_require_fresh_or_fault("verify target", &latest, &state)) {
-                break;
-            }
-            float tare_g = 0.0f;
-            bool has_tare = jar_tare_get(&tare_g);
-            float rel_g = grams - (has_tare ? tare_g : 0.0f);
-            float tol_low_g = (float)params.target_tol_low_g;
-            float tol_high_g = (float)params.target_tol_high_g;
-            if (new_sample && stable_above(rel_g, (float)params.target_grams + tol_high_g, &cnt_over, THRESH_CONFIRM_COUNT)) {
-                float over = rel_g - (float)params.target_grams;
-                ESP_LOGE(TAG, "overweight: rel=%.1f g (+%.1f g, tol=+%.1f g)",
-                         (double)rel_g, (double)over, (double)tol_high_g);
-                ESP_LOGW(TAG, "suggestion: increase close_early_g (now %u g)", (unsigned)params.close_early_g);
-                filler_set_fault(FLT_WEIGHT_RANGE);
-                state = FILLER_FAULT;
-                filler_set_state(state);
-            } else if (new_sample && stable_below(rel_g, (float)params.target_grams - tol_low_g, &cnt_under, THRESH_CONFIRM_COUNT)) {
-                float under = (float)params.target_grams - rel_g;
-                ESP_LOGI(TAG, "underweight: rel=%.1f g (-%.1f g, tol=-%.1f g) -> refill",
-                         (double)rel_g, (double)under, (double)tol_low_g);
-                float close_early_g_cur = (float)params.close_early_g - close_early_relax_g;
-                if (close_early_g_cur > 0.0f) {
-                    float prev_g = close_early_g_cur;
-                    close_early_relax_g += CLOSE_EARLY_STEP_G;
-                    if (close_early_relax_g > (float)params.close_early_g) {
-                        close_early_relax_g = (float)params.close_early_g;
-                    }
-                    close_early_g_cur = (float)params.close_early_g - close_early_relax_g;
-                    if (close_early_g_cur < 0.0f) close_early_g_cur = 0.0f;
-                    ESP_LOGI(TAG, "relax close_early: %.1f g -> %.1f g",
-                             (double)prev_g, (double)close_early_g_cur);
-                    ESP_LOGW(TAG, "suggestion: decrease close_early_g (now %u g)", (unsigned)params.close_early_g);
+            filler_strategy_tick_t tick = {
+                .now_us = esp_timer_get_time(),
+                .state_enter_us = state_enter_us,
+                .run_id = filler_get_run_id(),
+                .slot_idx = filler_get_slot_idx(),
+                .new_sample = new_sample,
+                .latest = &latest,
+                .params = &params,
+                .strategy_name = app_fill_strategy_get_name(active_strategy),
+            };
+            filler_state_t next_state = strategy_ops ? strategy_ops->step(&strategy_rt, state, &strategy_env, &tick) : state;
+            if (next_state != state) {
+                if (next_state == FILLER_FIND_SLOT) {
+                    skipped_slots_streak = 0;
                 }
-                state = FILLER_FILL;
-                filler_set_state(state);
-            } else if (sample_count >= THRESH_CONFIRM_COUNT) {
-                ESP_LOGI(TAG, "target verified: rel=%.1f g", (double)rel_g);
-                uint8_t cur = filler_get_slot_idx();
-                uint8_t next = slot_next_idx(cur, params.slots_total);
-                ESP_LOGI(TAG, "slot complete: %u -> %u", (unsigned)cur, (unsigned)next);
-                filler_set_slot(next);
-                skipped_slots_streak = 0;
-                state = FILLER_FIND_SLOT;
+                state = next_state;
                 filler_set_state(state);
             }
             break;
@@ -637,6 +524,7 @@ static void task_filler_fsm(void *arg)
             filler_publish_run_summary("done",
                                        filler_get_run_id(),
                                        filler_get_slot_idx(),
+                                       app_fill_strategy_get_name(active_strategy),
                                        &params);
             (void)telemetry_publish_run_end(filler_get_run_id(), filler_get_slot_idx(), "done");
             state = FILLER_IDLE;
@@ -646,10 +534,13 @@ static void task_filler_fsm(void *arg)
         case FILLER_FAULT:
             // Stop everything and wait for a new start request.
             if (filler_take_start_req()) {
+                active_strategy = app_fill_strategy_get_active();
+                strategy_ops = filler_strategy_ops_for_app(active_strategy);
                 taskENTER_CRITICAL(&s_lock);
                 s_run_id++;
                 taskEXIT_CRITICAL(&s_lock);
-                ESP_LOGI(TAG, "restart after fault");
+                ESP_LOGI(TAG, "restart after fault (strategy=%s)",
+                         app_fill_strategy_get_name(active_strategy));
                 filler_set_fault(FLT_NONE);
                 filler_set_slot(0);
                 (void)telemetry_publish_run_start(filler_get_run_id(), 0);

@@ -17,6 +17,7 @@ static const char *TAG = "ui_menu";
 
 typedef enum {
     MENU_HOME_PRESET = 0,
+    MENU_HOME_STRATEGY,
     MENU_HOME_RECIPE,
     MENU_HOME_MACHINE,
     MENU_HOME_TARE,
@@ -26,6 +27,7 @@ typedef enum {
 
 static const char *k_home_labels[MENU_HOME_COUNT] = {
     "Select preset",
+    "Select strategy",
     "Preset settings",
     "Machine settings",
     "Tare scale",
@@ -153,6 +155,10 @@ static void menu_render_home_detail(const ui_menu_t *m,
         snprintf(line4, line4_len, "Target + flow preset");
         snprintf(line5, line5_len, "Click: preset list");
         break;
+    case MENU_HOME_STRATEGY:
+        snprintf(line4, line4_len, "Fill control mode");
+        snprintf(line5, line5_len, "Click: mode list");
+        break;
     case MENU_HOME_RECIPE:
         snprintf(line4, line4_len, "Target, tol, honey");
         snprintf(line5, line5_len, "Active preset only");
@@ -256,6 +262,15 @@ void ui_menu_on_rotate(ui_menu_t *m, int32_t delta)
         return;
     }
 
+    if (m->view == UI_MENU_VIEW_STRATEGY_LIST) {
+        int32_t idx = (int32_t)m->index + delta;
+        if (idx < 0) idx = (int32_t)app_fill_strategy_count() - 1;
+        if ((size_t)idx >= app_fill_strategy_count()) idx = 0;
+        m->index = (size_t)idx;
+        buzzer_beep_ms(30);
+        return;
+    }
+
     size_t count = 0;
     const app_param_meta_t *meta = menu_meta_by_scope(m->scope, m->index, &count);
     if (!meta || count == 0) return;
@@ -284,6 +299,10 @@ bool ui_menu_on_click(ui_menu_t *m, app_params_t *out_apply)
         case MENU_HOME_PRESET:
             m->view = UI_MENU_VIEW_PRESET_LIST;
             m->index = app_presets_get_active_index();
+            return false;
+        case MENU_HOME_STRATEGY:
+            m->view = UI_MENU_VIEW_STRATEGY_LIST;
+            m->index = (size_t)app_fill_strategy_get_active();
             return false;
         case MENU_HOME_RECIPE:
             m->view = UI_MENU_VIEW_PARAM_LIST;
@@ -338,6 +357,16 @@ bool ui_menu_on_click(ui_menu_t *m, app_params_t *out_apply)
         return false;
     }
 
+    if (m->view == UI_MENU_VIEW_STRATEGY_LIST) {
+        (void)app_fill_strategy_select((app_fill_strategy_t)m->index);
+        app_params_get(&m->working);
+        m->view = UI_MENU_VIEW_HOME;
+        m->index = MENU_HOME_STRATEGY;
+        buzzer_beep_short(2);
+        ESP_LOGI(TAG, "strategy: apply %u", (unsigned)app_fill_strategy_get_active());
+        return false;
+    }
+
     if (m->view == UI_MENU_VIEW_PARAM_LIST) {
         m->view = UI_MENU_VIEW_PARAM_EDIT;
         ESP_LOGI(TAG, "edit: enter");
@@ -367,7 +396,9 @@ bool ui_menu_on_long_press(ui_menu_t *m)
         return true;
     }
 
-    if (m->view == UI_MENU_VIEW_PARAM_LIST || m->view == UI_MENU_VIEW_PRESET_LIST) {
+    if (m->view == UI_MENU_VIEW_PARAM_LIST ||
+        m->view == UI_MENU_VIEW_PRESET_LIST ||
+        m->view == UI_MENU_VIEW_STRATEGY_LIST) {
         app_params_get(&m->working);
         m->view = UI_MENU_VIEW_HOME;
         m->index = 0;
@@ -396,9 +427,11 @@ void ui_menu_render(const ui_menu_t *m, ssd1306_handle_t disp)
 
     if (m->view == UI_MENU_VIEW_HOME) {
         const char *preset = app_presets_get_name(app_presets_get_active_index());
+        const char *strategy = app_fill_strategy_get_name(app_fill_strategy_get_active());
         snprintf(line0, sizeof(line0), "Menu %u/%u",
                  (unsigned)(m->index + 1), (unsigned)MENU_HOME_COUNT);
         snprintf(line1, sizeof(line1), "Preset: %.14s", preset);
+        snprintf(line2, sizeof(line2), "Mode: %.15s", strategy);
         snprintf(line3, sizeof(line3), "> %.20s", k_home_labels[m->index]);
         menu_render_home_detail(m, line4, sizeof(line4), line5, sizeof(line5), line6, sizeof(line6));
         snprintf(line7, sizeof(line7), "Long: Exit");
@@ -412,6 +445,17 @@ void ui_menu_render(const ui_menu_t *m, ssd1306_handle_t disp)
         snprintf(line3, sizeof(line3), "Active: %.12s", active_name);
         snprintf(line5, sizeof(line5), "Click: Activate");
         snprintf(line6, sizeof(line6), "Keeps machine cfg");
+        snprintf(line7, sizeof(line7), "Long: Back");
+    } else if (m->view == UI_MENU_VIEW_STRATEGY_LIST) {
+        app_fill_strategy_t active = app_fill_strategy_get_active();
+        const char *selected = app_fill_strategy_get_name((app_fill_strategy_t)m->index);
+        const char *active_name = app_fill_strategy_get_name(active);
+        snprintf(line0, sizeof(line0), "Mode %u/%u",
+                 (unsigned)(m->index + 1), (unsigned)app_fill_strategy_count());
+        snprintf(line1, sizeof(line1), "> %.20s", selected);
+        snprintf(line3, sizeof(line3), "Active: %.12s", active_name);
+        snprintf(line5, sizeof(line5), "Click: Activate");
+        snprintf(line6, sizeof(line6), "Global fill mode");
         snprintf(line7, sizeof(line7), "Long: Back");
     } else {
         size_t count = 0;
