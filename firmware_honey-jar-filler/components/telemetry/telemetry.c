@@ -77,6 +77,7 @@ const char *telemetry_kind_name(telemetry_kind_t kind)
     case TELEMETRY_KIND_RUN_START: return "run_start";
     case TELEMETRY_KIND_RUN_END:   return "run_end";
     case TELEMETRY_KIND_FILL_START:return "fill_start";
+    case TELEMETRY_KIND_FILL_SUMMARY:return "fill_summary";
     case TELEMETRY_KIND_RUN_SUMMARY:return "run_summary";
     case TELEMETRY_KIND_STATE:     return "state";
     case TELEMETRY_KIND_FAULT:     return "fault";
@@ -291,7 +292,7 @@ static void telemetry_emit_record(const telemetry_record_t *rec)
     case TELEMETRY_KIND_SAMPLE:
         printf("TEL {\"ts_us\":%" PRId64 ",\"kind\":\"sample\",\"run_id\":%" PRIu32
                ",\"slot_idx\":%" PRId32 ",\"state\":%" PRIu32 ",\"target_g\":%" PRIu32
-               ",\"weight_g\":%.3f,\"relative_fill_g\":%.3f,\"gate_pct\":%.3f}\n",
+               ",\"weight_g\":%.3f,\"relative_fill_g\":%.3f,\"gate_pct\":%.3f",
                rec->ts_us,
                rec->run_id,
                rec->slot_idx,
@@ -300,6 +301,30 @@ static void telemetry_emit_record(const telemetry_record_t *rec)
                (double)rec->weight_g,
                (double)rec->relative_fill_g,
                (double)rec->gate_pct);
+        if (strategy_escaped[0] || text_escaped[0]) {
+            printf(",\"strategy_name\":\"%s\",\"gate_phase\":\"%s\""
+                   ",\"rate_raw_gps\":%.3f,\"rate_filtered_gps\":%.3f"
+                   ",\"predicted_remaining_g\":%.3f,\"dead_time_s\":%.3f"
+                   ",\"learned_dead_time_s\":%.3f,\"learned_post_close_gain_g\":%.3f"
+                   ",\"learned_fast_rate_gps\":%.3f,\"learned_slow_rate_gps\":%.3f"
+                   ",\"adapted_near_close_g\":%.3f,\"adapted_close_early_g\":%.3f"
+                   ",\"adapted_drip_wait_ms\":%.3f,\"refill_count\":%" PRIu32,
+                   strategy_escaped,
+                   text_escaped,
+                   (double)rec->rate_raw_gps,
+                   (double)rec->rate_filtered_gps,
+                   (double)rec->predicted_remaining_g,
+                   (double)rec->measured_dead_time_s,
+                   (double)rec->learned_dead_time_s,
+                   (double)rec->learned_post_close_gain_g,
+                   (double)rec->learned_fast_rate_gps,
+                   (double)rec->learned_slow_rate_gps,
+                   (double)rec->adapted_near_close_g,
+                   (double)rec->adapted_close_early_g,
+                   (double)rec->adapted_drip_wait_ms,
+                   rec->refill_count);
+        }
+        printf("}\n");
         break;
     case TELEMETRY_KIND_STATE:
         printf("TEL {\"ts_us\":%" PRId64 ",\"kind\":\"state\",\"run_id\":%" PRIu32
@@ -358,6 +383,45 @@ static void telemetry_emit_record(const telemetry_record_t *rec)
                (double)rec->weight_g,
                rec->scale_period_ms_cfg,
                rec->fsm_period_ms_cfg);
+        telemetry_emit_params_json(&rec->params);
+        printf("}}\n");
+        break;
+    case TELEMETRY_KIND_FILL_SUMMARY:
+        printf("TEL {\"ts_us\":%" PRId64 ",\"kind\":\"fill_summary\",\"run_id\":%" PRIu32
+               ",\"slot_idx\":%" PRId32 ",\"text\":\"%s\",\"preset_name\":\"%s\""
+               ",\"strategy_name\":\"%s\",\"target_g\":%" PRIu32
+               ",\"final_mass_g\":%.3f,\"final_relative_fill_g\":%.3f"
+               ",\"fill_error_g\":%.3f,\"measured_dead_time_s\":%.3f"
+               ",\"measured_post_close_gain_g\":%.3f,\"measured_fast_rate_gps\":%.3f"
+               ",\"measured_slow_rate_gps\":%.3f,\"drip_wait_used_ms\":%.3f"
+               ",\"refill_count\":%" PRIu32 ",\"next_dead_time_s\":%.3f"
+               ",\"next_post_close_gain_g\":%.3f,\"next_fast_rate_gps\":%.3f"
+               ",\"next_slow_rate_gps\":%.3f,\"next_near_close_g\":%.3f"
+               ",\"next_close_early_g\":%.3f,\"next_drip_wait_ms\":%.3f"
+               ",\"params\":{",
+               rec->ts_us,
+               rec->run_id,
+               rec->slot_idx,
+               text_escaped,
+               preset_escaped,
+               strategy_escaped,
+               rec->target_g,
+               (double)rec->weight_g,
+               (double)rec->relative_fill_g,
+               (double)rec->fill_error_g,
+               (double)rec->measured_dead_time_s,
+               (double)rec->measured_post_close_gain_g,
+               (double)rec->measured_fast_rate_gps,
+               (double)rec->measured_slow_rate_gps,
+               (double)rec->adapted_drip_wait_ms,
+               rec->refill_count,
+               (double)rec->learned_dead_time_s,
+               (double)rec->learned_post_close_gain_g,
+               (double)rec->learned_fast_rate_gps,
+               (double)rec->learned_slow_rate_gps,
+               (double)rec->adapted_near_close_g,
+               (double)rec->adapted_close_early_g,
+               (double)rec->next_drip_wait_ms);
         telemetry_emit_params_json(&rec->params);
         printf("}}\n");
         break;

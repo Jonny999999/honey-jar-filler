@@ -1,6 +1,8 @@
 #include "filler_fsm.h"
 
 #include <stdbool.h>
+#include <stdio.h>
+#include <string.h>
 
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -45,12 +47,29 @@ static volatile uint32_t s_run_id = 0;
 static float s_jar_tare_g = 0.0f;
 static gate_cmd_t s_gate_cmd = GATE_CMD_NONE;
 static float s_gate_pct = -1.0f;
+static filler_strategy_sample_telemetry_t s_strategy_sample_telemetry = {0};
 
 static void filler_set_state(filler_state_t st)
 {
     taskENTER_CRITICAL(&s_lock);
     s_state = st;
     taskEXIT_CRITICAL(&s_lock);
+}
+
+static void filler_set_strategy_sample_telemetry(const filler_strategy_sample_telemetry_t *sample)
+{
+    taskENTER_CRITICAL(&s_lock);
+    if (sample) {
+        s_strategy_sample_telemetry = *sample;
+    } else {
+        s_strategy_sample_telemetry = (filler_strategy_sample_telemetry_t){0};
+    }
+    taskEXIT_CRITICAL(&s_lock);
+}
+
+static void filler_clear_strategy_sample_telemetry(void)
+{
+    filler_set_strategy_sample_telemetry(NULL);
 }
 
 static void filler_set_fault(filler_fault_t flt)
@@ -255,6 +274,43 @@ static void filler_publish_fill_start(uint32_t run_id,
                                        FSM_TICK_MS);
 }
 
+static void filler_publish_fill_summary(uint32_t run_id,
+                                        uint8_t slot_idx,
+                                        const char *preset_name,
+                                        const char *strategy_name,
+                                        const app_params_t *params,
+                                        const filler_strategy_fill_summary_t *summary)
+{
+    if (!params || !summary || !summary->valid) return;
+
+    telemetry_record_t rec;
+    telemetry_record_init(&rec, TELEMETRY_KIND_FILL_SUMMARY);
+    rec.run_id = run_id;
+    rec.slot_idx = slot_idx;
+    rec.target_g = (uint32_t)summary->target_g;
+    rec.weight_g = summary->final_mass_g;
+    rec.relative_fill_g = summary->final_mass_g;
+    rec.fill_error_g = summary->fill_error_g;
+    rec.measured_dead_time_s = summary->measured_dead_time_s;
+    rec.measured_post_close_gain_g = summary->measured_post_close_gain_g;
+    rec.measured_fast_rate_gps = summary->measured_fast_rate_gps;
+    rec.measured_slow_rate_gps = summary->measured_slow_rate_gps;
+    rec.adapted_drip_wait_ms = summary->drip_wait_used_ms;
+    rec.refill_count = summary->refill_count;
+    rec.learned_dead_time_s = summary->next_dead_time_s;
+    rec.learned_post_close_gain_g = summary->next_post_close_gain_g;
+    rec.learned_fast_rate_gps = summary->next_fast_rate_gps;
+    rec.learned_slow_rate_gps = summary->next_slow_rate_gps;
+    rec.adapted_near_close_g = summary->next_near_close_g;
+    rec.adapted_close_early_g = summary->next_close_early_g;
+    rec.next_drip_wait_ms = summary->next_drip_wait_ms;
+    rec.params = *params;
+    snprintf(rec.text, sizeof(rec.text), "%s", summary->reason);
+    snprintf(rec.preset_name, sizeof(rec.preset_name), "%s", preset_name ? preset_name : "?");
+    snprintf(rec.strategy_name, sizeof(rec.strategy_name), "%s", strategy_name ? strategy_name : "?");
+    (void)telemetry_publish(&rec);
+}
+
 static void task_filler_fsm(void *arg)
 {
     (void)arg;
@@ -278,6 +334,9 @@ static void task_filler_fsm(void *arg)
         .set_slot = filler_set_slot,
         .slot_next_idx = slot_next_idx,
         .publish_fill_start = filler_publish_fill_start,
+        .set_sample_telemetry = filler_set_strategy_sample_telemetry,
+        .clear_sample_telemetry = filler_clear_strategy_sample_telemetry,
+        .publish_fill_summary = filler_publish_fill_summary,
     };
 
     for (;;) {
@@ -320,6 +379,7 @@ static void task_filler_fsm(void *arg)
             case FILLER_IDLE:
             case FILLER_DONE:
             case FILLER_FAULT:
+                filler_clear_strategy_sample_telemetry();
                 if (state == FILLER_FAULT) {
                     filler_publish_run_summary("fault",
                                                filler_get_run_id(),
@@ -335,16 +395,19 @@ static void task_filler_fsm(void *arg)
                 skipped_slots_streak = 0;
                 break;
             case FILLER_FIND_SLOT:
+                filler_clear_strategy_sample_telemetry();
                 ESP_LOGD(TAG, "motor on (find slot)");
                 motor_set(true);
                 jar_tare_clear();
                 break;
             case FILLER_VERIFY_EMPTY:
+                filler_clear_strategy_sample_telemetry();
                 ESP_LOGD(TAG, "verify empty: motor off, gate closed");
                 motor_set(false);
                 gate_close_cached();
                 break;
             case FILLER_SLOT_SETTLE:
+                filler_clear_strategy_sample_telemetry();
                 ESP_LOGD(TAG, "slot settle: motor off, gate closed");
                 motor_set(false);
                 gate_close_cached();
@@ -362,6 +425,8 @@ static void task_filler_fsm(void *arg)
                     .new_sample = false,
                     .latest = &entry_latest,
                     .params = &params,
+                    .preset_index = app_presets_get_active_index(),
+                    .preset_name = app_presets_get_name(app_presets_get_active_index()),
                     .strategy_name = app_fill_strategy_get_name(active_strategy),
                 };
                 if (strategy_ops && strategy_ops->on_enter) {
@@ -483,6 +548,8 @@ static void task_filler_fsm(void *arg)
                 .new_sample = new_sample,
                 .latest = &latest,
                 .params = &params,
+                .preset_index = app_presets_get_active_index(),
+                .preset_name = app_presets_get_name(app_presets_get_active_index()),
                 .strategy_name = app_fill_strategy_get_name(active_strategy),
             };
             filler_state_t next_state = strategy_ops ? strategy_ops->step(&strategy_rt, state, &strategy_env, &tick) : state;
@@ -506,6 +573,8 @@ static void task_filler_fsm(void *arg)
                 .new_sample = new_sample,
                 .latest = &latest,
                 .params = &params,
+                .preset_index = app_presets_get_active_index(),
+                .preset_name = app_presets_get_name(app_presets_get_active_index()),
                 .strategy_name = app_fill_strategy_get_name(active_strategy),
             };
             filler_state_t next_state = strategy_ops ? strategy_ops->step(&strategy_rt, state, &strategy_env, &tick) : state;
@@ -623,6 +692,15 @@ float filler_get_gate_percent(void)
 bool filler_get_jar_tare(float *out_grams)
 {
     return jar_tare_get(out_grams);
+}
+
+bool filler_get_strategy_sample_telemetry(filler_strategy_sample_telemetry_t *out)
+{
+    if (!out) return false;
+    taskENTER_CRITICAL(&s_lock);
+    *out = s_strategy_sample_telemetry;
+    taskEXIT_CRITICAL(&s_lock);
+    return out->valid;
 }
 
 const char *filler_state_name(filler_state_t st)

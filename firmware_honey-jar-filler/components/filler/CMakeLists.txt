@@ -1,4 +1,4 @@
-idf_component_register(SRCS "filler_fsm.c" "filler_strategy.c" "filler_strategy_heuristic.c"
+idf_component_register(SRCS "filler_fsm.c" "filler_strategy.c" "filler_strategy_heuristic.c" "filler_strategy_adaptive_heuristic.c"
                        INCLUDE_DIRS "."
                        PRIV_INCLUDE_DIRS "../../main"
-                       REQUIRES app gate motor driver esp_timer hx711 buzzer telemetry)
+                       REQUIRES app gate motor driver esp_timer hx711 buzzer telemetry nvs_flash)

@@ -64,11 +64,13 @@ GATE_LABELS_DE = {
     "percent": "Öffnungsgrad",
 }
 PLAIN_FIGURE_SIZE = (8.0, 5.0)
-DEBUG_META_WIDTH = 3.6
+DEBUG_META_WIDTH = 5.2
 LINE_FILL_MASS = "#c81e1e"
 LINE_GATE = "#7e22ce"
 LINE_TARGET = "#1f5f3a"
 LINE_FAULT = "#b91c1c"
+LINE_RATE_RAW = "#94a3b8"
+LINE_RATE_FILTERED = "#2563eb"
 STATE_BAND_EDGE = "#94a3b8"
 STATE_BAND_KEYS = {"FILL", "DRIP_WAIT", "VERIFY_TARGET", "FAULT"}
 
@@ -168,6 +170,16 @@ def _format_param_value(label: str, value: Any) -> str:
     return str(value)
 
 
+def _format_meta_value(value: Any, unit: str | None = None, decimals: int = 2) -> str:
+    if value is None:
+        return "-"
+    if isinstance(value, float):
+        text = f"{value:.{decimals}f}"
+    else:
+        text = str(value)
+    return f"{text} {unit}" if unit else text
+
+
 def _figure_style() -> None:
     plt.rcParams.update(
         {
@@ -206,7 +218,14 @@ def _format_state_band_label(state_name: str, width_s: float) -> str | None:
 def _series_from_samples(
     fill_run: FillRun,
     samples: list[dict[str, Any]],
-) -> tuple[list[float], list[float | None], list[float | None], float | None]:
+) -> tuple[
+    list[float],
+    list[float | None],
+    list[float | None],
+    list[float | None],
+    list[float | None],
+    float | None,
+]:
     x_samples = [_seconds_from_focus(fill_run, record) for record in samples]
     absolute_weights = [_float_value(record, "weight_g") for record in samples]
     base_weight_g = fill_run.base_weight_g
@@ -222,7 +241,9 @@ def _series_from_samples(
         for x_value, weight in zip(x_samples, absolute_weights, strict=True)
     ]
     gate_pct = [_float_value(record, "gate_pct") for record in samples]
-    return x_samples, fill_mass, gate_pct, base_weight_g
+    raw_rate = [_float_value(record, "rate_raw_gps") for record in samples]
+    filtered_rate = [_float_value(record, "rate_filtered_gps") for record in samples]
+    return x_samples, fill_mass, gate_pct, raw_rate, filtered_rate, base_weight_g
 
 
 def _plot_state_background(
@@ -426,13 +447,79 @@ def _annotate_faults(ax: Any, fill_run: FillRun, faults: list[dict[str, Any]]) -
         )
 
 
+def _matching_fill_record(fill_run: FillRun, record: dict[str, Any]) -> bool:
+    return (
+        int(record.get("run_id", 0)) == fill_run.run_id
+        and int(record.get("slot_idx", -1)) == fill_run.slot_idx
+    )
+
+
+def _fill_summary_record(
+    records: list[dict[str, Any]],
+    fill_run: FillRun,
+) -> dict[str, Any] | None:
+    matches = [
+        record
+        for record in records
+        if str(record.get("kind", "")) == "fill_summary" and _matching_fill_record(fill_run, record)
+    ]
+    return matches[-1] if matches else None
+
+
+def _first_adaptive_sample(
+    records: list[dict[str, Any]],
+    fill_run: FillRun,
+) -> dict[str, Any] | None:
+    for record in records:
+        if str(record.get("kind", "")) != "sample":
+            continue
+        if not _matching_fill_record(fill_run, record):
+            continue
+        if record.get("strategy_name") or record.get("adapted_close_early_g") is not None:
+            return record
+    return None
+
+
+def _draw_meta_section(
+    meta_ax: Any,
+    title: str,
+    entries: list[tuple[str, str]],
+    *,
+    x_label: float,
+    x_value: float,
+    y_start: float,
+) -> float:
+    if not entries:
+        return y_start
+    meta_ax.text(
+        x_label,
+        y_start,
+        title,
+        ha="left",
+        va="top",
+        fontsize=9.5,
+        color="#0f172a",
+        fontweight="bold",
+    )
+    y = y_start - 0.05
+    for label, value in entries:
+        meta_ax.text(x_label, y, f"{label}:", ha="left", va="top", fontsize=8.2, color="#475569")
+        meta_ax.text(x_value, y, value, ha="left", va="top", fontsize=8.2, color="#0f172a")
+        y -= 0.042
+    return y - 0.03
+
+
 def _draw_debug_metadata(
     meta_ax: Any,
     session_dir: Path,
     fill_run: FillRun,
     base_weight_g: float | None,
+    records: list[dict[str, Any]],
 ) -> None:
-    meta_lines = [
+    summary = _fill_summary_record(records, fill_run)
+    first_adaptive_sample = _first_adaptive_sample(records, fill_run)
+
+    general_lines = [
         ("Session", session_dir.name),
         ("Fill id", str(fill_run.fill_id)),
         ("Run", str(fill_run.run_id)),
@@ -443,21 +530,59 @@ def _draw_debug_metadata(
         ("End", fill_run.end_reason),
     ]
     if base_weight_g is not None:
-        meta_lines.append(("Base weight", f"{base_weight_g:.2f} g"))
+        general_lines.append(("Base weight", f"{base_weight_g:.2f} g"))
     if fill_run.end_weight_g is not None and base_weight_g is not None:
-        meta_lines.append(("Final fill mass", f"{fill_run.end_weight_g - base_weight_g:.2f} g"))
+        general_lines.append(("Final fill mass", f"{fill_run.end_weight_g - base_weight_g:.2f} g"))
     if fill_run.strategy_name:
-        meta_lines.append(("Strategy", fill_run.strategy_name))
+        general_lines.append(("Strategy", fill_run.strategy_name))
     if fill_run.scale_period_ms_cfg is not None:
-        meta_lines.append(("Scale period cfg", f"{fill_run.scale_period_ms_cfg:.0f} ms"))
+        general_lines.append(("Scale period cfg", f"{fill_run.scale_period_ms_cfg:.0f} ms"))
     if fill_run.scale_period_ms_avg is not None:
-        meta_lines.append(("Scale period avg", f"{fill_run.scale_period_ms_avg:.1f} ms"))
+        general_lines.append(("Scale period avg", f"{fill_run.scale_period_ms_avg:.1f} ms"))
     if fill_run.scale_rate_hz_avg is not None:
-        meta_lines.append(("Scale rate avg", f"{fill_run.scale_rate_hz_avg:.2f} Hz"))
+        general_lines.append(("Scale rate avg", f"{fill_run.scale_rate_hz_avg:.2f} Hz"))
     if fill_run.fsm_period_ms_cfg is not None:
-        meta_lines.append(("FSM period cfg", f"{fill_run.fsm_period_ms_cfg:.0f} ms"))
-    for label, value in important_params(fill_run):
-        meta_lines.append((label, _format_param_value(label, value)))
+        general_lines.append(("FSM period cfg", f"{fill_run.fsm_period_ms_cfg:.0f} ms"))
+
+    preset_lines = [
+        (label, _format_param_value(label, value))
+        for label, value in important_params(fill_run)
+    ]
+
+    adaptive_run_lines: list[tuple[str, str]] = []
+    adaptive_next_lines: list[tuple[str, str]] = []
+    if first_adaptive_sample is not None:
+        adaptive_run_lines.extend(
+            [
+                ("Near close used", _format_meta_value(_float_value(first_adaptive_sample, "adapted_near_close_g"), "g", 1)),
+                ("Close early used", _format_meta_value(_float_value(first_adaptive_sample, "adapted_close_early_g"), "g", 1)),
+                ("Drip wait start", _format_meta_value(_float_value(first_adaptive_sample, "adapted_drip_wait_ms"), "ms", 0)),
+                ("Dead time est.", _format_meta_value(_float_value(first_adaptive_sample, "learned_dead_time_s"), "s", 3)),
+                ("Post-close est.", _format_meta_value(_float_value(first_adaptive_sample, "learned_post_close_gain_g"), "g", 1)),
+            ]
+        )
+    if summary is not None:
+        adaptive_run_lines.extend(
+            [
+                ("Refills", _format_meta_value(summary.get("refill_count"))),
+                ("Dead time run", _format_meta_value(_float_value(summary, "measured_dead_time_s"), "s", 3)),
+                ("Post-close run", _format_meta_value(_float_value(summary, "measured_post_close_gain_g"), "g", 1)),
+                ("Fast rate run", _format_meta_value(_float_value(summary, "measured_fast_rate_gps"), "g/s", 1)),
+                ("Slow rate run", _format_meta_value(_float_value(summary, "measured_slow_rate_gps"), "g/s", 1)),
+                ("Drip wait used", _format_meta_value(_float_value(summary, "drip_wait_used_ms"), "ms", 0)),
+            ]
+        )
+        adaptive_next_lines.extend(
+            [
+                ("Learned dead time", _format_meta_value(_float_value(summary, "next_dead_time_s"), "s", 3)),
+                ("Learned post-close", _format_meta_value(_float_value(summary, "next_post_close_gain_g"), "g", 1)),
+                ("Learned fast rate", _format_meta_value(_float_value(summary, "next_fast_rate_gps"), "g/s", 1)),
+                ("Learned slow rate", _format_meta_value(_float_value(summary, "next_slow_rate_gps"), "g/s", 1)),
+                ("Next drip wait", _format_meta_value(_float_value(summary, "next_drip_wait_ms"), "ms", 0)),
+                ("Last near-close", _format_meta_value(_float_value(summary, "next_near_close_g"), "g", 1)),
+                ("Last close-early", _format_meta_value(_float_value(summary, "next_close_early_g"), "g", 1)),
+            ]
+        )
 
     meta_ax.text(
         0.0,
@@ -469,11 +594,99 @@ def _draw_debug_metadata(
         color="#0f172a",
         fontweight="bold",
     )
-    y = 0.94
-    for label, value in meta_lines:
-        meta_ax.text(0.0, y, f"{label}:", ha="left", va="top", fontsize=9, color="#475569")
-        meta_ax.text(0.54, y, value, ha="left", va="top", fontsize=9, color="#0f172a")
-        y -= 0.055
+    left_y = 0.94
+    right_y = 0.94
+    left_y = _draw_meta_section(meta_ax, "Run", general_lines, x_label=0.0, x_value=0.28, y_start=left_y)
+    _draw_meta_section(meta_ax, "Preset params", preset_lines, x_label=0.0, x_value=0.28, y_start=left_y)
+    right_y = _draw_meta_section(meta_ax, "Adaptive run", adaptive_run_lines, x_label=0.54, x_value=0.84, y_start=right_y)
+    _draw_meta_section(meta_ax, "Adaptive next", adaptive_next_lines, x_label=0.54, x_value=0.84, y_start=right_y)
+
+
+def _create_figure_axes(*, debug: bool, show_rate: str) -> tuple[Any, Any, Any | None, Any | None]:
+    want_rate = show_rate != "none"
+    if debug and want_rate:
+        fig = plt.figure(
+            figsize=(PLAIN_FIGURE_SIZE[0] + DEBUG_META_WIDTH, PLAIN_FIGURE_SIZE[1]),
+            constrained_layout=True,
+        )
+        gs = fig.add_gridspec(
+            2,
+            2,
+            width_ratios=[PLAIN_FIGURE_SIZE[0], DEBUG_META_WIDTH],
+            height_ratios=[3.8, 1.15],
+        )
+        ax = fig.add_subplot(gs[0, 0])
+        rate_ax = fig.add_subplot(gs[1, 0], sharex=ax)
+        meta_ax = fig.add_subplot(gs[:, 1])
+        meta_ax.axis("off")
+        return fig, ax, rate_ax, meta_ax
+    if debug:
+        fig, (ax, meta_ax) = plt.subplots(
+            ncols=2,
+            figsize=(PLAIN_FIGURE_SIZE[0] + DEBUG_META_WIDTH, PLAIN_FIGURE_SIZE[1]),
+            gridspec_kw={"width_ratios": [PLAIN_FIGURE_SIZE[0], DEBUG_META_WIDTH]},
+            constrained_layout=True,
+        )
+        meta_ax.axis("off")
+        return fig, ax, None, meta_ax
+    if want_rate:
+        fig = plt.figure(figsize=PLAIN_FIGURE_SIZE, constrained_layout=True)
+        gs = fig.add_gridspec(2, 1, height_ratios=[3.8, 1.15])
+        ax = fig.add_subplot(gs[0, 0])
+        rate_ax = fig.add_subplot(gs[1, 0], sharex=ax)
+        return fig, ax, rate_ax, None
+    fig, ax = plt.subplots(figsize=PLAIN_FIGURE_SIZE, constrained_layout=True)
+    return fig, ax, None, None
+
+
+def _plot_rate_panel(
+    rate_ax: Any,
+    x_samples: list[float],
+    raw_rate: list[float | None],
+    filtered_rate: list[float | None],
+    *,
+    show_rate: str,
+) -> None:
+    plotted_any = False
+    if show_rate in {"both"}:
+        if any(value is not None for value in raw_rate):
+            rate_ax.plot(
+                x_samples,
+                raw_rate,
+                color=LINE_RATE_RAW,
+                linewidth=1.0,
+                label="Rohrate [g/s]",
+                zorder=2,
+            )
+            plotted_any = True
+    if show_rate in {"filtered", "both"}:
+        if any(value is not None for value in filtered_rate):
+            rate_ax.plot(
+                x_samples,
+                filtered_rate,
+                color=LINE_RATE_FILTERED,
+                linewidth=1.6,
+                label="Gefilterte Rate [g/s]",
+                zorder=3,
+            )
+            plotted_any = True
+    rate_ax.set_ylabel("Füllrate [g/s]")
+    rate_ax.set_xlabel("Zeit relativ zum Füllbeginn [s]")
+    rate_ax.grid(True, axis="both", color="#cbd5e1", linewidth=0.6, alpha=0.55)
+    rate_ax.set_axisbelow(True)
+    if plotted_any:
+        rate_ax.legend(frameon=False, loc="upper right", ncol=2, borderaxespad=0.2)
+    else:
+        rate_ax.text(
+            0.5,
+            0.5,
+            "Keine Raten-Telemetrie in diesem Lauf",
+            transform=rate_ax.transAxes,
+            ha="center",
+            va="center",
+            fontsize=8.5,
+            color="#64748b",
+        )
 
 
 def _render_fill_variant(
@@ -486,6 +699,7 @@ def _render_fill_variant(
     debug: bool,
     legend_placement: str,
     state_style: str,
+    show_rate: str,
 ) -> list[Path]:
     samples = _sample_events(records)
     if not samples:
@@ -494,20 +708,10 @@ def _render_fill_variant(
     states = _state_events(records)
     gates = _gate_events(records)
     faults = _fault_events(records)
-    x_samples, y_fill_mass, y_gate, base_weight_g = _series_from_samples(fill_run, samples)
+    x_samples, y_fill_mass, y_gate, raw_rate, filtered_rate, base_weight_g = _series_from_samples(fill_run, samples)
 
     _figure_style()
-    if debug:
-        fig, (ax, meta_ax) = plt.subplots(
-            ncols=2,
-            figsize=(PLAIN_FIGURE_SIZE[0] + DEBUG_META_WIDTH, PLAIN_FIGURE_SIZE[1]),
-            gridspec_kw={"width_ratios": [PLAIN_FIGURE_SIZE[0], DEBUG_META_WIDTH]},
-            constrained_layout=True,
-        )
-        meta_ax.axis("off")
-    else:
-        fig, ax = plt.subplots(figsize=PLAIN_FIGURE_SIZE, constrained_layout=True)
-        meta_ax = None
+    fig, ax, rate_ax, meta_ax = _create_figure_axes(debug=debug, show_rate=show_rate)
     ax2 = ax.twinx()
 
     if state_style == "background":
@@ -558,12 +762,24 @@ def _render_fill_variant(
     _annotate_gate_events(ax2, fill_run, gates, samples)
     _annotate_faults(ax, fill_run, faults)
 
-    ax.set_xlabel("Zeit relativ zum Füllbeginn [s]")
+    if rate_ax is None:
+        ax.set_xlabel("Zeit relativ zum Füllbeginn [s]")
+    else:
+        ax.tick_params(labelbottom=False)
     ax.set_ylabel("Füllmasse [g]")
     ax2.set_ylabel("Klappenstellung [%]")
     ax2.set_ylim(-2, 102)
     ax.grid(True, axis="both", color="#cbd5e1", linewidth=0.7, alpha=0.65)
     ax.set_axisbelow(True)
+
+    if rate_ax is not None:
+        _plot_rate_panel(
+            rate_ax,
+            x_samples,
+            raw_rate,
+            filtered_rate,
+            show_rate=show_rate,
+        )
 
     handles1, labels1 = ax.get_legend_handles_labels()
     handles2, labels2 = ax2.get_legend_handles_labels()
@@ -591,7 +807,7 @@ def _render_fill_variant(
     ax.legend(**legend_kwargs)
 
     if debug and meta_ax is not None:
-        _draw_debug_metadata(meta_ax, session_dir, fill_run, base_weight_g)
+        _draw_debug_metadata(meta_ax, session_dir, fill_run, base_weight_g, records)
 
     exported: list[Path] = []
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -612,6 +828,7 @@ def _plot_fill(
     formats: list[str],
     legend_placement: str,
     state_style: str,
+    show_rate: str,
 ) -> list[Path]:
     exported = _render_fill_variant(
         session_dir,
@@ -622,6 +839,7 @@ def _plot_fill(
         debug=True,
         legend_placement=legend_placement,
         state_style=state_style,
+        show_rate=show_rate,
     )
     exported.extend(
         _render_fill_variant(
@@ -633,6 +851,7 @@ def _plot_fill(
             debug=False,
             legend_placement=legend_placement,
             state_style=state_style,
+            show_rate=show_rate,
         )
     )
     return exported
@@ -690,6 +909,12 @@ def main() -> int:
         default="none",
         help="Visualize firmware states as the existing full-height background, a compact top band, or disable it",
     )
+    parser.add_argument(
+        "--show-rate",
+        choices=["none", "filtered", "both"],
+        default="none",
+        help="Optionally add a second subplot with fill-rate telemetry for adaptive-strategy debugging",
+    )
     args = parser.parse_args()
 
     session_dir, fill_runs, fill_records = _load_input(
@@ -724,6 +949,7 @@ def main() -> int:
                 formats=formats,
                 legend_placement=args.legend_placement,
                 state_style=args.state_style,
+                show_rate=args.show_rate,
             )
         )
 
@@ -733,6 +959,7 @@ def main() -> int:
     print(f"Plotted:  {len(selected_fills)} fill runs")
     print("Variants: debug, plain")
     print(f"Legend:   {args.legend_placement}")
+    print(f"Rate:     {args.show_rate}")
     print()
     for fill_run in selected_fills:
         print(format_fill_brief(fill_run))

@@ -1,5 +1,6 @@
 #include "esp_log.h"
 #include <inttypes.h>
+#include <stdio.h>
 #include "esp_timer.h"
 
 #include "scale_hx711.h"
@@ -389,15 +390,36 @@ static bool scale_publish_telemetry_sample(int64_t ts_us, float weight_g)
     if (filler_get_jar_tare(&jar_tare_g)) {
         relative_fill_g = weight_g - jar_tare_g;
     }
+    telemetry_record_t rec;
+    telemetry_record_init(&rec, TELEMETRY_KIND_SAMPLE);
+    rec.ts_us = ts_us;
+    rec.run_id = run_id;
+    rec.slot_idx = slot_idx;
+    rec.state = state;
+    rec.target_g = params.target_grams;
+    rec.weight_g = weight_g;
+    rec.relative_fill_g = relative_fill_g;
+    rec.gate_pct = gate_pct;
 
-    return telemetry_publish_sample_compact(ts_us,
-                                            run_id,
-                                            slot_idx,
-                                            state,
-                                            params.target_grams,
-                                            weight_g,
-                                            relative_fill_g,
-                                            gate_pct);
+    filler_strategy_sample_telemetry_t strategy_sample = {0};
+    if (filler_get_strategy_sample_telemetry(&strategy_sample) && strategy_sample.valid) {
+        snprintf(rec.strategy_name, sizeof(rec.strategy_name), "%s", strategy_sample.strategy_name);
+        snprintf(rec.text, sizeof(rec.text), "%s", strategy_sample.gate_phase);
+        rec.rate_raw_gps = strategy_sample.raw_rate_gps;
+        rec.rate_filtered_gps = strategy_sample.filtered_rate_gps;
+        rec.predicted_remaining_g = strategy_sample.predicted_remaining_g;
+        rec.measured_dead_time_s = strategy_sample.measured_dead_time_s;
+        rec.learned_dead_time_s = strategy_sample.learned_dead_time_s;
+        rec.learned_post_close_gain_g = strategy_sample.learned_post_close_gain_g;
+        rec.learned_fast_rate_gps = strategy_sample.learned_fast_rate_gps;
+        rec.learned_slow_rate_gps = strategy_sample.learned_slow_rate_gps;
+        rec.adapted_near_close_g = strategy_sample.adapted_near_close_g;
+        rec.adapted_close_early_g = strategy_sample.adapted_close_early_g;
+        rec.adapted_drip_wait_ms = strategy_sample.adapted_drip_wait_ms;
+        rec.refill_count = strategy_sample.refill_count;
+    }
+
+    return telemetry_publish_sample(&rec);
 }
 
 // Keep queue/latest publishing consistent between the real and fake producers.
