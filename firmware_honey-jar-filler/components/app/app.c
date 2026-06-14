@@ -64,6 +64,7 @@ static const char *k_preset_names[APP_PRESET_COUNT] = {
 static const char *k_strategy_names[APP_FILL_STRATEGY_COUNT] = {
     "heuristic",
     "adaptive-heuristic",
+    "flow-control",
     "manual",
 };
 

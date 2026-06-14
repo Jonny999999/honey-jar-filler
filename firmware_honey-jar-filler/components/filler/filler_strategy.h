@@ -53,6 +53,10 @@ typedef struct {
     float predicted_remaining_g;
     float rel_at_first_close_g;
     float target_g;
+    float control_gate_cmd_pct;
+    float control_target_rate_gps;
+    float control_rate_error_gps;
+    int64_t control_last_update_us;
     float manual_gate_pct;
     bool manual_pending_advance;
     uint8_t manual_next_slot;
@@ -71,7 +75,7 @@ typedef struct {
     float fill_duration_s;
     float drip_wait_used_ms;
     uint32_t refill_count;
-    // "next_*" values are meaningful for adaptive mode. Fixed/manual
+    // "next_*" values are meaningful for learning strategies. Fixed/manual
     // strategies leave them at zero because no cross-run learning is applied.
     float next_dead_time_s;
     float next_post_close_gain_g;

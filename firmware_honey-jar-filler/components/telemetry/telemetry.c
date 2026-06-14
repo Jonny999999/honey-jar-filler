@@ -304,6 +304,7 @@ static void telemetry_emit_record(const telemetry_record_t *rec)
         if (strategy_escaped[0] || text_escaped[0]) {
             printf(",\"strategy_name\":\"%s\",\"gate_phase\":\"%s\""
                    ",\"rate_raw_gps\":%.3f,\"rate_filtered_gps\":%.3f"
+                   ",\"target_rate_gps\":%.3f,\"rate_error_gps\":%.3f"
                    ",\"predicted_remaining_g\":%.3f,\"measured_dead_time_s\":%.3f"
                    ",\"measured_post_close_gain_g\":%.3f"
                    ",\"learned_dead_time_s\":%.3f,\"learned_post_close_gain_g\":%.3f"
@@ -314,6 +315,8 @@ static void telemetry_emit_record(const telemetry_record_t *rec)
                    text_escaped,
                    (double)rec->rate_raw_gps,
                    (double)rec->rate_filtered_gps,
+                   (double)rec->target_rate_gps,
+                   (double)rec->rate_error_gps,
                    (double)rec->predicted_remaining_g,
                    (double)rec->measured_dead_time_s,
                    (double)rec->measured_post_close_gain_g,

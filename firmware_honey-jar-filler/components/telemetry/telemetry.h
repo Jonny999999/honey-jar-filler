@@ -46,6 +46,8 @@ typedef struct {
     float gate_pct;
     float rate_raw_gps;
     float rate_filtered_gps;
+    float target_rate_gps;
+    float rate_error_gps;
     float predicted_remaining_g;
     float measured_dead_time_s;
     float rate_at_close_gps;

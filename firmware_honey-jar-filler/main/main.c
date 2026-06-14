@@ -653,6 +653,7 @@ void app_main(void)
     esp_log_level_set("filler_fsm", ESP_LOG_DEBUG);
     esp_log_level_set("fill_strategy", ESP_LOG_DEBUG);
     esp_log_level_set("fill_adaptive", ESP_LOG_DEBUG);
+    esp_log_level_set("fill_flowctrl", ESP_LOG_DEBUG);
     esp_log_level_set("fill_manual", ESP_LOG_DEBUG);
     esp_log_level_set("telemetry", ESP_LOG_INFO);
 

@@ -407,6 +407,8 @@ static bool scale_publish_telemetry_sample(int64_t ts_us, float weight_g)
         snprintf(rec.text, sizeof(rec.text), "%s", strategy_sample.gate_phase);
         rec.rate_raw_gps = strategy_sample.raw_rate_gps;
         rec.rate_filtered_gps = strategy_sample.filtered_rate_gps;
+        rec.target_rate_gps = strategy_sample.target_rate_gps;
+        rec.rate_error_gps = strategy_sample.rate_error_gps;
         rec.predicted_remaining_g = strategy_sample.predicted_remaining_g;
         rec.measured_dead_time_s = strategy_sample.measured_dead_time_s;
         rec.measured_post_close_gain_g = strategy_sample.measured_post_close_gain_g;
