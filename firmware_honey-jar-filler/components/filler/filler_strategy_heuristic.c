@@ -13,8 +13,13 @@
 #define THRESH_CONFIRM_COUNT 4
 
 // Derivative-based measurement is shared with the adaptive strategy so both
-// modes can later be compared using similar thesis plots.
-#define RATE_FILTER_ALPHA 0.18f
+// modes can later be compared using similar thesis plots. Use a slower rise
+// and faster fall so the filtered rate does not stick high after flow stops.
+#define RATE_FILTER_ALPHA_RISE 0.18f
+#define RATE_FILTER_ALPHA_FALL 0.55f
+#define RATE_MIN_VALID_GPS 2.0f
+#define RATE_ZERO_EPS_GPS 0.5f
+#define RATE_NO_FLOW_RESET_SAMPLES 10u
 #define RESPONSE_THRESHOLD_MIN_G 1.5f
 #define RESPONSE_THRESHOLD_MAX_G 6.0f
 #define DELTA_RATE_MIN_DT_S 0.05f
@@ -33,6 +38,14 @@ static float ewma(float prev, float sample, float alpha)
 {
     if (prev <= 0.0f) return sample;
     return prev + alpha * (sample - prev);
+}
+
+static void clear_live_rate_estimates(filler_strategy_runtime_t *rt)
+{
+    if (!rt) return;
+    rt->raw_rate_gps = 0.0f;
+    rt->filtered_rate_gps = 0.0f;
+    rt->no_flow_count = 0;
 }
 
 static bool stable_above(float value, float threshold, uint8_t *count, uint8_t required)
@@ -117,7 +130,25 @@ static void update_rate_estimates(filler_strategy_runtime_t *rt, const filler_st
             float delta_g = rel_g - rt->last_rel_g;
             if (delta_g < -0.5f) delta_g = 0.0f;
             rt->raw_rate_gps = delta_g > 0.0f ? (delta_g / dt_s) : 0.0f;
-            rt->filtered_rate_gps = ewma(rt->filtered_rate_gps, rt->raw_rate_gps, RATE_FILTER_ALPHA);
+            if (rt->raw_rate_gps < RATE_MIN_VALID_GPS) {
+                rt->raw_rate_gps = 0.0f;
+            }
+
+            if (rt->raw_rate_gps <= 0.0f) {
+                if (rt->no_flow_count < 255) rt->no_flow_count++;
+                if (rt->no_flow_count >= RATE_NO_FLOW_RESET_SAMPLES) {
+                    rt->filtered_rate_gps = 0.0f;
+                } else {
+                    rt->filtered_rate_gps = ewma(rt->filtered_rate_gps, 0.0f, RATE_FILTER_ALPHA_FALL);
+                }
+            } else {
+                rt->no_flow_count = 0;
+                float alpha = (rt->raw_rate_gps >= rt->filtered_rate_gps) ? RATE_FILTER_ALPHA_RISE : RATE_FILTER_ALPHA_FALL;
+                rt->filtered_rate_gps = ewma(rt->filtered_rate_gps, rt->raw_rate_gps, alpha);
+            }
+            if (rt->filtered_rate_gps < RATE_ZERO_EPS_GPS) {
+                rt->filtered_rate_gps = 0.0f;
+            }
 
             const char *phase = heuristic_phase_name(rt);
             if ((strcmp(phase, "fast") == 0 || strcmp(phase, "refill") == 0) && rt->raw_rate_gps > 0.1f) {
@@ -273,6 +304,7 @@ static void heuristic_on_enter(filler_strategy_runtime_t *rt,
         }
         rt->last_rate_ts_us = 0;
         rt->last_rel_g = 0.0f;
+        clear_live_rate_estimates(rt);
         env->publish_fill_start(tick->run_id,
                                 tick->slot_idx,
                                 tick->strategy_name,
@@ -398,6 +430,7 @@ static filler_state_t heuristic_step(filler_strategy_runtime_t *rt,
     }
 
     case FILLER_DRIP_WAIT:
+        update_rate_estimates(rt, tick);
         track_post_close_gain(rt, tick);
         publish_runtime_snapshot(rt, env, tick,
                                  (float)tick->params->near_close_delta_g,
@@ -421,6 +454,7 @@ static filler_state_t heuristic_step(filler_strategy_runtime_t *rt,
         float rel_g = tick->latest->grams - (has_tare ? tare_g : 0.0f);
         float tol_low_g = (float)tick->params->target_tol_low_g;
         float tol_high_g = (float)tick->params->target_tol_high_g;
+        update_rate_estimates(rt, tick);
         track_post_close_gain(rt, tick);
 
         if (tick->new_sample &&

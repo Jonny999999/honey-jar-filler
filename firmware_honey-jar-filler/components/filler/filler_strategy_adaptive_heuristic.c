@@ -19,10 +19,17 @@
 #define ADAPT_ENABLE_PERSISTENT_LEARNING 0
 
 // Filtering / learning aggressiveness:
-// Lower alpha values react slower and are therefore safer for first live tests.
-#define RATE_FILTER_ALPHA 0.18f
-#define LEARN_ALPHA_SLOW 0.15f
-#define LEARN_ALPHA_MAIN 0.20f
+// Use a slower rise and faster fall so the filtered rate follows real flow but
+// does not stay artificially high once the measured increase stops.
+#define RATE_FILTER_ALPHA_RISE 0.18f
+#define RATE_FILTER_ALPHA_FALL 0.55f
+#define RATE_MIN_VALID_GPS 2.0f
+#define RATE_ZERO_EPS_GPS 0.5f
+#define RATE_NO_FLOW_RESET_SAMPLES 2u
+#define LEARN_ALPHA_DEAD_TIME 0.35f
+#define LEARN_ALPHA_POST_CLOSE 0.65f
+#define LEARN_ALPHA_RATE 0.20f
+#define LEARN_ALPHA_DRIP_WAIT 0.35f
 
 // VERIFY_TARGET robustness:
 // Require a few consecutive confirming samples before deciding under/overweight.
@@ -46,11 +53,10 @@
 // Safety limits:
 // Hard overfill margin faults instead of trying to recover. Safe-rate limits
 // reduce the gate opening when the observed fill rate looks implausibly high.
-#define ADAPT_HARD_OVERFILL_MARGIN_MIN_G 12.0f
+#define ADAPT_HARD_OVERFILL_MARGIN_MIN_G 1.0f
 #define ADAPT_HARD_OVERFILL_MARGIN_EXTRA_G 6.0f
-#define NEAR_CLOSE_EXTRA_G 8.0f
-#define NEAR_CLOSE_MULT 2.2f
-#define SAFE_RATE_MIN_GPS 25.0f
+#define NEAR_CLOSE_TRANSITION_MARGIN_G 4.0f
+#define SAFE_RATE_MIN_GPS 10.0f
 #define SAFE_RATE_MAX_GPS 100.0f
 #define SAFE_RATE_MULT 1.8f
 
@@ -108,6 +114,14 @@ static float ewma(float prev, float sample, float alpha)
 {
     if (prev <= 0.0f) return sample;
     return prev + alpha * (sample - prev);
+}
+
+static void clear_live_rate_estimates(filler_strategy_runtime_t *rt)
+{
+    if (!rt) return;
+    rt->raw_rate_gps = 0.0f;
+    rt->filtered_rate_gps = 0.0f;
+    rt->no_flow_count = 0;
 }
 
 static bool stable_above(float value, float threshold, uint8_t *count, uint8_t required)
@@ -270,15 +284,16 @@ static float response_threshold_g(const filler_strategy_tick_t *tick)
     return clampf_local(candidate, RESPONSE_THRESHOLD_MIN_G, RESPONSE_THRESHOLD_MAX_G);
 }
 
-static float prediction_rate_gps(const filler_strategy_runtime_t *rt)
+static float transition_fast_rate_gps(const filler_strategy_runtime_t *rt)
 {
     if (!rt) return 0.0f;
-    if (rt->filtered_rate_gps > 0.5f) return rt->filtered_rate_gps;
     adaptive_gate_phase_t phase = runtime_phase(rt);
-    if (phase == PHASE_REDUCED && rt->learned_slow_rate_gps > 0.5f) return rt->learned_slow_rate_gps;
-    if ((phase == PHASE_FAST || phase == PHASE_REFILL) && rt->learned_fast_rate_gps > 0.5f) return rt->learned_fast_rate_gps;
+    if ((phase == PHASE_FAST || phase == PHASE_REFILL) && rt->filtered_rate_gps > 0.5f) {
+        return rt->filtered_rate_gps;
+    }
     if (rt->learned_fast_rate_gps > 0.5f) return rt->learned_fast_rate_gps;
-    if (rt->learned_slow_rate_gps > 0.5f) return rt->learned_slow_rate_gps;
+    if (rt->filtered_rate_gps > 0.5f) return rt->filtered_rate_gps;
+    if (rt->raw_rate_gps > 0.5f) return rt->raw_rate_gps;
     return 0.0f;
 }
 
@@ -286,21 +301,35 @@ static void update_adapted_thresholds(filler_strategy_runtime_t *rt, const fille
 {
     if (!rt || !tick || !tick->params) return;
 
-    float rate_for_prediction = prediction_rate_gps(rt);
-    // Remaining in-flight mass is modeled conservatively as transport delay
-    // contribution plus post-close tail/drip contribution.
-    rt->predicted_remaining_g = rt->learned_dead_time_s * rate_for_prediction + rt->learned_post_close_gain_g;
+    float fast_transition_rate_gps = transition_fast_rate_gps(rt);
+    float transition_mass_g = rt->learned_dead_time_s * fast_transition_rate_gps;
+
+    // Close timing is dominated by the empirically measured residual mass after
+    // a full-close command. This measured post-close gain already captures the
+    // real plant behavior better than reconstructing it mainly from rate and
+    // dead time again.
+    rt->predicted_remaining_g = rt->learned_post_close_gain_g;
 
     float close_max = fmaxf((float)tick->params->close_early_g * 1.8f, 8.0f);
     float near_max = fmaxf((float)tick->params->near_close_delta_g * 2.0f, 20.0f);
     float close_candidate = rt->predicted_remaining_g + CLOSE_BUFFER_G - rt->close_early_relax_g;
-    float near_candidate = fmaxf(close_candidate + NEAR_CLOSE_EXTRA_G, rt->predicted_remaining_g * NEAR_CLOSE_MULT);
+    // Reducing from fast to slow should happen early enough that the mass
+    // already "in flight" at the fast rate can clear before the slower final
+    // phase is relied on. Therefore near-close is modeled as fast dead-time
+    // mass plus the later full-close threshold.
+    float near_candidate = transition_mass_g + clampf_local(close_candidate, 2.0f, close_max) + NEAR_CLOSE_TRANSITION_MARGIN_G;
 
     rt->adapted_close_early_g = clampf_local(close_candidate, 2.0f, close_max);
     rt->adapted_near_close_g = clampf_local(near_candidate,
                                             rt->adapted_close_early_g + 3.0f,
                                             near_max);
     rt->adapted_drip_wait_ms = clampf_local(rt->adapted_drip_wait_ms, DRIP_WAIT_MIN_MS, DRIP_WAIT_MAX_MS);
+}
+
+static float near_close_transition_mass_g(const filler_strategy_runtime_t *rt)
+{
+    if (!rt) return 0.0f;
+    return rt->learned_dead_time_s * transition_fast_rate_gps(rt);
 }
 
 static void publish_runtime_snapshot(filler_strategy_runtime_t *rt, const filler_strategy_env_t *env, const filler_strategy_tick_t *tick)
@@ -340,7 +369,25 @@ static void update_rate_estimates(filler_strategy_runtime_t *rt, const filler_st
             float delta_g = rel_g - rt->last_rel_g;
             if (delta_g < -0.5f) delta_g = 0.0f;
             rt->raw_rate_gps = delta_g > 0.0f ? (delta_g / dt_s) : 0.0f;
-            rt->filtered_rate_gps = ewma(rt->filtered_rate_gps, rt->raw_rate_gps, RATE_FILTER_ALPHA);
+            if (rt->raw_rate_gps < RATE_MIN_VALID_GPS) {
+                rt->raw_rate_gps = 0.0f;
+            }
+
+            if (rt->raw_rate_gps <= 0.0f) {
+                if (rt->no_flow_count < 255) rt->no_flow_count++;
+                if (rt->no_flow_count >= RATE_NO_FLOW_RESET_SAMPLES) {
+                    rt->filtered_rate_gps = 0.0f;
+                } else {
+                    rt->filtered_rate_gps = ewma(rt->filtered_rate_gps, 0.0f, RATE_FILTER_ALPHA_FALL);
+                }
+            } else {
+                rt->no_flow_count = 0;
+                float alpha = (rt->raw_rate_gps >= rt->filtered_rate_gps) ? RATE_FILTER_ALPHA_RISE : RATE_FILTER_ALPHA_FALL;
+                rt->filtered_rate_gps = ewma(rt->filtered_rate_gps, rt->raw_rate_gps, alpha);
+            }
+            if (rt->filtered_rate_gps < RATE_ZERO_EPS_GPS) {
+                rt->filtered_rate_gps = 0.0f;
+            }
 
             adaptive_gate_phase_t phase = runtime_phase(rt);
             if ((phase == PHASE_FAST || phase == PHASE_REFILL) && rt->raw_rate_gps > 0.1f) {
@@ -435,23 +482,28 @@ static void publish_summary_and_learn(filler_strategy_runtime_t *rt,
     adaptive_learned_entry_t before = *entry;
 
     if (plausible) {
-        entry->dead_time_s = ewma(entry->dead_time_s, rt->measured_dead_time_s, LEARN_ALPHA_MAIN);
-        entry->post_close_gain_g = ewma(entry->post_close_gain_g, rt->measured_post_close_gain_g, LEARN_ALPHA_MAIN);
-        if (fast_avg > 0.0f) entry->fast_rate_gps = ewma(entry->fast_rate_gps, fast_avg, LEARN_ALPHA_SLOW);
-        if (slow_avg > 0.0f) entry->slow_rate_gps = ewma(entry->slow_rate_gps, slow_avg, LEARN_ALPHA_SLOW);
+        entry->dead_time_s = ewma(entry->dead_time_s, rt->measured_dead_time_s, LEARN_ALPHA_DEAD_TIME);
+        entry->post_close_gain_g = ewma(entry->post_close_gain_g, rt->measured_post_close_gain_g, LEARN_ALPHA_POST_CLOSE);
+        if (fast_avg > 0.0f) entry->fast_rate_gps = ewma(entry->fast_rate_gps, fast_avg, LEARN_ALPHA_RATE);
+        if (slow_avg > 0.0f) entry->slow_rate_gps = ewma(entry->slow_rate_gps, slow_avg, LEARN_ALPHA_RATE);
         entry->drip_wait_ms = ewma(entry->drip_wait_ms,
                                    clampf_local(settled_wait_ms, DRIP_WAIT_MIN_MS, DRIP_WAIT_MAX_MS),
-                                   LEARN_ALPHA_MAIN);
+                                   LEARN_ALPHA_DRIP_WAIT);
         entry->successful_fills++;
         adaptive_store_save();
         ESP_LOGI(TAG,
-                 "learned update reason=%s dead_time %.3f->%.3f s post_close %.1f->%.1f g fast_rate %.1f->%.1f g/s slow_rate %.1f->%.1f g/s drip_wait %.0f->%.0f ms",
+                 "learned update reason=%s dead_time %.3f->%.3f s (a=%.2f) post_close %.1f->%.1f g (a=%.2f) fast_rate %.1f->%.1f g/s (a=%.2f) slow_rate %.1f->%.1f g/s (a=%.2f) drip_wait %.0f->%.0f ms (a=%.2f)",
                  reason ? reason : "ok",
                  (double)before.dead_time_s, (double)entry->dead_time_s,
+                 (double)LEARN_ALPHA_DEAD_TIME,
                  (double)before.post_close_gain_g, (double)entry->post_close_gain_g,
+                 (double)LEARN_ALPHA_POST_CLOSE,
                  (double)before.fast_rate_gps, (double)entry->fast_rate_gps,
+                 (double)LEARN_ALPHA_RATE,
                  (double)before.slow_rate_gps, (double)entry->slow_rate_gps,
-                 (double)before.drip_wait_ms, (double)entry->drip_wait_ms);
+                 (double)LEARN_ALPHA_RATE,
+                 (double)before.drip_wait_ms, (double)entry->drip_wait_ms,
+                 (double)LEARN_ALPHA_DRIP_WAIT);
     } else {
         ESP_LOGI(TAG,
                  "learning skipped reason=%s success=%d response=%d dead_time=%.3f s post_close=%.1f g fast_rate=%.1f g/s slow_rate=%.1f g/s",
@@ -533,6 +585,7 @@ static void adaptive_on_enter(filler_strategy_runtime_t *rt,
 
         rt->last_rate_ts_us = 0;
         rt->last_rel_g = 0.0f;
+        clear_live_rate_estimates(rt);
         reset_state_counters(rt);
         rt->learned_dead_time_s = entry->dead_time_s;
         rt->learned_post_close_gain_g = entry->post_close_gain_g;
@@ -540,10 +593,11 @@ static void adaptive_on_enter(filler_strategy_runtime_t *rt,
         rt->learned_slow_rate_gps = entry->slow_rate_gps;
         update_adapted_thresholds(rt, tick);
         ESP_LOGI(TAG,
-                 "adaptive thresholds near_close=%.1f g close_early=%.1f g predicted_remaining=%.1f g drip_wait=%.0f ms gate_fast=%u%% gate_reduced=%u%%",
+                 "adaptive thresholds near_close=%.1f g close_early=%.1f g close_post=%.1f g near_transition=%.1f g drip_wait=%.0f ms gate_fast=%u%% gate_reduced=%u%%",
                  (double)rt->adapted_near_close_g,
                  (double)rt->adapted_close_early_g,
                  (double)rt->predicted_remaining_g,
+                 (double)near_close_transition_mass_g(rt),
                  (double)rt->adapted_drip_wait_ms,
                  (unsigned)tick->params->max_gate_pct,
                  (unsigned)tick->params->near_close_gate_pct);
@@ -658,7 +712,7 @@ static filler_state_t adaptive_step(filler_strategy_runtime_t *rt,
         }
         if (remaining_g <= rt->adapted_close_early_g) {
             ESP_LOGI(TAG,
-                     "adaptive close remaining=%.1f g threshold=%.1f g predicted_remaining=%.1f g",
+                     "adaptive close remaining=%.1f g threshold=%.1f g learned_post_close=%.1f g",
                      (double)remaining_g,
                      (double)rt->adapted_close_early_g,
                      (double)rt->predicted_remaining_g);
@@ -670,9 +724,11 @@ static filler_state_t adaptive_step(filler_strategy_runtime_t *rt,
         if (remaining_g <= rt->adapted_near_close_g) {
             if (!rt->near_close_logged) {
                 ESP_LOGI(TAG,
-                         "adaptive near-close remaining=%.1f g threshold=%.1f g -> gate=%u%%",
+                         "adaptive near-close remaining=%.1f g threshold=%.1f g transition_mass=%.1f g close_threshold=%.1f g -> gate=%u%%",
                          (double)remaining_g,
                          (double)rt->adapted_near_close_g,
+                         (double)near_close_transition_mass_g(rt),
+                         (double)rt->adapted_close_early_g,
                          (unsigned)tick->params->near_close_gate_pct);
             }
             env->gate_set_percent_label(tick->params->near_close_gate_pct, "adaptive_near");
@@ -688,6 +744,7 @@ static filler_state_t adaptive_step(filler_strategy_runtime_t *rt,
     }
 
     case FILLER_DRIP_WAIT:
+        update_rate_estimates(rt, tick);
         track_post_close_gain(rt, tick);
         if ((tick->now_us - tick->state_enter_us) >= ((int64_t)rt->adapted_drip_wait_ms * 1000.0f)) {
             ESP_LOGI(TAG,
@@ -708,6 +765,7 @@ static filler_state_t adaptive_step(filler_strategy_runtime_t *rt,
             return next_state;
         }
 
+        update_rate_estimates(rt, tick);
         track_post_close_gain(rt, tick);
         float rel_g = tick->latest->grams - rt->run_base_weight_g;
         float tol_low_g = (float)tick->params->target_tol_low_g;

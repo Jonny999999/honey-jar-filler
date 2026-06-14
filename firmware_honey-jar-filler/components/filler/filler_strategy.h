@@ -20,6 +20,7 @@ typedef struct {
     uint8_t cnt_target;
     uint8_t cnt_under;
     uint8_t cnt_over;
+    uint8_t no_flow_count;
     uint8_t sample_count;
     bool response_detected;
     bool first_close_seen;

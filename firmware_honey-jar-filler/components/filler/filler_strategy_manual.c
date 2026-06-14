@@ -7,7 +7,8 @@
 
 // Manual mode uses the existing machine FSM to position the carousel, but the
 // actual dosing is fully user-driven with the rotary encoder.
-#define MANUAL_GATE_STEP_PCT 4f
+#define MANUAL_GATE_OPEN_STEP_PCT 4.0f
+#define MANUAL_GATE_CLOSE_STEP_PCT 6.0f
 #define MANUAL_ADVANCE_DRIP_MS 2000
 
 static const char *TAG = "fill_manual";
@@ -17,6 +18,19 @@ static float clamp_pct(float value)
     if (value < 0.0f) return 0.0f;
     if (value > 100.0f) return 100.0f;
     return value;
+}
+
+static float manual_apply_gate_delta(float current_pct, int32_t delta_steps)
+{
+    if (delta_steps == 0) return current_pct;
+
+    float next_pct = current_pct;
+    if (delta_steps > 0) {
+        next_pct += (float)delta_steps * MANUAL_GATE_OPEN_STEP_PCT;
+    } else {
+        next_pct += (float)delta_steps * MANUAL_GATE_CLOSE_STEP_PCT;
+    }
+    return clamp_pct(next_pct);
 }
 
 static void manual_publish_snapshot(filler_strategy_runtime_t *rt,
@@ -104,13 +118,15 @@ static filler_state_t manual_step(filler_strategy_runtime_t *rt,
             int32_t delta_steps = env->take_manual_gate_delta();
             if (delta_steps != 0) {
                 float prev_pct = rt->manual_gate_pct;
-                rt->manual_gate_pct = clamp_pct(rt->manual_gate_pct + ((float)delta_steps * MANUAL_GATE_STEP_PCT));
+                rt->manual_gate_pct = manual_apply_gate_delta(rt->manual_gate_pct, delta_steps);
                 if (rt->manual_gate_pct != prev_pct) {
                     env->gate_set_percent_label(rt->manual_gate_pct, "manual_adjust");
-                    ESP_LOGI(TAG, "manual gate: %.0f%% -> %.0f%% (delta=%ld)",
+                    ESP_LOGI(TAG, "manual gate: %.0f%% -> %.0f%% (delta=%ld, open_step=%.0f, close_step=%.0f)",
                              (double)prev_pct,
                              (double)rt->manual_gate_pct,
-                             (long)delta_steps);
+                             (long)delta_steps,
+                             (double)MANUAL_GATE_OPEN_STEP_PCT,
+                             (double)MANUAL_GATE_CLOSE_STEP_PCT);
                 }
             }
         }
