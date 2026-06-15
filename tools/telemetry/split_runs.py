@@ -43,7 +43,7 @@ def main() -> int:
     parser.add_argument(
         "--force",
         action="store_true",
-        help="Replace an existing output directory",
+        help="Deprecated compatibility flag. Existing split output is replaced automatically.",
     )
     args = parser.parse_args()
 
@@ -53,13 +53,10 @@ def main() -> int:
     post_ms = args.post_ms if args.post_ms is not None else int(session_meta.get("post_run_ms", 1000))
     output_dir = args.output_dir.resolve() if args.output_dir else session_dir / "fills"
 
+    cleared_existing = False
     if output_dir.exists():
-        if not args.force:
-            raise SystemExit(
-                f"output directory already exists: {output_dir}\n"
-                "Use --force to replace previously generated fill files."
-            )
         shutil.rmtree(output_dir)
+        cleared_existing = True
 
     telemetry_path = telemetry_path_for_session(session_dir)
     records = load_ndjson(telemetry_path)
@@ -76,6 +73,7 @@ def main() -> int:
     print(f"Session:   {session_dir}")
     print(f"Telemetry: {telemetry_path}")
     print(f"Output:    {output_dir}")
+    print(f"Cleared:   {'yes' if cleared_existing else 'no'}")
     print(f"Windows:   pre={pre_ms} ms, post={post_ms} ms")
     print(f"Detected:  {len(fill_runs)} fill runs")
     print()

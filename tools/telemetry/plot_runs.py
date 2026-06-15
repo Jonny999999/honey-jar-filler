@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
+import shutil
 import tempfile
 import textwrap
 from pathlib import Path
@@ -64,7 +66,14 @@ GATE_LABELS_DE = {
     "close": "Schließen",
     "percent": "Öffnungsgrad",
 }
-PLAIN_FIGURE_SIZE = (8.0, 5.0)
+FIGURE_PROFILES = {
+    "default": (8.67, 5.0),
+    "narrow": (6.8, 4.65),
+}
+PLAIN_PROFILE_SUFFIX = {
+    "default": "wide",
+    "narrow": "narrow",
+}
 DEBUG_META_WIDTH = 5.2
 LINE_FILL_MASS = "#c81e1e"
 LINE_GATE = "#7e22ce"
@@ -75,6 +84,12 @@ LINE_RATE_FILTERED = "#2563eb"
 STATE_BAND_EDGE = "#94a3b8"
 STATE_BAND_KEYS = {"FILL", "DRIP_WAIT", "VERIFY_TARGET", "FAULT"}
 RATE_AXIS_LABEL = "Füllrate [g/s]"
+STATE_BAND_FIGURE_EXTRA_H = 0.42
+STATE_BAND_HEIGHT_RATIO = 0.52
+MAIN_PLOT_HEIGHT_RATIO = 3.8
+RATE_PLOT_HEIGHT_RATIO = 1.7
+STATE_BAND_LABEL_MIN_WIDTH_S = 0.35
+STATE_BAND_LABEL_OUTSIDE_WIDTH_S = 1.45
 
 
 def _parse_fill_selection(value: str) -> list[int]:
@@ -182,6 +197,45 @@ def _format_meta_value(value: Any, unit: str | None = None, decimals: int = 2) -
     return f"{text} {unit}" if unit else text
 
 
+def _figure_size(profile: str) -> tuple[float, float]:
+    return FIGURE_PROFILES.get(profile, FIGURE_PROFILES["default"])
+
+
+def _plain_profile_suffix(profile: str) -> str:
+    return PLAIN_PROFILE_SUFFIX.get(profile, profile)
+
+
+def _slug_token(value: str | None, *, fallback: str) -> str:
+    if not value:
+        return fallback
+    collapsed = re.sub(r"[^A-Za-z0-9._-]+", "-", value.strip())
+    collapsed = re.sub(r"-{2,}", "-", collapsed).strip("-._")
+    return collapsed or fallback
+
+
+def _session_output_token(session_name: str) -> str:
+    token = _slug_token(session_name, fallback="session")
+    token = re.sub(
+        r"^(\d{4}\.\d{2}\.\d{2}_\d{2}-\d{2})-x-",
+        r"\1-",
+        token,
+        count=1,
+    )
+    return token
+
+
+def _output_stem_base(session_dir: Path, fill_run: FillRun) -> str:
+    session_token = _session_output_token(session_dir.name)
+    strategy_token = _slug_token(fill_run.strategy_name, fallback="strategy")
+    duration_token = f"{round(fill_run.focus_duration_s):d}s"
+    return (
+        f"{session_token}"
+        f"__{strategy_token}"
+        f"__fill-{fill_run.fill_id:02d}"
+        f"__total-{duration_token}"
+    )
+
+
 def _figure_style() -> None:
     plt.rcParams.update(
         {
@@ -209,12 +263,56 @@ def _format_state_band_label(state_name: str, width_s: float) -> str | None:
     label = STATE_LABELS_DE.get(state_name)
     if not label:
         return None
-    if width_s < 0.35:
+    if width_s < STATE_BAND_LABEL_MIN_WIDTH_S:
         return None
     if width_s >= 1.15:
         duration = f"{width_s:.2f}".replace(".", ",")
         return f"{label}\n({duration} s)"
     return label
+
+
+def _state_band_label_should_be_outside(label: str, width_s: float) -> bool:
+    if width_s < STATE_BAND_LABEL_OUTSIDE_WIDTH_S:
+        return True
+    longest_line = max(len(part) for part in label.splitlines())
+    estimated_needed_width_s = longest_line * 0.19
+    return width_s < estimated_needed_width_s
+
+
+def _place_state_band_label(
+    band_ax: Any,
+    *,
+    state_name: str,
+    x0: float,
+    x1: float,
+    band_y: float,
+    band_h: float,
+) -> bool:
+    width = max(0.0, x1 - x0)
+    label = _format_state_band_label(state_name, width)
+    if label is None:
+        return state_name in {"FILL", "IDLE"}
+
+    text_y = band_y + band_h / 2.0
+    va = "center"
+    clip_on = True
+    if state_name in {"FILL", "IDLE"} and _state_band_label_should_be_outside(label, width):
+        return True
+
+    band_ax.text(
+        x0 + width / 2.0,
+        text_y,
+        label,
+        transform=band_ax.get_xaxis_transform(),
+        ha="center",
+        va=va,
+        fontsize=7.0,
+        color="#1e293b",
+        zorder=2,
+        clip_on=clip_on,
+        linespacing=0.9,
+    )
+    return False
 
 
 def _series_from_samples(
@@ -288,16 +386,22 @@ def _plot_state_background(
 
 
 def _plot_state_band(
-    ax: Any,
+    band_ax: Any,
     fill_run: FillRun,
     states: list[dict[str, Any]],
 ) -> None:
+    if band_ax is None:
+        return
+
+    band_ax.set_ylim(0.0, 1.0)
+    band_ax.axis("off")
+
     if not states:
         return
 
     span_end_us = fill_run.window_end_us
-    band_y = 0.91
-    band_h = 0.065
+    band_y = 0.08
+    band_h = 0.84
     segments: list[tuple[str, float, float]] = []
 
     if fill_run.window_start_us < fill_run.focus_start_us:
@@ -325,6 +429,7 @@ def _plot_state_band(
         x1 = (end_us - fill_run.focus_start_us) / 1_000_000.0
         segments.append((state_name, x0, x1))
 
+    outside_labels: list[tuple[str, float, float]] = []
     for state_name, x0, x1 in segments:
         width = max(0.0, x1 - x0)
         if width <= 0.0:
@@ -334,7 +439,7 @@ def _plot_state_band(
             (x0, band_y),
             width,
             band_h,
-            transform=ax.get_xaxis_transform(),
+            transform=band_ax.get_xaxis_transform(),
             facecolor=STATE_COLORS.get(state_name, "#e2e8f0"),
             edgecolor=STATE_BAND_EDGE,
             linewidth=0.6,
@@ -342,23 +447,38 @@ def _plot_state_band(
             zorder=1,
             clip_on=False,
         )
-        ax.add_patch(rect)
+        band_ax.add_patch(rect)
 
-        label = _format_state_band_label(state_name, width)
-        if label is None:
-            continue
-        ax.text(
-            x0 + width / 2.0,
-            band_y + band_h / 2.0,
-            label,
-            transform=ax.get_xaxis_transform(),
+        needs_outside = _place_state_band_label(
+            band_ax,
+            state_name=state_name,
+            x0=x0,
+            x1=x1,
+            band_y=band_y,
+            band_h=band_h,
+        )
+        if needs_outside:
+            outside_labels.append((state_name, x0, x1))
+
+    for state_name, x0, x1 in outside_labels:
+        text_y = band_y + band_h + 0.06
+        band_ax.text(
+            x0 + max(0.0, x1 - x0) / 2.0,
+            text_y,
+            STATE_LABELS_DE.get(state_name, state_name),
+            transform=band_ax.get_xaxis_transform(),
             ha="center",
-            va="center",
+            va="bottom",
             fontsize=7.0,
             color="#1e293b",
-            zorder=2,
-            clip_on=True,
-            linespacing=0.9,
+            zorder=3,
+            clip_on=False,
+            bbox={
+                "boxstyle": "round,pad=0.12",
+                "fc": "#ffffff",
+                "ec": "#cbd5e1",
+                "alpha": 0.92,
+            },
         )
 
 
@@ -387,6 +507,7 @@ def _annotate_gate_events(
     gates: list[dict[str, Any]],
     samples: list[dict[str, Any]],
 ) -> None:
+    seen_zero_labels = 0
     for gate_record in gates:
         gate_pct = _float_value(gate_record, "gate_pct")
         if gate_pct is None:
@@ -394,13 +515,28 @@ def _annotate_gate_events(
         x_gate = _aligned_gate_x(fill_run, gate_record, samples, gate_pct)
         ax2.scatter([x_gate], [gate_pct], color=LINE_GATE, s=20, zorder=6)
         label = f"{gate_pct:.0f} %"
+        xytext = (-8, 0)
+        va = "center"
+        ha = "right"
+        if gate_pct <= 5.0:
+            if seen_zero_labels == 0:
+                xytext = (-8, 2)
+                va = "bottom"
+            else:
+                xytext = (-8, 6)
+                va = "bottom"
+            seen_zero_labels += 1
+        elif gate_pct >= 95.0:
+            xytext = (0, 3)
+            ha = "center"
+            va = "bottom"
         ax2.annotate(
             label,
             (x_gate, gate_pct),
             textcoords="offset points",
-            xytext=(-8, 0),
-            ha="right",
-            va="center",
+            xytext=xytext,
+            ha=ha,
+            va=va,
             fontsize=7.5,
             color=LINE_GATE,
         )
@@ -623,48 +759,60 @@ def _draw_debug_metadata(
     _draw_meta_section(meta_ax, "Adaptionswerte", adaptive_next_lines, x_label=0.56, x_value=0.86, y_start=right_y)
 
 
-def _create_figure_axes(*, debug: bool, show_rate: str, rate_layout: str) -> tuple[Any, Any, Any | None, Any | None]:
+def _create_figure_axes(
+    *,
+    debug: bool,
+    show_rate: str,
+    rate_layout: str,
+    state_style: str,
+    figure_profile: str,
+) -> tuple[Any, Any | None, Any, Any | None, Any | None]:
+    figure_width, figure_height_base = _figure_size(figure_profile)
     want_rate = show_rate != "none"
-    if debug and want_rate and rate_layout == "subplot":
+    want_band = state_style == "band"
+    subplot_rate = want_rate and rate_layout == "subplot"
+
+    figure_height = figure_height_base + (STATE_BAND_FIGURE_EXTRA_H if want_band else 0.0)
+    left_rows = 1 + (1 if want_band else 0) + (1 if subplot_rate else 0)
+    left_height_ratios: list[float] = []
+    if want_band:
+        left_height_ratios.append(STATE_BAND_HEIGHT_RATIO)
+    left_height_ratios.append(MAIN_PLOT_HEIGHT_RATIO)
+    if subplot_rate:
+        left_height_ratios.append(RATE_PLOT_HEIGHT_RATIO)
+
+    if debug:
         fig = plt.figure(
-            figsize=(PLAIN_FIGURE_SIZE[0] + DEBUG_META_WIDTH, PLAIN_FIGURE_SIZE[1]),
+            figsize=(figure_width + DEBUG_META_WIDTH, figure_height),
             constrained_layout=True,
         )
         gs = fig.add_gridspec(
+            left_rows,
             2,
-            2,
-            width_ratios=[PLAIN_FIGURE_SIZE[0], DEBUG_META_WIDTH],
-            height_ratios=[3.8, 1.15],
+            width_ratios=[figure_width, DEBUG_META_WIDTH],
+            height_ratios=left_height_ratios,
         )
-        ax = fig.add_subplot(gs[0, 0])
-        rate_ax = fig.add_subplot(gs[1, 0], sharex=ax)
+        main_row = 1 if want_band else 0
+        ax = fig.add_subplot(gs[main_row, 0])
+        band_ax = fig.add_subplot(gs[0, 0], sharex=ax) if want_band else None
+        rate_ax = fig.add_subplot(gs[main_row + 1, 0], sharex=ax) if subplot_rate else None
         meta_ax = fig.add_subplot(gs[:, 1])
         meta_ax.axis("off")
-        return fig, ax, rate_ax, meta_ax
-    if debug:
-        fig, (ax, meta_ax) = plt.subplots(
-            ncols=2,
-            figsize=(PLAIN_FIGURE_SIZE[0] + DEBUG_META_WIDTH, PLAIN_FIGURE_SIZE[1]),
-            gridspec_kw={"width_ratios": [PLAIN_FIGURE_SIZE[0], DEBUG_META_WIDTH]},
-            constrained_layout=True,
-        )
-        meta_ax.axis("off")
         if want_rate and rate_layout == "overlay":
-            rate_ax = ax.twinx()
-            return fig, ax, rate_ax, meta_ax
-        return fig, ax, None, meta_ax
-    if want_rate and rate_layout == "subplot":
-        fig = plt.figure(figsize=PLAIN_FIGURE_SIZE, constrained_layout=True)
-        gs = fig.add_gridspec(2, 1, height_ratios=[3.8, 1.15])
-        ax = fig.add_subplot(gs[0, 0])
-        rate_ax = fig.add_subplot(gs[1, 0], sharex=ax)
-        return fig, ax, rate_ax, None
+            return fig, band_ax, ax, ax.twinx(), meta_ax
+        return fig, band_ax, ax, rate_ax, meta_ax
+
+    fig = plt.figure(figsize=(figure_width, figure_height), constrained_layout=True)
+    gs = fig.add_gridspec(left_rows, 1, height_ratios=left_height_ratios)
+    main_row = 1 if want_band else 0
+    ax = fig.add_subplot(gs[main_row, 0])
+    band_ax = fig.add_subplot(gs[0, 0], sharex=ax) if want_band else None
+    if subplot_rate:
+        rate_ax = fig.add_subplot(gs[main_row + 1, 0], sharex=ax)
+        return fig, band_ax, ax, rate_ax, None
     if want_rate and rate_layout == "overlay":
-        fig, ax = plt.subplots(figsize=PLAIN_FIGURE_SIZE, constrained_layout=True)
-        rate_ax = ax.twinx()
-        return fig, ax, rate_ax, None
-    fig, ax = plt.subplots(figsize=PLAIN_FIGURE_SIZE, constrained_layout=True)
-    return fig, ax, None, None
+        return fig, band_ax, ax, ax.twinx(), None
+    return fig, band_ax, ax, None, None
 
 
 def _plot_rate_panel(
@@ -675,11 +823,13 @@ def _plot_rate_panel(
     *,
     show_rate: str,
     overlay: bool,
-) -> None:
+) -> tuple[list[Any], list[str]]:
     plotted_any = False
+    handles: list[Any] = []
+    labels: list[str] = []
     if show_rate in {"both"}:
         if any(value is not None for value in raw_rate):
-            rate_ax.plot(
+            (line_raw,) = rate_ax.plot(
                 x_samples,
                 raw_rate,
                 color=LINE_RATE_RAW,
@@ -688,39 +838,37 @@ def _plot_rate_panel(
                 zorder=6 if overlay else 2,
                 alpha=0.85 if overlay else 1.0,
             )
+            handles.append(line_raw)
+            labels.append("Rohrate [g/s]")
             plotted_any = True
     if show_rate in {"filtered", "both"}:
         if any(value is not None for value in filtered_rate):
-            rate_ax.plot(
+            filtered_label = "Gefilterte Füllrate [g/s]" if show_rate == "both" else "Füllrate [g/s]"
+            (line_filtered,) = rate_ax.plot(
                 x_samples,
                 filtered_rate,
                 color=LINE_RATE_FILTERED,
                 linewidth=1.2 if overlay else 1.6,
-                label="Gefilterte Rate [g/s]",
+                label=filtered_label,
                 zorder=7 if overlay else 3,
                 alpha=0.9 if overlay else 1.0,
             )
+            handles.append(line_filtered)
+            labels.append(filtered_label)
             plotted_any = True
     if overlay:
         rate_ax.set_ylabel(RATE_AXIS_LABEL, color=LINE_RATE_FILTERED)
     else:
         rate_ax.set_ylabel(RATE_AXIS_LABEL)
     if not overlay:
-        rate_ax.set_xlabel("Zeit relativ zum Füllbeginn [s]")
+        rate_ax.set_xlabel("Zeit relativ zum Füllbeginn [s]", labelpad=10)
         rate_ax.grid(True, axis="both", color="#cbd5e1", linewidth=0.6, alpha=0.55)
         rate_ax.set_axisbelow(True)
     else:
         rate_ax.spines["right"].set_position(("axes", 1.10))
         rate_ax.tick_params(axis="y", colors=LINE_RATE_FILTERED, labelsize=9)
         rate_ax.spines["right"].set_color(LINE_RATE_FILTERED)
-    if plotted_any and not overlay:
-        rate_ax.legend(
-            frameon=False,
-            loc="upper right",
-            ncol=2 if not overlay else 1,
-            borderaxespad=0.2,
-        )
-    else:
+    if not plotted_any:
         rate_ax.text(
             0.5,
             0.5,
@@ -731,6 +879,7 @@ def _plot_rate_panel(
             fontsize=8.5,
             color="#64748b",
         )
+    return handles, labels
 
 
 def _render_fill_variant(
@@ -745,6 +894,8 @@ def _render_fill_variant(
     state_style: str,
     show_rate: str,
     rate_layout: str,
+    figure_profile: str,
+    output_name: str,
 ) -> list[Path]:
     samples = _sample_events(records)
     if not samples:
@@ -756,14 +907,20 @@ def _render_fill_variant(
     x_samples, y_fill_mass, y_gate, raw_rate, filtered_rate, base_weight_g = _series_from_samples(fill_run, samples)
 
     _figure_style()
-    fig, ax, rate_ax, meta_ax = _create_figure_axes(debug=debug, show_rate=show_rate, rate_layout=rate_layout)
+    fig, band_ax, ax, rate_ax, meta_ax = _create_figure_axes(
+        debug=debug,
+        show_rate=show_rate,
+        rate_layout=rate_layout,
+        state_style=state_style,
+        figure_profile=figure_profile,
+    )
     ax2 = ax.twinx()
     overlay_rate = rate_ax is not None and show_rate != "none" and rate_layout == "overlay"
 
     if state_style == "background":
         _plot_state_background(ax, fill_run, states, show_labels=False)
     elif state_style == "band":
-        _plot_state_band(ax, fill_run, states)
+        _plot_state_band(band_ax, fill_run, states)
     if debug:
         _annotate_state_badges(ax, fill_run, states)
 
@@ -808,18 +965,19 @@ def _render_fill_variant(
     _annotate_gate_events(ax2, fill_run, gates, samples)
     _annotate_faults(ax, fill_run, faults)
 
-    if rate_ax is None or overlay_rate:
-        ax.set_xlabel("Zeit relativ zum Füllbeginn [s]")
-    else:
-        ax.tick_params(labelbottom=False)
+    ax.set_xlabel("" if (rate_ax is not None and not overlay_rate) else "Zeit relativ zum Füllbeginn [s]")
+    ax.tick_params(labelbottom=True)
     ax.set_ylabel("Füllmasse [g]")
     ax2.set_ylabel("Klappenstellung [%]")
-    ax2.set_ylim(-2, 102)
+    ax2.set_ylim(-2, 112)
+    ax2.set_yticks([0, 20, 40, 60, 80, 100])
     ax.grid(True, axis="both", color="#cbd5e1", linewidth=0.7, alpha=0.65)
     ax.set_axisbelow(True)
 
+    handles3: list[Any] = []
+    labels3: list[str] = []
     if rate_ax is not None:
-        _plot_rate_panel(
+        handles3, labels3 = _plot_rate_panel(
             rate_ax,
             x_samples,
             raw_rate,
@@ -827,45 +985,63 @@ def _render_fill_variant(
             show_rate=show_rate,
             overlay=overlay_rate,
         )
+        if not overlay_rate:
+            rate_ax.tick_params(labelbottom=True)
 
     handles1, labels1 = ax.get_legend_handles_labels()
     handles2, labels2 = ax2.get_legend_handles_labels()
-    handles3: list[Any] = []
-    labels3: list[str] = []
-    if overlay_rate:
-        handles3, labels3 = rate_ax.get_legend_handles_labels()
+    legend_count = len(handles1) + len(handles2) + len(handles3)
+    outside_legend_cols = max(1, legend_count)
+    if figure_profile == "narrow" and not overlay_rate:
+        outside_legend_cols = min(3, outside_legend_cols)
     legend_kwargs = {
         "handles": handles1 + handles2 + handles3,
         "labels": labels1 + labels2 + labels3,
         "frameon": False,
-        "ncol": 3,
+        "ncol": outside_legend_cols if legend_placement == "outside" else 1,
         "borderaxespad": 0.0,
     }
     if legend_placement == "inside":
         legend_kwargs.update(
             {
                 "loc": "upper left",
-                "bbox_to_anchor": (0.015, 0.905 if state_style == "band" else 0.985),
+                "bbox_to_anchor": (0.015, 0.985),
             }
         )
+        ax.legend(**legend_kwargs)
+        if rate_ax is not None and not overlay_rate and handles3:
+            rate_ax.legend(
+                handles=handles3,
+                labels=labels3,
+                frameon=False,
+                loc="upper right",
+                ncol=1,
+                borderaxespad=0.2,
+            )
     else:
+        legend_y = -0.16 if overlay_rate else -0.54
+        if not overlay_rate and figure_profile == "narrow":
+            legend_y = -0.62
+        if not overlay_rate and debug:
+            legend_y -= 0.10
         legend_kwargs.update(
             {
                 "loc": "upper center",
-                "bbox_to_anchor": (0.5, -0.14 if not overlay_rate else -0.16),
+                "bbox_to_anchor": (0.5, legend_y),
             }
         )
-    ax.legend(**legend_kwargs)
+        legend_target = rate_ax if (rate_ax is not None and not overlay_rate) else ax
+        legend_target.legend(**legend_kwargs)
 
     if debug and meta_ax is not None:
         _draw_debug_metadata(meta_ax, session_dir, fill_run, base_weight_g, records)
 
     exported: list[Path] = []
     output_dir.mkdir(parents=True, exist_ok=True)
-    stem = output_dir / f"fill_{fill_run.fill_id:04d}_{'debug' if debug else 'plain'}"
+    stem = output_dir / f"{_output_stem_base(session_dir, fill_run)}__{output_name}"
     for fmt in formats:
-        out_path = stem.with_suffix(f".{fmt}")
-        fig.savefig(out_path, dpi=180 if fmt == "png" else None, bbox_inches="tight")
+        out_path = stem.parent / f"{stem.name}.{fmt}"
+        fig.savefig(out_path, dpi=180 if fmt == "png" else None)
         exported.append(out_path)
     plt.close(fig)
     return exported
@@ -881,6 +1057,8 @@ def _plot_fill(
     state_style: str,
     show_rate: str,
     rate_layout: str,
+    figure_profile: str,
+    plain_both_profiles: bool,
 ) -> list[Path]:
     exported = _render_fill_variant(
         session_dir,
@@ -893,21 +1071,30 @@ def _plot_fill(
         state_style=state_style,
         show_rate=show_rate,
         rate_layout=rate_layout,
+        figure_profile=figure_profile,
+        output_name="debug",
     )
-    exported.extend(
-        _render_fill_variant(
-            session_dir,
-            fill_run,
-            records,
-            output_dir,
-            formats,
-            debug=False,
-            legend_placement=legend_placement,
-            state_style=state_style,
-            show_rate=show_rate,
-            rate_layout=rate_layout,
+    plain_profiles = ["default", "narrow"] if plain_both_profiles else [figure_profile]
+    for plain_profile in plain_profiles:
+        output_name = "plain"
+        if plain_both_profiles:
+            output_name = f"plain_{_plain_profile_suffix(plain_profile)}"
+        exported.extend(
+            _render_fill_variant(
+                session_dir,
+                fill_run,
+                records,
+                output_dir,
+                formats,
+                debug=False,
+                legend_placement=legend_placement,
+                state_style=state_style,
+                show_rate=show_rate,
+                rate_layout=rate_layout,
+                figure_profile=plain_profile,
+                output_name=output_name,
+            )
         )
-    )
     return exported
 
 
@@ -924,6 +1111,18 @@ def main() -> int:
         "--output-dir",
         type=Path,
         help="Figure output folder (default: <session>/figures)",
+    )
+    parser.add_argument(
+        "--clear-output",
+        dest="clear_output",
+        action="store_true",
+        help="Clear the figure output folder before exporting charts (default)",
+    )
+    parser.add_argument(
+        "--keep-output",
+        dest="clear_output",
+        action="store_false",
+        help="Keep existing figure files in the output folder",
     )
     parser.add_argument(
         "--pre-ms",
@@ -975,6 +1174,18 @@ def main() -> int:
         default="subplot",
         help="Draw rate telemetry in a dedicated subplot or overlaid with a separate right axis",
     )
+    parser.add_argument(
+        "--figure-profile",
+        choices=sorted(FIGURE_PROFILES.keys()),
+        default="default",
+        help="Use the normal thesis chart size or a narrower 16:10 variant for side-by-side placement",
+    )
+    parser.add_argument(
+        "--plain-both-profiles",
+        action="store_true",
+        help="Export the plain chart in both wide and narrow variants with suffixed filenames; debug is exported once",
+    )
+    parser.set_defaults(clear_output=True)
     args = parser.parse_args()
 
     session_dir, fill_runs, fill_records = _load_input(
@@ -998,6 +1209,10 @@ def main() -> int:
 
     output_dir = args.output_dir.resolve() if args.output_dir else session_dir / "figures"
     formats = args.format or ["pdf"]
+    cleared_output = False
+    if args.clear_output and output_dir.exists():
+        shutil.rmtree(output_dir)
+        cleared_output = True
     exported: list[Path] = []
     for fill_run in selected_fills:
         exported.extend(
@@ -1011,17 +1226,22 @@ def main() -> int:
                 state_style=args.state_style,
                 show_rate=args.show_rate,
                 rate_layout=args.rate_layout,
+                figure_profile=args.figure_profile,
+                plain_both_profiles=args.plain_both_profiles,
             )
         )
 
     print(f"Session:  {session_dir}")
     print(f"Output:   {output_dir}")
+    print(f"Cleared:  {'yes' if cleared_output else 'no'}")
     print(f"Formats:  {', '.join(formats)}")
     print(f"Plotted:  {len(selected_fills)} fill runs")
     print("Variants: debug, plain")
     print(f"Legend:   {args.legend_placement}")
     print(f"Rate:     {args.show_rate}")
     print(f"Layout:   {args.rate_layout}")
+    print(f"Profile:  {args.figure_profile}")
+    print(f"Plain:    {'wide+narrow' if args.plain_both_profiles else args.figure_profile}")
     print()
     for fill_run in selected_fills:
         print(format_fill_brief(fill_run))
