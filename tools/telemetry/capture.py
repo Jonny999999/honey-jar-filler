@@ -50,6 +50,9 @@ HELP_TITLE = "\x1b[38;5;230m"
 HELP_LABEL = "\x1b[38;5;153m"
 HELP_VALUE = "\x1b[38;5;120m"
 HELP_DIM = "\x1b[38;5;250m"
+LIVE_STATUS_HEADER_LINES = 3
+WEIGHT_PLOT_HEIGHT = 8
+LIVE_STATUS_LINE_COUNT = LIVE_STATUS_HEADER_LINES + WEIGHT_PLOT_HEIGHT
 
 
 @dataclass
@@ -435,7 +438,7 @@ def colorize_console_line(line: str, enabled: bool) -> str:
 
 def write_console_line(line: str, *, status_line_enabled: bool, colorize_logs: bool) -> None:
     if status_line_enabled:
-        clear_status_lines(True, 8)
+        clear_status_lines(True, LIVE_STATUS_LINE_COUNT)
     sys.stdout.write(colorize_console_line(line, colorize_logs))
     sys.stdout.flush()
 
@@ -525,7 +528,7 @@ def main() -> int:
     pending_bytes = bytearray()
     live = LiveStatus()
     weight_history: deque[float] = deque(maxlen=180)
-    status_line_count = 8
+    status_line_count = LIVE_STATUS_LINE_COUNT
     started_at = time.monotonic()
     interrupted = False
 
@@ -539,7 +542,7 @@ def main() -> int:
         active = f"run={current_run.run_id}" if current_run is not None else "run=idle"
         term_width = shutil.get_terminal_size((120, 24)).columns
         plot_width = max(24, min(108, term_width - 5))
-        plot_lines = build_weight_plot(weight_history, plot_width, 5, 0.0, 500.0)
+        plot_lines = build_weight_plot(weight_history, plot_width, WEIGHT_PLOT_HEIGHT, 0.0, 500.0)
         clear_status_lines(True, status_line_count)
         print_status_block(
             True,
@@ -698,9 +701,9 @@ def main() -> int:
             status.target_g = float(target_g)
         if isinstance(weight_g, (int, float)):
             status.weight_g = float(weight_g)
-            history.append(status.weight_g)
         if isinstance(rel_g, (int, float)):
             status.relative_fill_g = float(rel_g)
+            history.append(status.relative_fill_g)
         if isinstance(gate_pct, (int, float)):
             status.gate_pct = float(gate_pct)
         if isinstance(ts_us, int):

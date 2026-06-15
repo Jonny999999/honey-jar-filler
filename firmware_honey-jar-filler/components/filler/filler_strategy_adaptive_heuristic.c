@@ -40,15 +40,18 @@
 #define RESPONSE_THRESHOLD_MIN_G 1.5f
 #define RESPONSE_THRESHOLD_MAX_G 6.0f
 #define DEAD_TIME_MIN_S 0.10f
-#define DEAD_TIME_MAX_S 3.00f
-#define NO_RESPONSE_MIN_S 1.20f
-#define NO_RESPONSE_MAX_S 6.00f
+#define DEAD_TIME_MAX_S 10.00f
+#define NO_RESPONSE_MIN_S 7.00f
+#define NO_RESPONSE_MAX_S 12.00f
+#define NO_RESPONSE_DEAD_TIME_MULT 4.0f
+#define NO_RESPONSE_EXTRA_S 1.5f
 
 // Adaptive threshold shaping:
 // CLOSE_BUFFER_G keeps closing slightly conservative, REFILL_RELAX_STEP_G makes
 // the next refill attempt less conservative after an underfill.
 #define CLOSE_BUFFER_G 1.5f
 #define REFILL_RELAX_STEP_G 2.5f
+#define REFILL_MIN_OPEN_MS 1000.0f
 
 // Safety limits:
 // Hard overfill margin faults instead of trying to recover. Safe-rate limits
@@ -332,6 +335,15 @@ static float near_close_transition_mass_g(const filler_strategy_runtime_t *rt)
     return rt->learned_dead_time_s * transition_fast_rate_gps(rt);
 }
 
+static float adaptive_no_response_limit_s(const filler_strategy_runtime_t *rt)
+{
+    float learned_dead_time_s = rt ? rt->learned_dead_time_s : 0.0f;
+    return clampf_local(fmaxf(learned_dead_time_s * NO_RESPONSE_DEAD_TIME_MULT,
+                              learned_dead_time_s + NO_RESPONSE_EXTRA_S),
+                        NO_RESPONSE_MIN_S,
+                        NO_RESPONSE_MAX_S);
+}
+
 static void publish_runtime_snapshot(filler_strategy_runtime_t *rt, const filler_strategy_env_t *env, const filler_strategy_tick_t *tick)
 {
     if (!rt || !env || !env->set_sample_telemetry || !tick) return;
@@ -570,7 +582,7 @@ static void adaptive_on_enter(filler_strategy_runtime_t *rt,
             log_learned_entry("starting adaptive fill with", tick->preset_index, entry);
         } else {
             rt->refill_count++;
-            rt->close_early_relax_g += REFILL_RELAX_STEP_G;
+            rt->fill_open_ts_us = tick->now_us;
             rt->first_close_seen = false;
             rt->rel_at_first_close_g = 0.0f;
             rt->measured_post_close_gain_g = 0.0f;
@@ -582,6 +594,7 @@ static void adaptive_on_enter(filler_strategy_runtime_t *rt,
                      (unsigned)rt->refill_count,
                      (double)rt->close_early_relax_g);
         }
+        rt->fill_eval_after_ts_us = (tick->latest && tick->latest->ts_us != 0) ? tick->latest->ts_us : tick->now_us;
 
         rt->last_rate_ts_us = 0;
         rt->last_rel_g = 0.0f;
@@ -593,14 +606,16 @@ static void adaptive_on_enter(filler_strategy_runtime_t *rt,
         rt->learned_slow_rate_gps = entry->slow_rate_gps;
         update_adapted_thresholds(rt, tick);
         ESP_LOGI(TAG,
-                 "adaptive thresholds near_close=%.1f g close_early=%.1f g close_post=%.1f g near_transition=%.1f g drip_wait=%.0f ms gate_fast=%u%% gate_reduced=%u%%",
+                 "adaptive thresholds near_close=%.1f g close_early=%.1f g close_post=%.1f g near_transition=%.1f g drip_wait=%.0f ms gate_fast=%u%% gate_reduced=%u%% no_response_limit=%.2f s response_threshold=%.1f g",
                  (double)rt->adapted_near_close_g,
                  (double)rt->adapted_close_early_g,
                  (double)rt->predicted_remaining_g,
                  (double)near_close_transition_mass_g(rt),
                  (double)rt->adapted_drip_wait_ms,
                  (unsigned)tick->params->max_gate_pct,
-                 (unsigned)tick->params->near_close_gate_pct);
+                 (unsigned)tick->params->near_close_gate_pct,
+                 (double)adaptive_no_response_limit_s(rt),
+                 (double)response_threshold_g(tick));
         env->publish_fill_start(tick->run_id,
                                 tick->slot_idx,
                                 tick->strategy_name,
@@ -647,7 +662,11 @@ static filler_state_t adaptive_step(filler_strategy_runtime_t *rt,
         }
 
         float rel_g = tick->latest->grams - rt->run_base_weight_g;
-        update_rate_estimates(rt, tick);
+        bool sample_after_open = tick->new_sample && tick->latest->ts_us > rt->fill_eval_after_ts_us;
+        float open_elapsed_ms = (float)(tick->now_us - rt->fill_open_ts_us) / 1000.0f;
+        if (sample_after_open) {
+            update_rate_estimates(rt, tick);
+        }
         update_adapted_thresholds(rt, tick);
 
         // Hard stop against obvious mess scenarios: if the process is already
@@ -666,11 +685,15 @@ static filler_state_t adaptive_step(filler_strategy_runtime_t *rt,
             return FILLER_FAULT;
         }
 
-        float no_response_limit_s = clampf_local(fmaxf(rt->learned_dead_time_s * 2.5f, rt->learned_dead_time_s + 0.8f),
-                                                 NO_RESPONSE_MIN_S,
-                                                 NO_RESPONSE_MAX_S);
+        float no_response_limit_s = adaptive_no_response_limit_s(rt);
         if (!rt->response_detected && ((tick->now_us - rt->fill_open_ts_us) / 1000000.0f) > no_response_limit_s) {
-            ESP_LOGE(TAG, "no weight response after opening");
+            ESP_LOGE(TAG,
+                     "no weight response after opening elapsed=%.2f s limit=%.2f s rel=%.1f g threshold=%.1f g learned_dead_time=%.2f s",
+                     (double)((tick->now_us - rt->fill_open_ts_us) / 1000000.0f),
+                     (double)no_response_limit_s,
+                     (double)rel_g,
+                     (double)response_threshold_g(tick),
+                     (double)rt->learned_dead_time_s);
             env->gate_close_label("no_response");
             env->set_fault(FLT_EMPTY_HONEY);
             publish_runtime_snapshot(rt, env, tick);
@@ -697,7 +720,13 @@ static filler_state_t adaptive_step(filler_strategy_runtime_t *rt,
             return state;
         }
 
-        if (!tick->new_sample) {
+        if (!sample_after_open) {
+            publish_runtime_snapshot(rt, env, tick);
+            return state;
+        }
+
+        if (rt->refill_count > 0 && open_elapsed_ms < REFILL_MIN_OPEN_MS) {
+            env->gate_set_percent_label(tick->params->max_gate_pct, "refill_hold_open");
             publish_runtime_snapshot(rt, env, tick);
             return state;
         }
@@ -793,6 +822,9 @@ static filler_state_t adaptive_step(filler_strategy_runtime_t *rt,
             ESP_LOGI(TAG, "adaptive underweight: rel=%.1f g (-%.1f g) -> refill",
                      (double)rel_g, (double)under);
             rt->close_early_relax_g += REFILL_RELAX_STEP_G;
+            ESP_LOGI(TAG, "relax close_early by %.1f g -> total_relax=%.1f g",
+                     (double)REFILL_RELAX_STEP_G,
+                     (double)rt->close_early_relax_g);
             publish_runtime_snapshot(rt, env, tick);
             return FILLER_FILL;
         }

@@ -27,6 +27,7 @@ typedef struct {
     uint8_t active_preset_index;
     uint8_t refill_count;
     int64_t fill_open_ts_us;
+    int64_t fill_eval_after_ts_us;
     int64_t first_response_ts_us;
     int64_t first_close_ts_us;
     int64_t last_rate_ts_us;
