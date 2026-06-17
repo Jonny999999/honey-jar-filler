@@ -241,11 +241,15 @@ def build_fill_runs(
     }
 
     fill_runs: list[FillRun] = []
+    next_start_index_allowed = 0
     for index, record in enumerate(records):
+        if index < next_start_index_allowed:
+            continue
         if record_kind(record) != "state" or record_text(record) != FILL_STATE:
             continue
         focus_start_us = timestamps[index]
-        focus_end_us, end_reason, stop_index = _find_fill_end(records, timestamps, index)
+        focus_end_us, end_reason, stop_index = _find_fill_end(records, timestamps, index, record)
+        next_start_index_allowed = stop_index + 1
         next_fill_ts = _find_next_fill_start(records, timestamps, stop_index + 1)
         next_foreign_sample_ts = _find_next_foreign_slot_sample(
             records,
@@ -416,14 +420,37 @@ def _find_fill_end(
     records: list[dict[str, Any]],
     timestamps: list[int],
     start_index: int,
+    start_record: dict[str, Any],
 ) -> tuple[int, str, int]:
+    run_id = int(start_record.get("run_id", 0))
+    slot_idx = int(start_record.get("slot_idx", -1))
     for index in range(start_index + 1, len(records)):
         record = records[index]
         kind = record_kind(record)
+        if kind == "fill_summary":
+            if int(record.get("run_id", 0)) != run_id:
+                continue
+            if int(record.get("slot_idx", -1)) != slot_idx:
+                continue
+            result = record_text(record) or "fill_summary"
+            return timestamps[index], f"fill_summary:{result}", index
+        if kind == "fault":
+            if int(record.get("run_id", 0)) != run_id:
+                continue
+            if int(record.get("slot_idx", slot_idx)) != slot_idx:
+                continue
+            reason = record_text(record) or "fault"
+            return timestamps[index], f"fault:{reason}", index
         if kind == "state":
             state_name = record_text(record)
+            if int(record.get("run_id", run_id)) != run_id:
+                continue
+            if int(record.get("slot_idx", slot_idx)) != slot_idx:
+                continue
             if state_name == FILL_STATE:
-                return timestamps[index], "next_fill", index
+                continue
+            if state_name == "FAULT":
+                return timestamps[index], "state:FAULT", index
             if state_name in STOP_STATES:
                 return timestamps[index], f"state:{state_name}", index
         if kind == "run_end":

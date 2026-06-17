@@ -22,6 +22,7 @@ typedef enum {
     TELEMETRY_KIND_RUN_START,
     TELEMETRY_KIND_RUN_END,
     TELEMETRY_KIND_FILL_START,
+    TELEMETRY_KIND_FILL_SUMMARY,
     TELEMETRY_KIND_RUN_SUMMARY,
     TELEMETRY_KIND_STATE,
     TELEMETRY_KIND_FAULT,
@@ -37,11 +38,32 @@ typedef struct {
     uint32_t state;
     uint32_t preset_index;
     uint32_t target_g;
+    uint32_t refill_count;
     uint32_t scale_period_ms_cfg;
     uint32_t fsm_period_ms_cfg;
     float weight_g;
     float relative_fill_g;
     float gate_pct;
+    float rate_raw_gps;
+    float rate_filtered_gps;
+    float target_rate_gps;
+    float rate_error_gps;
+    float predicted_remaining_g;
+    float measured_dead_time_s;
+    float rate_at_close_gps;
+    float fill_duration_s;
+    float learned_dead_time_s;
+    float learned_post_close_gain_g;
+    float learned_fast_rate_gps;
+    float learned_slow_rate_gps;
+    float adapted_near_close_g;
+    float adapted_close_early_g;
+    float adapted_drip_wait_ms;
+    float next_drip_wait_ms;
+    float fill_error_g;
+    float measured_post_close_gain_g;
+    float measured_fast_rate_gps;
+    float measured_slow_rate_gps;
     char preset_name[TELEMETRY_NAME_MAX];
     char strategy_name[TELEMETRY_NAME_MAX];
     app_params_t params;

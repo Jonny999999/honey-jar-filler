@@ -13,6 +13,7 @@ extern "C" {
 typedef enum {
     UI_MENU_VIEW_HOME = 0,
     UI_MENU_VIEW_PRESET_LIST,
+    UI_MENU_VIEW_STRATEGY_LIST,
     UI_MENU_VIEW_PARAM_LIST,
     UI_MENU_VIEW_PARAM_EDIT,
 } ui_menu_view_t;

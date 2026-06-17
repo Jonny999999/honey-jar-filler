@@ -14,11 +14,14 @@
 #define NVS_KEY_LEGACY_PARAMS "params_v1"
 #define NVS_KEY_MACHINE       "machine_v1"
 #define NVS_KEY_PRESETS       "presets_v1"
+#define NVS_KEY_STRATEGY      "strategy_v1"
 
 #define APP_MACHINE_STORE_VERSION 1u
 #define APP_PRESET_STORE_VERSION  1u
+#define APP_STRATEGY_STORE_VERSION 1u
 #define APP_PRESET_DEFAULT_ACTIVE 1u
 #define APP_PRESET_TEST_INDEX     3u
+#define APP_FILL_STRATEGY_DEFAULT APP_FILL_STRATEGY_HEURISTIC
 
 typedef struct {
     uint16_t version;
@@ -34,11 +37,17 @@ typedef struct {
     app_params_t presets[APP_PRESET_COUNT];
 } app_preset_store_t;
 
+typedef struct {
+    uint16_t version;
+    uint8_t active_strategy;
+} app_strategy_store_t;
+
 static SemaphoreHandle_t s_params_mtx;
 static app_params_t s_params;
 static bool s_params_dirty;
 static app_machine_store_t s_machine_store;
 static app_preset_store_t s_preset_store;
+static app_strategy_store_t s_strategy_store;
 static const char *TAG = "app_params";
 
 static app_params_t app_preset_defaults(uint8_t index);
@@ -50,6 +59,13 @@ static const char *k_preset_names[APP_PRESET_COUNT] = {
     "Medium viscosity",
     "Low viscosity",
     "Testing",
+};
+
+static const char *k_strategy_names[APP_FILL_STRATEGY_COUNT] = {
+    "heuristic",
+    "adaptive-heuristic",
+    "flow-control",
+    "manual",
 };
 
 // Centralized defaults for runtime parameters.
@@ -218,6 +234,15 @@ static void app_preset_store_apply_defaults(app_preset_store_t *store)
     }
 }
 
+static void app_strategy_store_apply_defaults(app_strategy_store_t *store)
+{
+    if (!store) return;
+    *store = (app_strategy_store_t){
+        .version = APP_STRATEGY_STORE_VERSION,
+        .active_strategy = APP_FILL_STRATEGY_DEFAULT,
+    };
+}
+
 static bool app_machine_store_valid(const app_machine_store_t *store)
 {
     return store &&
@@ -240,6 +265,13 @@ static bool app_preset_store_valid(const app_preset_store_t *store)
         if (!app_params_blob_valid(&store->presets[i])) return false;
     }
     return true;
+}
+
+static bool app_strategy_store_valid(const app_strategy_store_t *store)
+{
+    return store &&
+           store->version == APP_STRATEGY_STORE_VERSION &&
+           store->active_strategy < APP_FILL_STRATEGY_COUNT;
 }
 
 static esp_err_t app_machine_store_load(app_machine_store_t *out)
@@ -274,6 +306,22 @@ static esp_err_t app_preset_store_load(app_preset_store_t *out)
     return ESP_OK;
 }
 
+static esp_err_t app_strategy_store_load(app_strategy_store_t *out)
+{
+    if (!out) return ESP_ERR_INVALID_ARG;
+
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READONLY, &h);
+    if (err != ESP_OK) return err;
+
+    size_t len = sizeof(*out);
+    err = nvs_get_blob(h, NVS_KEY_STRATEGY, out, &len);
+    nvs_close(h);
+    if (err != ESP_OK) return err;
+    if (len != sizeof(*out) || !app_strategy_store_valid(out)) return ESP_ERR_INVALID_RESPONSE;
+    return ESP_OK;
+}
+
 static esp_err_t app_machine_store_save_locked(void)
 {
     nvs_handle_t h;
@@ -298,11 +346,25 @@ static esp_err_t app_preset_store_save_locked(void)
     return err;
 }
 
+static esp_err_t app_strategy_store_save_locked(void)
+{
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &h);
+    if (err != ESP_OK) return err;
+
+    err = nvs_set_blob(h, NVS_KEY_STRATEGY, &s_strategy_store, sizeof(s_strategy_store));
+    if (err == ESP_OK) err = nvs_commit(h);
+    nvs_close(h);
+    return err;
+}
+
 static esp_err_t app_store_save_all_locked(void)
 {
     esp_err_t err = app_machine_store_save_locked();
     if (err != ESP_OK) return err;
-    return app_preset_store_save_locked();
+    err = app_preset_store_save_locked();
+    if (err != ESP_OK) return err;
+    return app_strategy_store_save_locked();
 }
 
 static void app_sync_stores_from_runtime_locked(void)
@@ -384,12 +446,14 @@ void app_params_init(void)
 
     app_machine_store_apply_defaults(&s_machine_store);
     app_preset_store_apply_defaults(&s_preset_store);
+    app_strategy_store_apply_defaults(&s_strategy_store);
     app_rebuild_runtime_locked();
     s_params_dirty = false;
 
     bool need_save = false;
     bool machine_loaded = false;
     bool presets_loaded = false;
+    bool strategy_loaded = false;
 
     app_machine_store_t machine_loaded_tmp = {0};
     if (app_machine_store_load(&machine_loaded_tmp) == ESP_OK) {
@@ -407,7 +471,15 @@ void app_params_init(void)
         need_save = true;
     }
 
-    if (!machine_loaded && !presets_loaded) {
+    app_strategy_store_t strategy_loaded_tmp = {0};
+    if (app_strategy_store_load(&strategy_loaded_tmp) == ESP_OK) {
+        s_strategy_store = strategy_loaded_tmp;
+        strategy_loaded = true;
+    } else {
+        need_save = true;
+    }
+
+    if (!machine_loaded && !presets_loaded && !strategy_loaded) {
         if (app_try_migrate_legacy_locked()) {
             need_save = false;
         }
@@ -428,6 +500,9 @@ void app_params_init(void)
     ESP_LOGI(TAG, "active preset: %u '%s'",
              (unsigned)s_preset_store.active_index,
              app_presets_get_name(s_preset_store.active_index));
+    ESP_LOGI(TAG, "active strategy: %u '%s'",
+             (unsigned)s_strategy_store.active_strategy,
+             app_fill_strategy_get_name((app_fill_strategy_t)s_strategy_store.active_strategy));
     app_params_log_all(&s_params, &effective_defaults);
 
     xSemaphoreGive(s_params_mtx);
@@ -570,6 +645,48 @@ esp_err_t app_presets_select(uint8_t index)
         ESP_LOGI(TAG, "preset selected: %u '%s'", (unsigned)index, app_presets_get_name(index));
     } else {
         ESP_LOGW(TAG, "preset select save failed: %s", esp_err_to_name(err));
+    }
+    xSemaphoreGive(s_params_mtx);
+    return err;
+}
+
+size_t app_fill_strategy_count(void)
+{
+    return APP_FILL_STRATEGY_COUNT;
+}
+
+app_fill_strategy_t app_fill_strategy_get_active(void)
+{
+    app_fill_strategy_t strategy = APP_FILL_STRATEGY_DEFAULT;
+    if (!s_params_mtx) return strategy;
+
+    if (xSemaphoreTake(s_params_mtx, portMAX_DELAY) != pdPASS) return strategy;
+    if (s_strategy_store.active_strategy < APP_FILL_STRATEGY_COUNT) {
+        strategy = (app_fill_strategy_t)s_strategy_store.active_strategy;
+    }
+    xSemaphoreGive(s_params_mtx);
+    return strategy;
+}
+
+const char *app_fill_strategy_get_name(app_fill_strategy_t strategy)
+{
+    if ((size_t)strategy >= APP_FILL_STRATEGY_COUNT) return "?";
+    return k_strategy_names[strategy];
+}
+
+esp_err_t app_fill_strategy_select(app_fill_strategy_t strategy)
+{
+    if ((size_t)strategy >= APP_FILL_STRATEGY_COUNT || !s_params_mtx) return ESP_ERR_INVALID_ARG;
+
+    if (xSemaphoreTake(s_params_mtx, portMAX_DELAY) != pdPASS) return ESP_ERR_TIMEOUT;
+    s_strategy_store.active_strategy = (uint8_t)strategy;
+    esp_err_t err = app_strategy_store_save_locked();
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "strategy selected: %u '%s'",
+                 (unsigned)strategy,
+                 app_fill_strategy_get_name(strategy));
+    } else {
+        ESP_LOGW(TAG, "strategy select save failed: %s", esp_err_to_name(err));
     }
     xSemaphoreGive(s_params_mtx);
     return err;

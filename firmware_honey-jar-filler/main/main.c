@@ -637,6 +637,8 @@ void app_main(void)
         ESP_ERROR_CHECK(nvs_flash_init());
     }
     // Default to warnings; bump specific components as needed.
+    // Strategy tags are raised explicitly so live dosing decisions and adaptive
+    // learning logs remain visible during tuning runs.
     esp_log_level_set("*", ESP_LOG_WARN);
     esp_log_level_set("main", ESP_LOG_INFO);
     esp_log_level_set("app_params", ESP_LOG_INFO);
@@ -649,6 +651,10 @@ void app_main(void)
     esp_log_level_set("encoder_consumer", ESP_LOG_WARN);
     esp_log_level_set("scale_consumer", ESP_LOG_WARN);
     esp_log_level_set("filler_fsm", ESP_LOG_DEBUG);
+    esp_log_level_set("fill_strategy", ESP_LOG_DEBUG);
+    esp_log_level_set("fill_adaptive", ESP_LOG_DEBUG);
+    esp_log_level_set("fill_flowctrl", ESP_LOG_DEBUG);
+    esp_log_level_set("fill_manual", ESP_LOG_DEBUG);
     esp_log_level_set("telemetry", ESP_LOG_INFO);
 
     // Load persistent app parameters (targets/timeouts).

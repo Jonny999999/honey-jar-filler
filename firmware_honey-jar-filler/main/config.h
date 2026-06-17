@@ -60,8 +60,8 @@
 #define CONFIG_HX711_SCK_GPIO       GPIO_NUM_13
 
 // sample interval / averaging - consider one readout takes ~90ms
-#define CONFIG_HX711_POLL_INTERVAL_MS 280 //note: INTERVAL > COUNT * 90ms
-#define CONFIG_HX711_AVG_SAMPLE_COUNT 3  //note: COUNT < INTERVAL / 90ms
+#define CONFIG_HX711_POLL_INTERVAL_MS 100 //note: INTERVAL > COUNT * 90ms
+#define CONFIG_HX711_AVG_SAMPLE_COUNT 1  //note: COUNT < INTERVAL / 90ms
 
 // Startup policy for development:
 // - REQUIRED keeps the real machine strict and fails startup on missing scale HW.

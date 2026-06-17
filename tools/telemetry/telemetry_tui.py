@@ -206,6 +206,15 @@ def print_command_preview(cmd: Sequence[str]) -> None:
     print()
 
 
+def print_batch_preview(jobs: Sequence[tuple[str, Sequence[str]]]) -> None:
+    print()
+    print(style("Batch commands to run", ANSI_BOLD, FG_TITLE))
+    for index, (label, cmd) in enumerate(jobs, start=1):
+        print(style(f"[{index}/{len(jobs)}] {label}", FG_LABEL))
+        print(style(shlex.join(cmd), FG_ACCENT))
+    print()
+
+
 def print_command_result(cmd: Sequence[str], returncode: int) -> None:
     print()
     print(style("-" * 78, FG_HINT))
@@ -232,14 +241,82 @@ def run_tool(cmd: Sequence[str]) -> int:
     return returncode
 
 
-def choose_session(output_root: Path, *, purpose: str) -> SessionInfo | None:
+def run_tool_batch(jobs: Sequence[tuple[str, Sequence[str]]]) -> int:
+    if not jobs:
+        print(style("Nothing to run.", FG_WARN))
+        wait_for_enter()
+        return 1
+
+    print_batch_preview(jobs)
+    if not prompt_yes_no("Run this batch now?", True):
+        print(style("Cancelled.", FG_WARN))
+        wait_for_enter()
+        return 1
+
+    results: list[tuple[str, int]] = []
+    print()
+    for index, (label, cmd) in enumerate(jobs, start=1):
+        print(style("=" * 78, FG_HINT))
+        print(style(f"Running {index}/{len(jobs)}: {label}", ANSI_BOLD, FG_TITLE))
+        print(style(shlex.join(cmd), FG_ACCENT))
+        print(style("-" * 78, FG_HINT))
+        returncode = subprocess.run(cmd, cwd=REPO_ROOT, check=False).returncode
+        results.append((label, returncode))
+        print(style(f"Exit code: {returncode}", FG_VALUE if returncode == 0 else FG_ERROR))
+        print()
+
+    failures = sum(1 for _, code in results if code != 0)
+    print(style("=" * 78, FG_HINT))
+    print(style("Batch finished", ANSI_BOLD, FG_TITLE))
+    print(f"{style('Jobs', FG_LABEL)}: {style(str(len(results)), FG_VALUE)}")
+    print(f"{style('Failures', FG_LABEL)}: {style(str(failures), FG_VALUE if failures == 0 else FG_ERROR)}")
+    for label, returncode in results:
+        color = FG_VALUE if returncode == 0 else FG_ERROR
+        print(f"  {style(label, FG_LABEL)}: {style(str(returncode), color)}")
+    print(style("=" * 78, FG_HINT))
+    wait_for_enter()
+    return 0 if failures == 0 else 1
+
+
+def _parse_selection_list(raw: str, *, max_index: int) -> list[int]:
+    selected: list[int] = []
+    seen: set[int] = set()
+    for part in raw.split(","):
+        item = part.strip()
+        if not item:
+            continue
+        if "-" in item:
+            start_text, end_text = item.split("-", 1)
+            start = int(start_text)
+            end = int(end_text)
+            if start > end:
+                start, end = end, start
+            for value in range(start, end + 1):
+                if value < 1 or value > max_index:
+                    raise ValueError("Choice out of range")
+                if value not in seen:
+                    selected.append(value)
+                    seen.add(value)
+            continue
+        value = int(item)
+        if value < 1 or value > max_index:
+            raise ValueError("Choice out of range")
+        if value not in seen:
+            selected.append(value)
+            seen.add(value)
+    return selected
+
+
+def choose_sessions(output_root: Path, *, purpose: str) -> list[SessionInfo]:
     sessions = discover_sessions(output_root)
     if not sessions:
         print(style(f"No telemetry sessions found in {output_root}", FG_WARN))
-        return None
+        return []
 
-    print(style(f"Select session for {purpose}", ANSI_BOLD, FG_TITLE))
-    for index, session in enumerate(sessions[:12], start=1):
+    visible_sessions = sessions[:20]
+    print(style(f"Select session(s) for {purpose}", ANSI_BOLD, FG_TITLE))
+    print(style("Use comma lists or ranges like 1,3,5-7. Use 'a' for all shown.", FG_HINT))
+    for index, session in enumerate(visible_sessions, start=1):
         parts = [session.name]
         if session.port:
             parts.append(f"port={session.port}")
@@ -248,25 +325,36 @@ def choose_session(output_root: Path, *, purpose: str) -> SessionInfo | None:
         if session.figure_count:
             parts.append(f"figures={session.figure_count}")
         print(f"  {style(str(index), FG_ACCENT)}. {' | '.join(parts)}")
-    print(f"  {style('m', FG_ACCENT)}. Enter a path manually")
+    print(f"  {style('a', FG_ACCENT)}. All listed sessions")
+    print(f"  {style('m', FG_ACCENT)}. Enter one or more paths manually")
     default_key = "1"
     while True:
         raw = prompt("Choice", default_key).lower()
+        if raw == "a":
+            return visible_sessions
         if raw == "m":
-            manual = Path(prompt("Absolute or relative session path")).expanduser()
-            candidate = (manual if manual.is_absolute() else REPO_ROOT / manual).resolve()
-            if (candidate / "telemetry.ndjson").exists():
-                return SessionInfo(candidate, None, None, None, None, None, 0)
-            print(style("That path is not a telemetry session folder.", FG_ERROR))
+            manual_raw = prompt("Absolute or relative session paths (comma-separated)")
+            selected_manual: list[SessionInfo] = []
+            valid = True
+            for part in manual_raw.split(","):
+                manual = Path(part.strip()).expanduser()
+                candidate = (manual if manual.is_absolute() else REPO_ROOT / manual).resolve()
+                if not (candidate / "telemetry.ndjson").exists():
+                    print(style(f"Not a telemetry session folder: {candidate}", FG_ERROR))
+                    valid = False
+                    break
+                selected_manual.append(SessionInfo(candidate, None, None, None, None, None, 0))
+            if valid and selected_manual:
+                return selected_manual
             continue
         try:
-            idx = int(raw)
+            selected_indexes = _parse_selection_list(raw, max_index=len(visible_sessions))
         except ValueError:
-            print(style("Enter a listed number or 'm'.", FG_ERROR))
+            print(style("Enter listed numbers, ranges like 2-4, 'a', or 'm'.", FG_ERROR))
             continue
-        if 1 <= idx <= min(len(sessions), 12):
-            return sessions[idx - 1]
-        print(style("Choice out of range.", FG_ERROR))
+        if selected_indexes:
+            return [visible_sessions[idx - 1] for idx in selected_indexes]
+        print(style("No valid selections given.", FG_ERROR))
 
 
 def choose_serial_port() -> str:
@@ -295,6 +383,20 @@ def parse_fill_selection(fill_count: int | None) -> str | None:
     if not fill_count:
         return None
     selection = prompt("Fill ids to plot (comma list or 'all')", "all").strip().lower()
+    if selection in {"", "all"}:
+        return None
+    return selection
+
+
+def parse_fill_selection_batch(sessions: Sequence[SessionInfo]) -> str | None:
+    known_counts = sorted({session.fill_count for session in sessions if session.fill_count is not None})
+    if len(sessions) == 1:
+        return parse_fill_selection(sessions[0].fill_count)
+
+    if known_counts:
+        counts_text = ", ".join(str(value) for value in known_counts)
+        print(style(f"Known fill counts across selected sessions: {counts_text}", FG_HINT))
+    selection = prompt("Fill ids to plot for all selected sessions (comma list or 'all')", "all").strip().lower()
     if selection in {"", "all"}:
         return None
     return selection
@@ -347,64 +449,68 @@ def action_capture(output_root: Path) -> None:
 def action_split(output_root: Path) -> None:
     print_header(
         "Telemetry TUI: Split",
-        "Convert one captured session into per-fill NDJSON files for plotting and comparison.",
+        "Convert one or more captured sessions into per-fill NDJSON files for plotting and comparison.",
     )
     print_panel(
         "What This Does",
         [
-            "Loads telemetry.ndjson from one session.",
-            "Detects each jar filling process from state=FILL.",
+            "Loads telemetry.ndjson from one or more sessions.",
+            "Groups each full jar fill including refill cycles into one run.",
+            "Always clears old fills/ output first so no stale split files remain.",
             "Writes fills/index.json and fill_0001.ndjson, fill_0002.ndjson, ...",
         ],
     )
     print()
 
-    session = choose_session(output_root, purpose="split")
-    if session is None:
+    sessions = choose_sessions(output_root, purpose="split")
+    if not sessions:
         wait_for_enter()
         return
 
-    pre_default = session.pre_ms if session.pre_ms is not None else 1000
-    post_default = session.post_ms if session.post_ms is not None else 1000
+    pre_default = sessions[0].pre_ms if sessions[0].pre_ms is not None else 1000
+    post_default = sessions[0].post_ms if sessions[0].post_ms is not None else 1000
     pre_ms = prompt_int("Pre-fill context [ms]", pre_default, minimum=0)
     post_ms = prompt_int("Post-fill context [ms]", post_default, minimum=0)
 
-    cmd = [
-        sys.executable,
-        str(SPLIT_SCRIPT),
-        str(session.path),
-        "--pre-ms",
-        str(pre_ms),
-        "--post-ms",
-        str(post_ms),
-        "--force",
-    ]
-    run_tool(cmd)
+    jobs: list[tuple[str, Sequence[str]]] = []
+    for session in sessions:
+        cmd = [
+            sys.executable,
+            str(SPLIT_SCRIPT),
+            str(session.path),
+            "--pre-ms",
+            str(pre_ms),
+            "--post-ms",
+            str(post_ms),
+        ]
+        jobs.append((session.name, cmd))
+    run_tool_batch(jobs)
 
 
 def action_plot(output_root: Path) -> None:
     print_header(
         "Telemetry TUI: Plot",
-        "Generate thesis charts from one session or its already split fill files.",
+        "Generate thesis charts from one or more sessions or their already split fill files.",
     )
     print_panel(
         "What This Does",
         [
-            "Uses fills/index.json when available, otherwise plots directly from the session.",
+            "Plots directly from selected sessions so the latest split logic is always used.",
+            "The standalone plotting script can still be called manually on fills/index.json.",
+            "By default, the previous figure output folder is cleared first.",
             "Exports both plain and debug chart variants.",
+            "Supports optional Zustandsband and Füllraten-Darstellung.",
             "Keeps the existing plotting script as the source of truth.",
         ],
     )
     print()
 
-    session = choose_session(output_root, purpose="plot")
-    if session is None:
+    sessions = choose_sessions(output_root, purpose="plot")
+    if not sessions:
         wait_for_enter()
         return
 
-    fills_dir = session.path / "fills"
-    input_path = fills_dir if (fills_dir / "index.json").exists() else session.path
-    fill_ids = parse_fill_selection(session.fill_count)
+    fill_ids = parse_fill_selection_batch(sessions)
     legend = prompt_choice(
         "Legend placement",
         [("o", "outside below plot"), ("i", "inside plot")],
@@ -413,39 +519,81 @@ def action_plot(output_root: Path) -> None:
     state_style = prompt_choice(
         "State visualization",
         [("n", "none"), ("b", "compact top band"), ("g", "full background")],
-        "n",
+        "b",
     )
+    show_rate = prompt_choice(
+        "Fill-rate telemetry",
+        [("n", "none"), ("f", "filtered only"), ("b", "raw + filtered")],
+        "f",
+    )
+    rate_layout = "s"
+    if show_rate != "n":
+        print(style("Overlay keeps one compact chart but uses an extra right axis for g/s.", FG_HINT))
+        print(style("Subplot keeps units visually cleaner and is usually the better thesis default.", FG_HINT))
+        rate_layout = prompt_choice(
+            "Rate layout",
+            [("s", "separate subplot"), ("o", "overlay in same chart")],
+            "s",
+        )
+    figure_profile = prompt_choice(
+        "Figure width",
+        [("d", "default 16:10 full-width"), ("n", "narrow taller variant for side-by-side")],
+        "d",
+    )
+    plain_both_profiles = prompt_yes_no("Also export plain chart in both wide+narrow variants?", False)
     format_choice = prompt_choice(
         "Export formats",
-        [("1", "pdf"), ("2", "pdf + svg"), ("3", "pdf + svg + png")],
-        "2",
+        [("1", "pdf"), ("2", "pdf + svg"), ("3", "pdf + svg + png"), ("4", "png only")],
+        "4",
     )
     output_dir_raw = prompt("Output dir override (optional)", "")
-
-    cmd = [
-        sys.executable,
-        str(PLOT_SCRIPT),
-        str(input_path),
-        "--legend-placement",
-        "outside" if legend == "o" else "inside",
-        "--state-style",
-        {"n": "none", "b": "band", "g": "background"}[state_style],
-    ]
-    if fill_ids:
-        cmd.extend(["--fills", fill_ids])
+    output_dir_override: Path | None = None
     if output_dir_raw:
-        output_dir = Path(output_dir_raw).expanduser()
-        if not output_dir.is_absolute():
-            output_dir = (REPO_ROOT / output_dir).resolve()
-        cmd.extend(["--output-dir", str(output_dir)])
+        output_dir_override = Path(output_dir_raw).expanduser()
+        if not output_dir_override.is_absolute():
+            output_dir_override = (REPO_ROOT / output_dir_override).resolve()
+    clear_output = prompt_yes_no("Clear previous generated figures first?", True)
 
-    cmd.extend(["--format", "pdf"])
-    if format_choice in {"2", "3"}:
-        cmd.extend(["--format", "svg"])
-    if format_choice == "3":
-        cmd.extend(["--format", "png"])
+    format_args: list[str] = []
+    if format_choice == "1":
+        format_args.extend(["--format", "pdf"])
+    elif format_choice == "2":
+        format_args.extend(["--format", "pdf", "--format", "svg"])
+    elif format_choice == "3":
+        format_args.extend(["--format", "pdf", "--format", "svg", "--format", "png"])
+    elif format_choice == "4":
+        format_args.extend(["--format", "png"])
 
-    run_tool(cmd)
+    jobs: list[tuple[str, Sequence[str]]] = []
+    for session in sessions:
+        cmd = [
+            sys.executable,
+            str(PLOT_SCRIPT),
+            str(session.path),
+            "--legend-placement",
+            "outside" if legend == "o" else "inside",
+            "--state-style",
+            {"n": "none", "b": "band", "g": "background"}[state_style],
+            "--show-rate",
+            {"n": "none", "f": "filtered", "b": "both"}[show_rate],
+            "--rate-layout",
+            "overlay" if rate_layout == "o" else "subplot",
+            "--figure-profile",
+            "narrow" if figure_profile == "n" else "default",
+        ]
+        if plain_both_profiles:
+            cmd.append("--plain-both-profiles")
+        if fill_ids:
+            cmd.extend(["--fills", fill_ids])
+        if output_dir_override:
+            session_output_dir = output_dir_override / session.name
+            cmd.extend(["--output-dir", str(session_output_dir)])
+        if not clear_output:
+            cmd.append("--keep-output")
+        cmd.extend(format_args)
+        jobs.append((session.name, cmd))
+
+    run_tool_batch(jobs)
 
 
 def action_list_sessions(output_root: Path) -> None:

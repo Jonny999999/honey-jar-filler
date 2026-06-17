@@ -21,6 +21,14 @@ typedef enum {
     APP_PARAM_SCOPE_MACHINE,
 } app_param_scope_t;
 
+typedef enum {
+    APP_FILL_STRATEGY_HEURISTIC = 0,
+    APP_FILL_STRATEGY_ADAPTIVE_HEURISTIC,
+    APP_FILL_STRATEGY_FLOW_CONTROL,
+    APP_FILL_STRATEGY_MANUAL,
+    APP_FILL_STRATEGY_COUNT,
+} app_fill_strategy_t;
+
 #define APP_PRESET_COUNT     4u
 #define APP_PRESET_NAME_MAX 16u
 
@@ -77,6 +85,11 @@ size_t    app_presets_count(void);
 uint8_t   app_presets_get_active_index(void);
 const char *app_presets_get_name(uint8_t index);
 esp_err_t app_presets_select(uint8_t index);
+
+size_t    app_fill_strategy_count(void);
+app_fill_strategy_t app_fill_strategy_get_active(void);
+const char *app_fill_strategy_get_name(app_fill_strategy_t strategy);
+esp_err_t app_fill_strategy_select(app_fill_strategy_t strategy);
 
 const app_param_meta_t *app_params_meta_get(size_t *out_count);
 
