@@ -424,6 +424,26 @@ def parse_rate_selection() -> str:
         print(style("Enter at least one valid rate trace, 'all', or 'none'.", FG_ERROR))
 
 
+def parse_session_summary_groups() -> str:
+    print(style("Session summary groups", ANSI_BOLD, FG_TITLE))
+    print(style("  overview, adaptive, compare", FG_HINT))
+    print(style("Use a comma list or 'all'. These figures are based on fill_summary records.", FG_HINT))
+    while True:
+        selection = prompt("Session summary groups", "all").strip().lower()
+        if selection in {"", "all"}:
+            return "all"
+        tokens = [part.strip() for part in selection.split(",") if part.strip()]
+        valid = {"overview", "adaptive", "compare"}
+        invalid = [token for token in tokens if token not in valid]
+        if invalid:
+            print(style(f"Unknown summary groups: {', '.join(invalid)}", FG_ERROR))
+            continue
+        ordered = [name for name in ["overview", "adaptive", "compare"] if name in tokens]
+        if ordered:
+            return ",".join(ordered)
+        print(style("Enter at least one valid summary group or 'all'.", FG_ERROR))
+
+
 def action_capture(output_root: Path) -> None:
     print_header(
         "Telemetry TUI: Capture",
@@ -522,6 +542,7 @@ def action_plot(output_root: Path) -> None:
             "By default, the previous figure output folder is cleared first.",
             "Exports both plain and debug chart variants.",
             "Supports optional Zustandsband and Füllraten-Darstellung.",
+            "Generates session-level summary figures from fill_summary by default.",
             "Keeps the existing plotting script as the source of truth.",
         ],
     )
@@ -558,6 +579,10 @@ def action_plot(output_root: Path) -> None:
         [("d", "default 16:10 full-width"), ("n", "narrow taller variant for side-by-side")],
         "d",
     )
+    session_summary = prompt_yes_no("Also generate session summary figures?", True)
+    session_summary_groups = "all"
+    if session_summary:
+        session_summary_groups = parse_session_summary_groups()
     plain_both_profiles = prompt_yes_no("Also export plain chart in both wide+narrow variants?", False)
     format_choice = prompt_choice(
         "Export formats",
@@ -601,6 +626,10 @@ def action_plot(output_root: Path) -> None:
         ]
         if plain_both_profiles:
             cmd.append("--plain-both-profiles")
+        if not session_summary:
+            cmd.append("--no-session-summary")
+        else:
+            cmd.extend(["--session-summary-groups", session_summary_groups])
         if fill_ids:
             cmd.extend(["--fills", fill_ids])
         if output_dir_override:
