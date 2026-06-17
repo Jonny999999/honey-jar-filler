@@ -10,7 +10,7 @@
 
 #define ADAPT_NAMESPACE "fill_adapt"
 #define ADAPT_KEY_STORE "learn_v1"
-#define ADAPT_STORE_VERSION 1u
+#define ADAPT_STORE_VERSION 2u
 
 // Persistence / session behavior:
 // 0 => start after each boot from preset-derived defaults and learn only within
@@ -23,13 +23,18 @@
 // does not stay artificially high once the measured increase stops.
 #define RATE_FILTER_ALPHA_RISE 0.18f
 #define RATE_FILTER_ALPHA_FALL 0.55f
-#define RATE_MIN_VALID_GPS 2.0f
-#define RATE_ZERO_EPS_GPS 0.5f
+#define RATE_FILTER_MEDIUM_ALPHA_RISE 0.10f
+#define RATE_FILTER_MEDIUM_ALPHA_FALL 0.28f
+#define RATE_FILTER_SLOW_ALPHA_RISE 0.05f
+#define RATE_FILTER_SLOW_ALPHA_FALL 0.16f
+#define RATE_CONTROL_MIN_VALID_GPS 2.0f
+#define RATE_ZERO_EPS_GPS 0.15f
 #define RATE_NO_FLOW_RESET_SAMPLES 2u
 #define LEARN_ALPHA_DEAD_TIME 0.35f
 #define LEARN_ALPHA_POST_CLOSE 0.65f
 #define LEARN_ALPHA_RATE 0.20f
 #define LEARN_ALPHA_DRIP_WAIT 0.35f
+#define LEARN_ALPHA_NEAR_CLOSE_BIAS 0.18f
 
 // VERIFY_TARGET robustness:
 // Require a few consecutive confirming samples before deciding under/overweight.
@@ -51,6 +56,8 @@
 // the next refill attempt less conservative after an underfill.
 #define CLOSE_BUFFER_G 1.5f
 #define REFILL_RELAX_STEP_G 2.5f
+#define NEAR_CLOSE_REFILL_RELAX_STEP_G 3.0f
+#define NEAR_CLOSE_REFILL_RELAX_MAX_G 12.0f
 #define REFILL_MIN_OPEN_MS 1000.0f
 
 // Safety limits:
@@ -59,8 +66,10 @@
 #define ADAPT_HARD_OVERFILL_MARGIN_MIN_G 1.0f
 #define ADAPT_HARD_OVERFILL_MARGIN_EXTRA_G 6.0f
 #define NEAR_CLOSE_TRANSITION_MARGIN_G 4.0f
+#define NEAR_CLOSE_BIAS_MIN_G -40.0f
+#define NEAR_CLOSE_BIAS_MAX_G 80.0f
 #define SAFE_RATE_MIN_GPS 10.0f
-#define SAFE_RATE_MAX_GPS 100.0f
+#define SAFE_RATE_MAX_GPS 150.0f
 #define SAFE_RATE_MULT 1.8f
 
 // Sample-to-sample rate estimation window:
@@ -84,6 +93,7 @@ typedef struct {
     float post_close_gain_g;
     float fast_rate_gps;
     float slow_rate_gps;
+    float near_close_bias_g;
     float drip_wait_ms;
 } adaptive_learned_entry_t;
 
@@ -123,8 +133,13 @@ static void clear_live_rate_estimates(filler_strategy_runtime_t *rt)
 {
     if (!rt) return;
     rt->raw_rate_gps = 0.0f;
+    rt->rate_2sample_gps = 0.0f;
+    rt->rate_4sample_gps = 0.0f;
     rt->filtered_rate_gps = 0.0f;
+    rt->filtered_rate_medium_gps = 0.0f;
+    rt->filtered_rate_slow_gps = 0.0f;
     rt->no_flow_count = 0;
+    rt->rate_hist_count = 0;
 }
 
 static bool stable_above(float value, float threshold, uint8_t *count, uint8_t required)
@@ -185,11 +200,22 @@ static void adaptive_defaults_from_params(adaptive_learned_entry_t *entry, const
 {
     if (!entry || !params) return;
     float poll_s = ((float)CONFIG_HX711_POLL_INTERVAL_MS / 1000.0f) * 2.5f;
+    float default_close_g = clampf_local(clampf_local((float)params->close_early_g * 0.55f, 1.0f, 120.0f) + CLOSE_BUFFER_G,
+                                         2.0f,
+                                         fmaxf((float)params->close_early_g * 1.8f, 8.0f));
     entry->initialized = 1;
     entry->dead_time_s = clampf_local(poll_s, 0.25f, 1.20f);
     entry->post_close_gain_g = clampf_local((float)params->close_early_g * 0.55f, 1.0f, 120.0f);
     entry->fast_rate_gps = 0.0f;
     entry->slow_rate_gps = 0.0f;
+    // Preserve preset-driven startup behavior by biasing the empirical
+    // near-close correction so the first adaptive threshold stays close to the
+    // preset's configured near-close delta until measured runs refine it.
+    entry->near_close_bias_g = clampf_local((float)params->near_close_delta_g -
+                                            default_close_g -
+                                            NEAR_CLOSE_TRANSITION_MARGIN_G,
+                                            NEAR_CLOSE_BIAS_MIN_G,
+                                            NEAR_CLOSE_BIAS_MAX_G);
     entry->drip_wait_ms = clampf_local((float)params->drip_delay_ms, DRIP_WAIT_MIN_MS, DRIP_WAIT_MAX_MS);
 }
 
@@ -197,15 +223,52 @@ static void log_learned_entry(const char *prefix, uint8_t preset_index, const ad
 {
     if (!prefix || !entry) return;
     ESP_LOGI(TAG,
-             "%s preset=%u dead_time=%.3f s post_close=%.1f g fast_rate=%.1f g/s slow_rate=%.1f g/s drip_wait=%.0f ms fills=%lu",
+             "%s preset=%u dead_time=%.3f s post_close=%.1f g fast_rate=%.1f g/s slow_rate=%.1f g/s near_bias=%.1f g drip_wait=%.0f ms fills=%lu",
              prefix,
              (unsigned)preset_index,
              (double)entry->dead_time_s,
              (double)entry->post_close_gain_g,
              (double)entry->fast_rate_gps,
              (double)entry->slow_rate_gps,
+             (double)entry->near_close_bias_g,
              (double)entry->drip_wait_ms,
              (unsigned long)entry->successful_fills);
+}
+
+static float rate_sample_clamped(float delta_g, float dt_s)
+{
+    if (dt_s <= 0.0f) return 0.0f;
+    if (delta_g < -0.5f) delta_g = 0.0f;
+    return (delta_g > 0.0f) ? (delta_g / dt_s) : 0.0f;
+}
+
+static float history_window_rate_gps(const filler_strategy_runtime_t *rt, uint8_t intervals)
+{
+    if (!rt || rt->rate_hist_count <= intervals) return 0.0f;
+    float dt_s = (float)(rt->rate_hist_ts_us[0] - rt->rate_hist_ts_us[intervals]) / 1000000.0f;
+    float min_dt_s = DELTA_RATE_MIN_DT_S * (float)intervals;
+    float max_dt_s = DELTA_RATE_MAX_DT_S * (float)intervals;
+    if (dt_s < min_dt_s || dt_s > max_dt_s) return 0.0f;
+    return rate_sample_clamped(rt->rate_hist_rel_g[0] - rt->rate_hist_rel_g[intervals], dt_s);
+}
+
+static void push_rate_history(filler_strategy_runtime_t *rt, float rel_g, int64_t ts_us)
+{
+    if (!rt) return;
+    for (int i = 4; i > 0; --i) {
+        rt->rate_hist_rel_g[i] = rt->rate_hist_rel_g[i - 1];
+        rt->rate_hist_ts_us[i] = rt->rate_hist_ts_us[i - 1];
+    }
+    rt->rate_hist_rel_g[0] = rel_g;
+    rt->rate_hist_ts_us[0] = ts_us;
+    if (rt->rate_hist_count < 5) rt->rate_hist_count++;
+}
+
+static float filtered_rate_step(float prev, float sample, float alpha_rise, float alpha_fall)
+{
+    float alpha = (sample >= prev) ? alpha_rise : alpha_fall;
+    float filtered = ewma(prev, sample, alpha);
+    return (filtered < RATE_ZERO_EPS_GPS) ? 0.0f : filtered;
 }
 
 static void adaptive_store_apply_defaults(adaptive_store_t *store)
@@ -316,11 +379,16 @@ static void update_adapted_thresholds(filler_strategy_runtime_t *rt, const fille
     float close_max = fmaxf((float)tick->params->close_early_g * 1.8f, 8.0f);
     float near_max = fmaxf((float)tick->params->near_close_delta_g * 2.0f, 20.0f);
     float close_candidate = rt->predicted_remaining_g + CLOSE_BUFFER_G - rt->close_early_relax_g;
-    // Reducing from fast to slow should happen early enough that the mass
-    // already "in flight" at the fast rate can clear before the slower final
-    // phase is relied on. Therefore near-close is modeled as fast dead-time
-    // mass plus the later full-close threshold.
-    float near_candidate = transition_mass_g + clampf_local(close_candidate, 2.0f, close_max) + NEAR_CLOSE_TRANSITION_MARGIN_G;
+    // Near-close is still seeded from the dead-time/rate estimate, but the
+    // learned bias carries the long-term empirical correction for each preset.
+    // Refill-time relax only affects the reduced-gate transition, not the
+    // final close threshold that remains dominated by post-close mass learning.
+    float transition_extra_g = transition_mass_g +
+                               rt->learned_near_close_bias_g -
+                               rt->near_close_relax_g +
+                               NEAR_CLOSE_TRANSITION_MARGIN_G;
+    float near_candidate = clampf_local(close_candidate, 2.0f, close_max) +
+                           fmaxf(3.0f, transition_extra_g);
 
     rt->adapted_close_early_g = clampf_local(close_candidate, 2.0f, close_max);
     rt->adapted_near_close_g = clampf_local(near_candidate,
@@ -351,14 +419,20 @@ static void publish_runtime_snapshot(filler_strategy_runtime_t *rt, const filler
     filler_strategy_sample_telemetry_t sample = {
         .valid = true,
         .raw_rate_gps = rt->raw_rate_gps,
+        .rate_2sample_gps = rt->rate_2sample_gps,
+        .rate_4sample_gps = rt->rate_4sample_gps,
         .filtered_rate_gps = rt->filtered_rate_gps,
+        .filtered_rate_medium_gps = rt->filtered_rate_medium_gps,
+        .filtered_rate_slow_gps = rt->filtered_rate_slow_gps,
         .predicted_remaining_g = rt->predicted_remaining_g,
         .measured_dead_time_s = rt->measured_dead_time_s,
         .measured_post_close_gain_g = rt->measured_post_close_gain_g,
+        .measured_near_close_gain_g = rt->measured_near_close_gain_g,
         .learned_dead_time_s = rt->learned_dead_time_s,
         .learned_post_close_gain_g = rt->learned_post_close_gain_g,
         .learned_fast_rate_gps = rt->learned_fast_rate_gps,
         .learned_slow_rate_gps = rt->learned_slow_rate_gps,
+        .learned_near_close_bias_g = rt->learned_near_close_bias_g,
         .adapted_near_close_g = rt->adapted_near_close_g,
         .adapted_close_early_g = rt->adapted_close_early_g,
         .adapted_drip_wait_ms = rt->adapted_drip_wait_ms,
@@ -373,19 +447,26 @@ static void update_rate_estimates(filler_strategy_runtime_t *rt, const filler_st
 {
     if (!rt || !tick || !tick->new_sample || !tick->latest) return;
 
+    // Keep several parallel rate views:
+    // - raw_rate_gps: sample-to-sample derivative, useful to see small peaks
+    // - rate_2sample_gps / rate_4sample_gps: short windows that reduce jitter
+    // - filtered_rate_*: progressively smoother traces for control/plotting
     float rel_g = tick->latest->grams - rt->run_base_weight_g;
+    push_rate_history(rt, rel_g, tick->latest->ts_us);
 
     if (rt->last_rate_ts_us != 0) {
         float dt_s = (float)(tick->latest->ts_us - rt->last_rate_ts_us) / 1000000.0f;
         if (dt_s >= DELTA_RATE_MIN_DT_S && dt_s <= DELTA_RATE_MAX_DT_S) {
             float delta_g = rel_g - rt->last_rel_g;
-            if (delta_g < -0.5f) delta_g = 0.0f;
-            rt->raw_rate_gps = delta_g > 0.0f ? (delta_g / dt_s) : 0.0f;
-            if (rt->raw_rate_gps < RATE_MIN_VALID_GPS) {
-                rt->raw_rate_gps = 0.0f;
+            float rate_for_control_gps = 0.0f;
+            rt->raw_rate_gps = rate_sample_clamped(delta_g, dt_s);
+            rt->rate_2sample_gps = history_window_rate_gps(rt, 2);
+            rt->rate_4sample_gps = history_window_rate_gps(rt, 4);
+            if (rt->raw_rate_gps >= RATE_CONTROL_MIN_VALID_GPS) {
+                rate_for_control_gps = rt->raw_rate_gps;
             }
 
-            if (rt->raw_rate_gps <= 0.0f) {
+            if (rate_for_control_gps <= 0.0f) {
                 if (rt->no_flow_count < 255) rt->no_flow_count++;
                 if (rt->no_flow_count >= RATE_NO_FLOW_RESET_SAMPLES) {
                     rt->filtered_rate_gps = 0.0f;
@@ -394,12 +475,19 @@ static void update_rate_estimates(filler_strategy_runtime_t *rt, const filler_st
                 }
             } else {
                 rt->no_flow_count = 0;
-                float alpha = (rt->raw_rate_gps >= rt->filtered_rate_gps) ? RATE_FILTER_ALPHA_RISE : RATE_FILTER_ALPHA_FALL;
-                rt->filtered_rate_gps = ewma(rt->filtered_rate_gps, rt->raw_rate_gps, alpha);
+                rt->filtered_rate_gps = filtered_rate_step(rt->filtered_rate_gps,
+                                                           rate_for_control_gps,
+                                                           RATE_FILTER_ALPHA_RISE,
+                                                           RATE_FILTER_ALPHA_FALL);
             }
-            if (rt->filtered_rate_gps < RATE_ZERO_EPS_GPS) {
-                rt->filtered_rate_gps = 0.0f;
-            }
+            rt->filtered_rate_medium_gps = filtered_rate_step(rt->filtered_rate_medium_gps,
+                                                              rt->raw_rate_gps,
+                                                              RATE_FILTER_MEDIUM_ALPHA_RISE,
+                                                              RATE_FILTER_MEDIUM_ALPHA_FALL);
+            rt->filtered_rate_slow_gps = filtered_rate_step(rt->filtered_rate_slow_gps,
+                                                            rt->raw_rate_gps,
+                                                            RATE_FILTER_SLOW_ALPHA_RISE,
+                                                            RATE_FILTER_SLOW_ALPHA_FALL);
 
             adaptive_gate_phase_t phase = runtime_phase(rt);
             if ((phase == PHASE_FAST || phase == PHASE_REFILL) && rt->raw_rate_gps > 0.1f) {
@@ -446,6 +534,13 @@ static void mark_first_close(filler_strategy_runtime_t *rt, const filler_strateg
     rt->rel_at_first_close_g = tick->latest->grams - rt->run_base_weight_g;
     rt->last_gain_ts_us = rt->first_close_ts_us;
     rt->rate_at_close_gps = (rt->filtered_rate_gps > 0.0f) ? rt->filtered_rate_gps : rt->raw_rate_gps;
+    rt->rate_2sample_at_close_gps = rt->rate_2sample_gps;
+    rt->rate_4sample_at_close_gps = rt->rate_4sample_gps;
+    rt->filtered_rate_medium_at_close_gps = rt->filtered_rate_medium_gps;
+    rt->filtered_rate_slow_at_close_gps = rt->filtered_rate_slow_gps;
+    if (rt->measured_near_close_valid) {
+        rt->measured_near_close_gain_g = fmaxf(0.0f, rt->rel_at_first_close_g - rt->rel_at_near_close_g);
+    }
 }
 
 static float safe_rate_limit_gps(const filler_strategy_runtime_t *rt)
@@ -461,6 +556,36 @@ static bool plausible_positive(float value, float min_v, float max_v)
     return value >= min_v && value <= max_v;
 }
 
+static void compute_thresholds_for_summary(const adaptive_learned_entry_t *entry,
+                                           const app_params_t *params,
+                                           float fast_transition_rate_gps,
+                                           float close_early_relax_g,
+                                           float near_close_relax_g,
+                                           float *out_close_g,
+                                           float *out_near_g)
+{
+    if (!entry || !params) return;
+
+    // Rebuild the thresholds that the next fill would start from after the
+    // current run's learning update has been applied.
+    float predicted_remaining_g = entry->post_close_gain_g;
+    float close_max = fmaxf((float)params->close_early_g * 1.8f, 8.0f);
+    float near_max = fmaxf((float)params->near_close_delta_g * 2.0f, 20.0f);
+    float close_candidate = predicted_remaining_g + CLOSE_BUFFER_G - close_early_relax_g;
+    float transition_mass_g = entry->dead_time_s * fmaxf(0.0f, fast_transition_rate_gps);
+    float transition_extra_g = transition_mass_g +
+                               entry->near_close_bias_g -
+                               near_close_relax_g +
+                               NEAR_CLOSE_TRANSITION_MARGIN_G;
+    float close_g = clampf_local(close_candidate, 2.0f, close_max);
+    float near_g = clampf_local(close_g + fmaxf(3.0f, transition_extra_g),
+                                close_g + 3.0f,
+                                near_max);
+
+    if (out_close_g) *out_close_g = close_g;
+    if (out_near_g) *out_near_g = near_g;
+}
+
 static void publish_summary_and_learn(filler_strategy_runtime_t *rt,
                                       const filler_strategy_env_t *env,
                                       const filler_strategy_tick_t *tick,
@@ -470,9 +595,9 @@ static void publish_summary_and_learn(filler_strategy_runtime_t *rt,
     if (!rt || !env || !env->publish_fill_summary || !tick || !tick->latest || !tick->params) return;
 
     // Learned across runs: dead time, post-close gain, representative fast/slow
-    // fill rates, and a conservative drip-wait recommendation. Per-run
-    // measurements stay in the runtime struct and are only committed when the
-    // finished fill is plausible and fault-free.
+    // fill rates, the near-close bias, and a conservative drip-wait
+    // recommendation. Per-run measurements stay in the runtime struct and are
+    // only committed when the finished fill is plausible and fault-free.
     adaptive_learned_entry_t *entry = adaptive_entry_for_preset(tick->preset_index, tick->params);
     float final_rel_g = tick->latest->grams - rt->run_base_weight_g;
     float fast_avg = (rt->fast_rate_count > 0) ? (rt->fast_rate_sum_gps / (float)rt->fast_rate_count) : 0.0f;
@@ -483,11 +608,14 @@ static void publish_summary_and_learn(filler_strategy_runtime_t *rt,
     float settled_wait_ms = rt->first_close_seen && rt->last_gain_ts_us >= rt->first_close_ts_us
         ? ((float)(rt->last_gain_ts_us - rt->first_close_ts_us) / 1000.0f) + DRIP_WAIT_SETTLE_MARGIN_MS
         : rt->adapted_drip_wait_ms;
+    bool plausible_near_close = !rt->measured_near_close_valid ||
+                                plausible_positive(rt->measured_near_close_gain_g, 0.0f, 200.0f);
 
     bool plausible = success &&
                      rt->response_detected &&
                      plausible_positive(rt->measured_dead_time_s, DEAD_TIME_MIN_S, DEAD_TIME_MAX_S) &&
                      plausible_positive(rt->measured_post_close_gain_g, 0.0f, 150.0f) &&
+                     plausible_near_close &&
                      (fast_avg == 0.0f || plausible_positive(fast_avg, 0.5f, 400.0f)) &&
                      (slow_avg == 0.0f || plausible_positive(slow_avg, 0.2f, 250.0f));
 
@@ -498,13 +626,22 @@ static void publish_summary_and_learn(filler_strategy_runtime_t *rt,
         entry->post_close_gain_g = ewma(entry->post_close_gain_g, rt->measured_post_close_gain_g, LEARN_ALPHA_POST_CLOSE);
         if (fast_avg > 0.0f) entry->fast_rate_gps = ewma(entry->fast_rate_gps, fast_avg, LEARN_ALPHA_RATE);
         if (slow_avg > 0.0f) entry->slow_rate_gps = ewma(entry->slow_rate_gps, slow_avg, LEARN_ALPHA_RATE);
+        if (rt->measured_near_close_valid && rt->near_close_transition_estimate_g >= 0.0f) {
+            float bias_sample_g = rt->measured_near_close_gain_g - rt->near_close_transition_estimate_g;
+            entry->near_close_bias_g = ewma(entry->near_close_bias_g,
+                                            clampf_local(bias_sample_g, NEAR_CLOSE_BIAS_MIN_G, NEAR_CLOSE_BIAS_MAX_G),
+                                            LEARN_ALPHA_NEAR_CLOSE_BIAS);
+            entry->near_close_bias_g = clampf_local(entry->near_close_bias_g,
+                                                    NEAR_CLOSE_BIAS_MIN_G,
+                                                    NEAR_CLOSE_BIAS_MAX_G);
+        }
         entry->drip_wait_ms = ewma(entry->drip_wait_ms,
                                    clampf_local(settled_wait_ms, DRIP_WAIT_MIN_MS, DRIP_WAIT_MAX_MS),
                                    LEARN_ALPHA_DRIP_WAIT);
         entry->successful_fills++;
         adaptive_store_save();
         ESP_LOGI(TAG,
-                 "learned update reason=%s dead_time %.3f->%.3f s (a=%.2f) post_close %.1f->%.1f g (a=%.2f) fast_rate %.1f->%.1f g/s (a=%.2f) slow_rate %.1f->%.1f g/s (a=%.2f) drip_wait %.0f->%.0f ms (a=%.2f)",
+                 "learned update reason=%s dead_time %.3f->%.3f s (a=%.2f) post_close %.1f->%.1f g (a=%.2f) fast_rate %.1f->%.1f g/s (a=%.2f) slow_rate %.1f->%.1f g/s (a=%.2f) near_bias %.1f->%.1f g (a=%.2f) drip_wait %.0f->%.0f ms (a=%.2f)",
                  reason ? reason : "ok",
                  (double)before.dead_time_s, (double)entry->dead_time_s,
                  (double)LEARN_ALPHA_DEAD_TIME,
@@ -514,19 +651,33 @@ static void publish_summary_and_learn(filler_strategy_runtime_t *rt,
                  (double)LEARN_ALPHA_RATE,
                  (double)before.slow_rate_gps, (double)entry->slow_rate_gps,
                  (double)LEARN_ALPHA_RATE,
+                 (double)before.near_close_bias_g, (double)entry->near_close_bias_g,
+                 (double)LEARN_ALPHA_NEAR_CLOSE_BIAS,
                  (double)before.drip_wait_ms, (double)entry->drip_wait_ms,
                  (double)LEARN_ALPHA_DRIP_WAIT);
     } else {
         ESP_LOGI(TAG,
-                 "learning skipped reason=%s success=%d response=%d dead_time=%.3f s post_close=%.1f g fast_rate=%.1f g/s slow_rate=%.1f g/s",
+                 "learning skipped reason=%s success=%d response=%d dead_time=%.3f s post_close=%.1f g near_close_gain=%.1f g fast_rate=%.1f g/s slow_rate=%.1f g/s",
                  reason ? reason : "fault",
                  success ? 1 : 0,
                  rt->response_detected ? 1 : 0,
                  (double)rt->measured_dead_time_s,
                  (double)rt->measured_post_close_gain_g,
+                 (double)rt->measured_near_close_gain_g,
                  (double)fast_avg,
                  (double)slow_avg);
     }
+
+    float next_close_g = 0.0f;
+    float next_near_g = 0.0f;
+    float next_fast_rate_gps = (entry->fast_rate_gps > 0.0f) ? entry->fast_rate_gps : fast_avg;
+    compute_thresholds_for_summary(entry,
+                                   tick->params,
+                                   next_fast_rate_gps,
+                                   0.0f,
+                                   0.0f,
+                                   &next_close_g,
+                                   &next_near_g);
 
     filler_strategy_fill_summary_t summary = {
         .valid = true,
@@ -535,18 +686,31 @@ static void publish_summary_and_learn(filler_strategy_runtime_t *rt,
         .fill_error_g = final_rel_g - (float)tick->params->target_grams,
         .measured_dead_time_s = rt->measured_dead_time_s,
         .measured_post_close_gain_g = rt->measured_post_close_gain_g,
+        .measured_near_close_gain_g = rt->measured_near_close_gain_g,
         .measured_fast_rate_gps = fast_avg,
         .measured_slow_rate_gps = slow_avg,
         .rate_at_close_gps = rt->rate_at_close_gps,
+        .rate_2sample_at_close_gps = rt->rate_2sample_at_close_gps,
+        .rate_4sample_at_close_gps = rt->rate_4sample_at_close_gps,
+        .filtered_rate_medium_at_close_gps = rt->filtered_rate_medium_at_close_gps,
+        .filtered_rate_slow_at_close_gps = rt->filtered_rate_slow_at_close_gps,
         .fill_duration_s = fill_duration_s,
         .drip_wait_used_ms = rt->adapted_drip_wait_ms,
         .refill_count = rt->refill_count,
+        .used_dead_time_s = rt->learned_dead_time_s,
+        .used_post_close_gain_g = rt->learned_post_close_gain_g,
+        .used_fast_rate_gps = rt->learned_fast_rate_gps,
+        .used_slow_rate_gps = rt->learned_slow_rate_gps,
+        .used_near_close_bias_g = rt->learned_near_close_bias_g,
+        .used_near_close_g = rt->adapted_near_close_g,
+        .used_close_early_g = rt->adapted_close_early_g,
         .next_dead_time_s = entry->dead_time_s,
         .next_post_close_gain_g = entry->post_close_gain_g,
         .next_fast_rate_gps = entry->fast_rate_gps,
         .next_slow_rate_gps = entry->slow_rate_gps,
-        .next_near_close_g = rt->adapted_near_close_g,
-        .next_close_early_g = rt->adapted_close_early_g,
+        .next_near_close_bias_g = entry->near_close_bias_g,
+        .next_near_close_g = next_near_g,
+        .next_close_early_g = next_close_g,
         .next_drip_wait_ms = entry->drip_wait_ms,
     };
     snprintf(summary.reason, sizeof(summary.reason), "%s", reason ? reason : (success ? "ok" : "fault"));
@@ -571,7 +735,7 @@ static void adaptive_on_enter(filler_strategy_runtime_t *rt,
         adaptive_learned_entry_t *entry = adaptive_entry_for_preset(tick->preset_index, tick->params);
         if (prev_state != FILLER_VERIFY_TARGET) {
             // Measured only within the current fill: response timing, live rate
-            // estimates, post-close gain, and refill count for this jar.
+            // estimates, near-close/close gains, and refill count for this jar.
             memset(rt, 0, sizeof(*rt));
             rt->fill_open_ts_us = tick->now_us;
             rt->run_base_weight_g = tick->latest ? tick->latest->grams : 0.0f;
@@ -585,14 +749,19 @@ static void adaptive_on_enter(filler_strategy_runtime_t *rt,
             rt->fill_open_ts_us = tick->now_us;
             rt->first_close_seen = false;
             rt->rel_at_first_close_g = 0.0f;
+            rt->rel_at_near_close_g = 0.0f;
             rt->measured_post_close_gain_g = 0.0f;
+            rt->measured_near_close_gain_g = 0.0f;
+            rt->measured_near_close_valid = false;
+            rt->near_close_transition_estimate_g = 0.0f;
             rt->last_post_close_gain_g = 0.0f;
             rt->first_close_ts_us = 0;
             rt->last_gain_ts_us = 0;
             ESP_LOGI(TAG,
-                     "refill attempt=%u relaxed_close_early=%.1f g",
+                     "refill attempt=%u relaxed_close_early=%.1f g relaxed_near_close=%.1f g",
                      (unsigned)rt->refill_count,
-                     (double)rt->close_early_relax_g);
+                     (double)rt->close_early_relax_g,
+                     (double)rt->near_close_relax_g);
         }
         rt->fill_eval_after_ts_us = (tick->latest && tick->latest->ts_us != 0) ? tick->latest->ts_us : tick->now_us;
 
@@ -604,13 +773,15 @@ static void adaptive_on_enter(filler_strategy_runtime_t *rt,
         rt->learned_post_close_gain_g = entry->post_close_gain_g;
         rt->learned_fast_rate_gps = entry->fast_rate_gps;
         rt->learned_slow_rate_gps = entry->slow_rate_gps;
+        rt->learned_near_close_bias_g = entry->near_close_bias_g;
         update_adapted_thresholds(rt, tick);
         ESP_LOGI(TAG,
-                 "adaptive thresholds near_close=%.1f g close_early=%.1f g close_post=%.1f g near_transition=%.1f g drip_wait=%.0f ms gate_fast=%u%% gate_reduced=%u%% no_response_limit=%.2f s response_threshold=%.1f g",
+                 "adaptive thresholds near_close=%.1f g close_early=%.1f g close_post=%.1f g near_transition=%.1f g near_bias=%.1f g drip_wait=%.0f ms gate_fast=%u%% gate_reduced=%u%% no_response_limit=%.2f s response_threshold=%.1f g",
                  (double)rt->adapted_near_close_g,
                  (double)rt->adapted_close_early_g,
                  (double)rt->predicted_remaining_g,
                  (double)near_close_transition_mass_g(rt),
+                 (double)rt->learned_near_close_bias_g,
                  (double)rt->adapted_drip_wait_ms,
                  (unsigned)tick->params->max_gate_pct,
                  (unsigned)tick->params->near_close_gate_pct,
@@ -751,12 +922,21 @@ static filler_state_t adaptive_step(filler_strategy_runtime_t *rt,
             return FILLER_DRIP_WAIT;
         }
         if (remaining_g <= rt->adapted_near_close_g) {
+            // Learn from the actual threshold-triggered reduced-gate handover,
+            // not from earlier safety-driven reductions that already changed
+            // the plant before the normal near-close boundary was reached.
+            if (!rt->near_close_logged && !rt->measured_near_close_valid) {
+                rt->measured_near_close_valid = true;
+                rt->rel_at_near_close_g = rel_g;
+                rt->near_close_transition_estimate_g = near_close_transition_mass_g(rt);
+            }
             if (!rt->near_close_logged) {
                 ESP_LOGI(TAG,
-                         "adaptive near-close remaining=%.1f g threshold=%.1f g transition_mass=%.1f g close_threshold=%.1f g -> gate=%u%%",
+                         "adaptive near-close remaining=%.1f g threshold=%.1f g transition_mass=%.1f g bias=%.1f g close_threshold=%.1f g -> gate=%u%%",
                          (double)remaining_g,
                          (double)rt->adapted_near_close_g,
-                         (double)near_close_transition_mass_g(rt),
+                         (double)rt->near_close_transition_estimate_g,
+                         (double)rt->learned_near_close_bias_g,
                          (double)rt->adapted_close_early_g,
                          (unsigned)tick->params->near_close_gate_pct);
             }
@@ -822,9 +1002,14 @@ static filler_state_t adaptive_step(filler_strategy_runtime_t *rt,
             ESP_LOGI(TAG, "adaptive underweight: rel=%.1f g (-%.1f g) -> refill",
                      (double)rel_g, (double)under);
             rt->close_early_relax_g += REFILL_RELAX_STEP_G;
+            rt->near_close_relax_g = fminf(rt->near_close_relax_g + NEAR_CLOSE_REFILL_RELAX_STEP_G,
+                                           NEAR_CLOSE_REFILL_RELAX_MAX_G);
             ESP_LOGI(TAG, "relax close_early by %.1f g -> total_relax=%.1f g",
                      (double)REFILL_RELAX_STEP_G,
                      (double)rt->close_early_relax_g);
+            ESP_LOGI(TAG, "relax near_close by %.1f g -> total_relax=%.1f g",
+                     (double)NEAR_CLOSE_REFILL_RELAX_STEP_G,
+                     (double)rt->near_close_relax_g);
             publish_runtime_snapshot(rt, env, tick);
             return FILLER_FILL;
         }

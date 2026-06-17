@@ -79,8 +79,16 @@ LINE_FILL_MASS = "#c81e1e"
 LINE_GATE = "#7e22ce"
 LINE_TARGET = "#1f5f3a"
 LINE_FAULT = "#b91c1c"
-LINE_RATE_RAW = "#94a3b8"
-LINE_RATE_FILTERED = "#2563eb"
+RATE_SERIES_SPECS: dict[str, dict[str, str]] = {
+    "raw": {"field": "rate_raw_gps", "label": "Rohrate [g/s]", "color": "#94a3b8"},
+    "2sample": {"field": "rate_2sample_gps", "label": "2-Sample-Rate [g/s]", "color": "#0f766e"},
+    "4sample": {"field": "rate_4sample_gps", "label": "4-Sample-Rate [g/s]", "color": "#0ea5e9"},
+    "filtered": {"field": "rate_filtered_gps", "label": "Gefilterte Füllrate [g/s]", "color": "#2563eb"},
+    "medium": {"field": "rate_filtered_medium_gps", "label": "Mittlere Filterrate [g/s]", "color": "#7c3aed"},
+    "slow": {"field": "rate_filtered_slow_gps", "label": "Langsame Filterrate [g/s]", "color": "#ea580c"},
+}
+RATE_SELECTION_ORDER = ["raw", "2sample", "4sample", "filtered", "medium", "slow"]
+LINE_RATE_FILTERED = RATE_SERIES_SPECS["filtered"]["color"]
 STATE_BAND_EDGE = "#94a3b8"
 STATE_BAND_KEYS = {"FILL", "DRIP_WAIT", "VERIFY_TARGET", "FAULT"}
 RATE_AXIS_LABEL = "Füllrate [g/s]"
@@ -249,6 +257,42 @@ def _figure_style() -> None:
     )
 
 
+def _parse_show_rate(value: str) -> str:
+    raw = value.strip().lower()
+    if raw in {"none", "off", "n"}:
+        return "none"
+    if raw in {"all", "a"}:
+        return "all"
+    aliases = {
+        "both": "raw,filtered",
+        "f": "filtered",
+        "r": "raw",
+        "m": "medium",
+        "s": "slow",
+    }
+    raw = aliases.get(raw, raw)
+    tokens = [part.strip().lower() for part in raw.split(",") if part.strip()]
+    if not tokens:
+        return "none"
+    invalid = [token for token in tokens if token not in RATE_SERIES_SPECS]
+    if invalid:
+        raise argparse.ArgumentTypeError(
+            f"Unknown rate series: {', '.join(invalid)}. "
+            f"Use one of: {', '.join(RATE_SELECTION_ORDER)}, all, none."
+        )
+    ordered = [name for name in RATE_SELECTION_ORDER if name in tokens]
+    return ",".join(ordered) if ordered else "none"
+
+
+def _selected_rate_series(show_rate: str) -> list[str]:
+    if show_rate == "none":
+        return []
+    if show_rate == "all":
+        return RATE_SELECTION_ORDER.copy()
+    selected = [part.strip() for part in show_rate.split(",") if part.strip()]
+    return [name for name in RATE_SELECTION_ORDER if name in selected]
+
+
 def _gate_label_de(record: dict[str, Any]) -> str:
     text = str(record.get("text", "")).strip()
     return GATE_LABELS_DE.get(text, text or "Ereignis")
@@ -322,8 +366,7 @@ def _series_from_samples(
     list[float],
     list[float | None],
     list[float | None],
-    list[float | None],
-    list[float | None],
+    dict[str, list[float | None]],
     float | None,
 ]:
     x_samples = [_seconds_from_focus(fill_run, record) for record in samples]
@@ -341,9 +384,11 @@ def _series_from_samples(
         for x_value, weight in zip(x_samples, absolute_weights, strict=True)
     ]
     gate_pct = [_float_value(record, "gate_pct") for record in samples]
-    raw_rate = [_float_value(record, "rate_raw_gps") for record in samples]
-    filtered_rate = [_float_value(record, "rate_filtered_gps") for record in samples]
-    return x_samples, fill_mass, gate_pct, raw_rate, filtered_rate, base_weight_g
+    rate_series = {
+        name: [_float_value(record, spec["field"]) for record in samples]
+        for name, spec in RATE_SERIES_SPECS.items()
+    }
+    return x_samples, fill_mass, gate_pct, rate_series, base_weight_g
 
 
 def _plot_state_background(
@@ -700,6 +745,7 @@ def _draw_debug_metadata(
                 ("Nachtropfen Start", _format_meta_value(_float_value(first_adaptive_sample, "adapted_drip_wait_ms"), "ms", 0)),
                 ("Totzeit Schätzwert", _format_meta_value(_float_value(first_adaptive_sample, "learned_dead_time_s"), "s", 3)),
                 ("Nachlauf Schätzwert", _format_meta_value(_float_value(first_adaptive_sample, "learned_post_close_gain_g"), "g", 1)),
+                ("Bias Nahe Schließen", _format_meta_value(_float_value(first_adaptive_sample, "learned_near_close_bias_g"), "g", 1)),
             ]
         )
     if summary is not None:
@@ -717,9 +763,21 @@ def _draw_debug_metadata(
             [
                 ("Totzeit Messung", _format_meta_value(_float_value(summary, "measured_dead_time_s"), "s", 3)),
                 ("Nachlauf Messung", _format_meta_value(_float_value(summary, "measured_post_close_gain_g"), "g", 1)),
+                ("Near-Close Ist", _format_meta_value(_float_value(summary, "measured_near_close_gain_g"), "g", 1)),
                 ("Rate schnell", _format_meta_value(_float_value(summary, "measured_fast_rate_gps"), "g/s", 1)),
                 ("Rate reduziert", _format_meta_value(_float_value(summary, "measured_slow_rate_gps"), "g/s", 1)),
                 ("Rate beim Schließen", _format_meta_value(_float_value(summary, "rate_at_close_gps"), "g/s", 1)),
+                ("2-Sample beim Schließen", _format_meta_value(_float_value(summary, "rate_2sample_at_close_gps"), "g/s", 1)),
+                ("4-Sample beim Schließen", _format_meta_value(_float_value(summary, "rate_4sample_at_close_gps"), "g/s", 1)),
+                ("Mittel beim Schließen", _format_meta_value(_float_value(summary, "rate_filtered_medium_at_close_gps"), "g/s", 1)),
+                ("Langsam beim Schließen", _format_meta_value(_float_value(summary, "rate_filtered_slow_at_close_gps"), "g/s", 1)),
+                ("Totzeit Start", _format_meta_value(_float_value(summary, "used_dead_time_s"), "s", 3)),
+                ("Nachlauf Start", _format_meta_value(_float_value(summary, "used_post_close_gain_g"), "g", 1)),
+                ("Rate schnell Start", _format_meta_value(_float_value(summary, "used_fast_rate_gps"), "g/s", 1)),
+                ("Rate reduziert Start", _format_meta_value(_float_value(summary, "used_slow_rate_gps"), "g/s", 1)),
+                ("Bias Start", _format_meta_value(_float_value(summary, "used_near_close_bias_g"), "g", 1)),
+                ("Near-Close Start", _format_meta_value(_float_value(summary, "used_near_close_g"), "g", 1)),
+                ("Früh schließen Start", _format_meta_value(_float_value(summary, "used_close_early_g"), "g", 1)),
                 ("Nachtropfen Ist", _format_meta_value(_float_value(summary, "drip_wait_used_ms"), "ms", 0)),
             ]
         )
@@ -729,6 +787,7 @@ def _draw_debug_metadata(
                 ("Nächster Nachlauf", _format_meta_value(_float_value(summary, "next_post_close_gain_g"), "g", 1)),
                 ("Nächste Rate schnell", _format_meta_value(_float_value(summary, "next_fast_rate_gps"), "g/s", 1)),
                 ("Nächste Rate reduziert", _format_meta_value(_float_value(summary, "next_slow_rate_gps"), "g/s", 1)),
+                ("Nächster Bias", _format_meta_value(_float_value(summary, "next_near_close_bias_g"), "g", 1)),
                 ("Nächstes Nachtropfen", _format_meta_value(_float_value(summary, "next_drip_wait_ms"), "ms", 0)),
                 ("Nächstes Nahe Schließen", _format_meta_value(_float_value(summary, "next_near_close_g"), "g", 1)),
                 ("Nächstes Früh schließen", _format_meta_value(_float_value(summary, "next_close_early_g"), "g", 1)),
@@ -818,8 +877,7 @@ def _create_figure_axes(
 def _plot_rate_panel(
     rate_ax: Any,
     x_samples: list[float],
-    raw_rate: list[float | None],
-    filtered_rate: list[float | None],
+    rate_series: dict[str, list[float | None]],
     *,
     show_rate: str,
     overlay: bool,
@@ -827,35 +885,24 @@ def _plot_rate_panel(
     plotted_any = False
     handles: list[Any] = []
     labels: list[str] = []
-    if show_rate in {"both"}:
-        if any(value is not None for value in raw_rate):
-            (line_raw,) = rate_ax.plot(
-                x_samples,
-                raw_rate,
-                color=LINE_RATE_RAW,
-                linewidth=1.0 if overlay else 1.0,
-                label="Rohrate [g/s]",
-                zorder=6 if overlay else 2,
-                alpha=0.85 if overlay else 1.0,
-            )
-            handles.append(line_raw)
-            labels.append("Rohrate [g/s]")
-            plotted_any = True
-    if show_rate in {"filtered", "both"}:
-        if any(value is not None for value in filtered_rate):
-            filtered_label = "Gefilterte Füllrate [g/s]" if show_rate == "both" else "Füllrate [g/s]"
-            (line_filtered,) = rate_ax.plot(
-                x_samples,
-                filtered_rate,
-                color=LINE_RATE_FILTERED,
-                linewidth=1.2 if overlay else 1.6,
-                label=filtered_label,
-                zorder=7 if overlay else 3,
-                alpha=0.9 if overlay else 1.0,
-            )
-            handles.append(line_filtered)
-            labels.append(filtered_label)
-            plotted_any = True
+    selected_series = _selected_rate_series(show_rate)
+    for z_index, name in enumerate(selected_series, start=2):
+        values = rate_series.get(name, [])
+        if not any(value is not None for value in values):
+            continue
+        spec = RATE_SERIES_SPECS[name]
+        (line_rate,) = rate_ax.plot(
+            x_samples,
+            values,
+            color=spec["color"],
+            linewidth=1.1 if name == "raw" else (1.2 if overlay else 1.5),
+            label=spec["label"],
+            zorder=(6 + z_index) if overlay else z_index,
+            alpha=0.85 if name == "raw" else (0.92 if overlay else 1.0),
+        )
+        handles.append(line_rate)
+        labels.append(spec["label"])
+        plotted_any = True
     if overlay:
         rate_ax.set_ylabel(RATE_AXIS_LABEL, color=LINE_RATE_FILTERED)
     else:
@@ -904,7 +951,7 @@ def _render_fill_variant(
     states = _state_events(records)
     gates = _gate_events(records)
     faults = _fault_events(records)
-    x_samples, y_fill_mass, y_gate, raw_rate, filtered_rate, base_weight_g = _series_from_samples(fill_run, samples)
+    x_samples, y_fill_mass, y_gate, rate_series, base_weight_g = _series_from_samples(fill_run, samples)
 
     _figure_style()
     fig, band_ax, ax, rate_ax, meta_ax = _create_figure_axes(
@@ -980,8 +1027,7 @@ def _render_fill_variant(
         handles3, labels3 = _plot_rate_panel(
             rate_ax,
             x_samples,
-            raw_rate,
-            filtered_rate,
+            rate_series,
             show_rate=show_rate,
             overlay=overlay_rate,
         )
@@ -1164,9 +1210,12 @@ def main() -> int:
     )
     parser.add_argument(
         "--show-rate",
-        choices=["none", "filtered", "both"],
+        type=_parse_show_rate,
         default="none",
-        help="Show fill-rate telemetry in addition to mass and gate traces",
+        help=(
+            "Show rate telemetry as none, all, or a comma list such as "
+            "raw,filtered,medium"
+        ),
     )
     parser.add_argument(
         "--rate-layout",

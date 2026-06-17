@@ -402,6 +402,28 @@ def parse_fill_selection_batch(sessions: Sequence[SessionInfo]) -> str | None:
     return selection
 
 
+def parse_rate_selection() -> str:
+    print(style("Available flow-rate traces", ANSI_BOLD, FG_TITLE))
+    print(style("  raw, 2sample, 4sample, filtered, medium, slow", FG_HINT))
+    print(style("Use a comma list like raw,filtered,medium, or 'all' / 'none'.", FG_HINT))
+    while True:
+        selection = prompt("Rate traces to plot", "filtered").strip().lower()
+        if selection in {"", "none", "off"}:
+            return "none"
+        if selection == "all":
+            return "all"
+        tokens = [part.strip() for part in selection.split(",") if part.strip()]
+        valid = {"raw", "2sample", "4sample", "filtered", "medium", "slow"}
+        invalid = [token for token in tokens if token not in valid]
+        if invalid:
+            print(style(f"Unknown rate traces: {', '.join(invalid)}", FG_ERROR))
+            continue
+        ordered = [name for name in ["raw", "2sample", "4sample", "filtered", "medium", "slow"] if name in tokens]
+        if ordered:
+            return ",".join(ordered)
+        print(style("Enter at least one valid rate trace, 'all', or 'none'.", FG_ERROR))
+
+
 def action_capture(output_root: Path) -> None:
     print_header(
         "Telemetry TUI: Capture",
@@ -521,13 +543,9 @@ def action_plot(output_root: Path) -> None:
         [("n", "none"), ("b", "compact top band"), ("g", "full background")],
         "b",
     )
-    show_rate = prompt_choice(
-        "Fill-rate telemetry",
-        [("n", "none"), ("f", "filtered only"), ("b", "raw + filtered")],
-        "f",
-    )
+    show_rate = parse_rate_selection()
     rate_layout = "s"
-    if show_rate != "n":
+    if show_rate != "none":
         print(style("Overlay keeps one compact chart but uses an extra right axis for g/s.", FG_HINT))
         print(style("Subplot keeps units visually cleaner and is usually the better thesis default.", FG_HINT))
         rate_layout = prompt_choice(
@@ -575,7 +593,7 @@ def action_plot(output_root: Path) -> None:
             "--state-style",
             {"n": "none", "b": "band", "g": "background"}[state_style],
             "--show-rate",
-            {"n": "none", "f": "filtered", "b": "both"}[show_rate],
+            show_rate,
             "--rate-layout",
             "overlay" if rate_layout == "o" else "subplot",
             "--figure-profile",
