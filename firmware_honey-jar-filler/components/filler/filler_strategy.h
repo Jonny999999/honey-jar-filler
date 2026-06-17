@@ -60,6 +60,9 @@ typedef struct {
     float learned_post_close_gain_g;
     float learned_fast_rate_gps;
     float learned_slow_rate_gps;
+    float learned_finish_trim_g;
+    float learned_fast_start_gate_pct;
+    float learned_slow_start_gate_pct;
     float learned_near_close_bias_g;
     float adapted_near_close_g;
     float adapted_close_early_g;
@@ -72,6 +75,8 @@ typedef struct {
     bool measured_near_close_valid;
     float target_g;
     float control_gate_cmd_pct;
+    float gate_at_slow_entry_pct;
+    float gate_at_close_pct;
     float control_target_rate_gps;
     float control_rate_error_gps;
     int64_t control_last_update_us;

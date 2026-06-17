@@ -22,6 +22,8 @@
 #define LEARN_ALPHA_POST_CLOSE 0.65f
 #define LEARN_ALPHA_RATE 0.20f
 #define LEARN_ALPHA_DRIP_WAIT 0.35f
+#define LEARN_ALPHA_FINISH_TRIM 0.18f
+#define LEARN_ALPHA_GATE_START 0.30f
 
 // Verify robustness.
 #define VERIFY_CONFIRM_SAMPLES 4u
@@ -38,6 +40,8 @@
 #define CLOSE_BUFFER_G 1.5f
 #define REFILL_RELAX_STEP_G 2.5f
 #define NEAR_CLOSE_TRANSITION_MARGIN_G 4.0f
+#define FLOW_FINISH_TRIM_MIN_G -10.0f
+#define FLOW_FINISH_TRIM_MAX_G 12.0f
 
 // Safety limits.
 #define FLOW_HARD_OVERFILL_MARGIN_MIN_G 12.0f
@@ -72,6 +76,9 @@ typedef struct {
     float post_close_gain_g;
     float fast_rate_gps;
     float slow_rate_gps;
+    float finish_trim_g;
+    float fast_start_gate_pct;
+    float slow_start_gate_pct;
     float drip_wait_ms;
 } flow_learned_entry_t;
 
@@ -180,6 +187,9 @@ static void flow_defaults_from_params(flow_learned_entry_t *entry, const app_par
     entry->post_close_gain_g = clampf_local((float)params->close_early_g * 0.55f, 1.0f, 120.0f);
     entry->fast_rate_gps = fallback_fast_rate_gps(params);
     entry->slow_rate_gps = fallback_slow_rate_gps(params);
+    entry->finish_trim_g = 0.0f;
+    entry->fast_start_gate_pct = clampf_local((float)params->max_gate_pct, 0.0f, 100.0f);
+    entry->slow_start_gate_pct = clampf_local((float)params->near_close_gate_pct, 0.0f, 100.0f);
     entry->drip_wait_ms = clampf_local((float)params->drip_delay_ms, DRIP_WAIT_MIN_MS, DRIP_WAIT_MAX_MS);
 }
 
@@ -187,13 +197,16 @@ static void log_learned_entry(const char *prefix, uint8_t preset_index, const fl
 {
     if (!prefix || !entry) return;
     ESP_LOGI(TAG,
-             "%s preset=%u dead_time=%.3f s post_close=%.1f g fast_rate=%.1f g/s slow_rate=%.1f g/s drip_wait=%.0f ms fills=%lu",
+             "%s preset=%u dead_time=%.3f s post_close=%.1f g fast_rate=%.1f g/s slow_rate=%.1f g/s finish_trim=%.1f g fast_start=%.1f%% slow_start=%.1f%% drip_wait=%.0f ms fills=%lu",
              prefix,
              (unsigned)preset_index,
              (double)entry->dead_time_s,
              (double)entry->post_close_gain_g,
              (double)entry->fast_rate_gps,
              (double)entry->slow_rate_gps,
+             (double)entry->finish_trim_g,
+             (double)entry->fast_start_gate_pct,
+             (double)entry->slow_start_gate_pct,
              (double)entry->drip_wait_ms,
              (unsigned long)entry->successful_fills);
 }
@@ -238,40 +251,72 @@ static float close_phase_rate_gps(const filler_strategy_runtime_t *rt, const app
 
 static float fast_gate_min_pct(const app_params_t *params)
 {
-    float near_gate = params ? (float)params->near_close_gate_pct : 20.0f;
-    return clampf_local(near_gate, 5.0f, params ? (float)params->max_gate_pct : 100.0f);
+    (void)params;
+    return 0.0f;
 }
 
 static float fast_gate_max_pct(const app_params_t *params)
 {
-    float max_gate = params ? (float)params->max_gate_pct : 100.0f;
-    return clampf_local(max_gate, 5.0f, 100.0f);
+    (void)params;
+    return 100.0f;
 }
 
 static float slow_gate_max_pct(const app_params_t *params)
 {
-    float max_gate = fast_gate_max_pct(params);
-    float near_gate = params ? (float)params->near_close_gate_pct : 20.0f;
-    return clampf_local(near_gate, 4.0f, max_gate);
+    (void)params;
+    return 100.0f;
 }
 
 static float slow_gate_min_pct(const app_params_t *params)
 {
-    float slow_max = slow_gate_max_pct(params);
-    return clampf_local(fmaxf(4.0f, slow_max * 0.4f), 4.0f, slow_max);
+    (void)params;
+    return 0.0f;
 }
 
 static float flow_start_gate_pct(const app_params_t *params)
 {
-    float fast_min = fast_gate_min_pct(params);
-    float fast_max = fast_gate_max_pct(params);
-    return clampf_local(fast_max * 0.75f, fast_min, fast_max);
+    // Preset gate percentages act as the initial operating points for the two
+    // flow-control phases. The controller is still free to move over the full
+    // 0..100% range afterward if the measured flow requires it.
+    float start_gate = params ? (float)params->max_gate_pct : 80.0f;
+    return clampf_local(start_gate, 0.0f, 100.0f);
+}
+
+static float flow_slow_phase_start_gate_pct(const app_params_t *params)
+{
+    float start_gate = params ? (float)params->near_close_gate_pct : 20.0f;
+    return clampf_local(start_gate, 0.0f, 100.0f);
+}
+
+static float flow_runtime_fast_start_gate_pct(const filler_strategy_runtime_t *rt, const app_params_t *params)
+{
+    if (!rt || rt->learned_fast_start_gate_pct <= 0.0f) {
+        return flow_start_gate_pct(params);
+    }
+    return clampf_local(rt->learned_fast_start_gate_pct, 0.0f, 100.0f);
+}
+
+static float flow_runtime_slow_start_gate_pct(const filler_strategy_runtime_t *rt, const app_params_t *params)
+{
+    if (!rt || rt->learned_slow_start_gate_pct <= 0.0f) {
+        return flow_slow_phase_start_gate_pct(params);
+    }
+    return clampf_local(rt->learned_slow_start_gate_pct, 0.0f, 100.0f);
 }
 
 static float control_holdoff_ms(const filler_strategy_runtime_t *rt)
 {
-    float learned_dead_ms = rt ? (rt->learned_dead_time_s * 1000.0f) : FLOW_CTRL_HOLDOFF_MIN_MS;
-    return clampf_local(learned_dead_ms, FLOW_CTRL_HOLDOFF_MIN_MS, FLOW_CTRL_HOLDOFF_MAX_MS);
+    if (!rt) return FLOW_CTRL_HOLDOFF_MIN_MS;
+
+    // Use the preset/session-learned dead time as the startup estimate, then
+    // switch to the measured dead time from the current fill once a response
+    // has actually been detected. That keeps the controller holdoff dynamic
+    // within the run instead of waiting until the next jar to benefit.
+    float dead_time_s = rt->learned_dead_time_s;
+    if (rt->response_detected && rt->measured_dead_time_s > 0.0f) {
+        dead_time_s = rt->measured_dead_time_s;
+    }
+    return clampf_local(dead_time_s * 1000.0f, FLOW_CTRL_HOLDOFF_MIN_MS, FLOW_CTRL_HOLDOFF_MAX_MS);
 }
 
 static float target_rate_gps(const filler_strategy_runtime_t *rt, const app_params_t *params)
@@ -301,14 +346,17 @@ static void update_thresholds(filler_strategy_runtime_t *rt, const filler_strate
     float transition_mass_g = rt->learned_dead_time_s * fast_transition_rate;
     float close_dead_mass_g = rt->learned_dead_time_s * close_rate;
 
-    // Final close uses a learned residual mass model: mass still in transport
-    // at the controlled slow rate plus the empirically observed post-close
-    // dripping/tail mass.
+    // Final close is still driven by the learned post-close residual mass.
+    // The slow-phase transport mass only adds the remaining in-flight portion
+    // before the fully closed command can take effect.
     rt->predicted_remaining_g = rt->learned_post_close_gain_g + close_dead_mass_g;
 
     float close_max = fmaxf((float)tick->params->close_early_g * 1.8f, 10.0f);
     float near_max = fmaxf((float)tick->params->near_close_delta_g * 2.0f, 30.0f);
-    float close_candidate = rt->predicted_remaining_g + CLOSE_BUFFER_G - rt->close_early_relax_g;
+    // A small learned finish trim compensates for repeatable mean fill error
+    // that still sits inside tolerance. Positive trim closes later.
+    float close_candidate = rt->predicted_remaining_g + CLOSE_BUFFER_G -
+                            rt->close_early_relax_g - rt->learned_finish_trim_g;
     float close_threshold = clampf_local(close_candidate, 2.0f, close_max);
     float near_candidate = transition_mass_g + close_threshold + NEAR_CLOSE_TRANSITION_MARGIN_G;
 
@@ -425,6 +473,7 @@ static void mark_first_close(filler_strategy_runtime_t *rt, const filler_strateg
     rt->rel_at_first_close_g = tick->latest->grams - rt->run_base_weight_g;
     rt->last_gain_ts_us = rt->first_close_ts_us;
     rt->rate_at_close_gps = (rt->filtered_rate_gps > 0.0f) ? rt->filtered_rate_gps : rt->raw_rate_gps;
+    rt->gate_at_close_pct = rt->control_gate_cmd_pct;
 }
 
 static float safe_rate_limit_gps(const filler_strategy_runtime_t *rt, const app_params_t *params)
@@ -514,6 +563,7 @@ static void publish_summary_and_learn(filler_strategy_runtime_t *rt,
     float final_rel_g = tick->latest->grams - rt->run_base_weight_g;
     float fast_avg = (rt->fast_rate_count > 0) ? (rt->fast_rate_sum_gps / (float)rt->fast_rate_count) : 0.0f;
     float slow_avg = (rt->slow_rate_count > 0) ? (rt->slow_rate_sum_gps / (float)rt->slow_rate_count) : 0.0f;
+    float fill_error_g = final_rel_g - (float)tick->params->target_grams;
     float fill_duration_s = (rt->fill_open_ts_us > 0)
         ? ((float)(tick->now_us - rt->fill_open_ts_us) / 1000000.0f)
         : 0.0f;
@@ -534,17 +584,36 @@ static void publish_summary_and_learn(filler_strategy_runtime_t *rt,
         entry->post_close_gain_g = ewma(entry->post_close_gain_g, rt->measured_post_close_gain_g, LEARN_ALPHA_POST_CLOSE);
         entry->fast_rate_gps = ewma(entry->fast_rate_gps, fast_avg, LEARN_ALPHA_RATE);
         if (slow_avg > 0.0f) entry->slow_rate_gps = ewma(entry->slow_rate_gps, slow_avg, LEARN_ALPHA_RATE);
+        entry->finish_trim_g = ewma(entry->finish_trim_g,
+                                    clampf_local(-fill_error_g, FLOW_FINISH_TRIM_MIN_G, FLOW_FINISH_TRIM_MAX_G),
+                                    LEARN_ALPHA_FINISH_TRIM);
+        entry->finish_trim_g = clampf_local(entry->finish_trim_g,
+                                            FLOW_FINISH_TRIM_MIN_G,
+                                            FLOW_FINISH_TRIM_MAX_G);
+        if (rt->gate_at_slow_entry_pct > 0.0f) {
+            entry->fast_start_gate_pct = ewma(entry->fast_start_gate_pct,
+                                              clampf_local(rt->gate_at_slow_entry_pct, 0.0f, 100.0f),
+                                              LEARN_ALPHA_GATE_START);
+        }
+        if (rt->gate_at_close_pct > 0.0f) {
+            entry->slow_start_gate_pct = ewma(entry->slow_start_gate_pct,
+                                              clampf_local(rt->gate_at_close_pct, 0.0f, 100.0f),
+                                              LEARN_ALPHA_GATE_START);
+        }
         entry->drip_wait_ms = ewma(entry->drip_wait_ms,
                                    clampf_local(settled_wait_ms, DRIP_WAIT_MIN_MS, DRIP_WAIT_MAX_MS),
                                    LEARN_ALPHA_DRIP_WAIT);
         entry->successful_fills++;
         ESP_LOGI(TAG,
-                 "learned update reason=%s dead_time %.3f->%.3f s post_close %.1f->%.1f g fast_rate %.1f->%.1f g/s slow_rate %.1f->%.1f g/s drip_wait %.0f->%.0f ms",
+                 "learned update reason=%s dead_time %.3f->%.3f s post_close %.1f->%.1f g fast_rate %.1f->%.1f g/s slow_rate %.1f->%.1f g/s finish_trim %.1f->%.1f g fast_start %.1f->%.1f%% slow_start %.1f->%.1f%% drip_wait %.0f->%.0f ms",
                  reason ? reason : "ok",
                  (double)before.dead_time_s, (double)entry->dead_time_s,
                  (double)before.post_close_gain_g, (double)entry->post_close_gain_g,
                  (double)before.fast_rate_gps, (double)entry->fast_rate_gps,
                  (double)before.slow_rate_gps, (double)entry->slow_rate_gps,
+                 (double)before.finish_trim_g, (double)entry->finish_trim_g,
+                 (double)before.fast_start_gate_pct, (double)entry->fast_start_gate_pct,
+                 (double)before.slow_start_gate_pct, (double)entry->slow_start_gate_pct,
                  (double)before.drip_wait_ms, (double)entry->drip_wait_ms);
     } else {
         ESP_LOGI(TAG,
@@ -562,7 +631,7 @@ static void publish_summary_and_learn(filler_strategy_runtime_t *rt,
         .valid = true,
         .final_mass_g = final_rel_g,
         .target_g = (float)tick->params->target_grams,
-        .fill_error_g = final_rel_g - (float)tick->params->target_grams,
+        .fill_error_g = fill_error_g,
         .measured_dead_time_s = rt->measured_dead_time_s,
         .measured_post_close_gain_g = rt->measured_post_close_gain_g,
         .measured_fast_rate_gps = fast_avg,
@@ -571,6 +640,12 @@ static void publish_summary_and_learn(filler_strategy_runtime_t *rt,
         .fill_duration_s = fill_duration_s,
         .drip_wait_used_ms = rt->adapted_drip_wait_ms,
         .refill_count = rt->refill_count,
+        .used_dead_time_s = rt->learned_dead_time_s,
+        .used_post_close_gain_g = rt->learned_post_close_gain_g,
+        .used_fast_rate_gps = rt->learned_fast_rate_gps,
+        .used_slow_rate_gps = rt->learned_slow_rate_gps,
+        .used_near_close_g = rt->adapted_near_close_g,
+        .used_close_early_g = rt->adapted_close_early_g,
         .next_dead_time_s = entry->dead_time_s,
         .next_post_close_gain_g = entry->post_close_gain_g,
         .next_fast_rate_gps = entry->fast_rate_gps,
@@ -604,10 +679,17 @@ static void flow_on_enter(filler_strategy_runtime_t *rt,
             rt->fill_open_ts_us = tick->now_us;
             rt->active_preset_index = tick->preset_index;
             rt->target_g = (float)tick->params->target_grams;
+            rt->learned_dead_time_s = entry->dead_time_s;
+            rt->learned_post_close_gain_g = entry->post_close_gain_g;
+            rt->learned_fast_rate_gps = entry->fast_rate_gps;
+            rt->learned_slow_rate_gps = entry->slow_rate_gps;
+            rt->learned_finish_trim_g = entry->finish_trim_g;
+            rt->learned_fast_start_gate_pct = entry->fast_start_gate_pct;
+            rt->learned_slow_start_gate_pct = entry->slow_start_gate_pct;
             if (!env->jar_tare_get || !env->jar_tare_get(&rt->run_base_weight_g)) {
                 rt->run_base_weight_g = tick->latest ? tick->latest->grams : 0.0f;
             }
-            rt->control_gate_cmd_pct = flow_start_gate_pct(tick->params);
+            rt->control_gate_cmd_pct = flow_runtime_fast_start_gate_pct(rt, tick->params);
             rt->adapted_drip_wait_ms = entry->drip_wait_ms;
             log_learned_entry("starting flow-control fill with", tick->preset_index, entry);
         } else {
@@ -634,21 +716,19 @@ static void flow_on_enter(filler_strategy_runtime_t *rt,
         rt->control_last_update_us = 0;
         clear_live_rate_estimates(rt);
         flow_reset_counters(rt);
-        rt->learned_dead_time_s = entry->dead_time_s;
-        rt->learned_post_close_gain_g = entry->post_close_gain_g;
-        rt->learned_fast_rate_gps = entry->fast_rate_gps;
-        rt->learned_slow_rate_gps = entry->slow_rate_gps;
         update_thresholds(rt, tick);
         update_control_targets(rt, tick->params);
         ESP_LOGI(TAG,
-                 "flow thresholds near_close=%.1f g close_early=%.1f g predicted_remaining=%.1f g target_fast=%.1f g/s target_slow=%.1f g/s drip_wait=%.0f ms start_gate=%.1f%%",
+                 "flow thresholds near_close=%.1f g close_early=%.1f g predicted_remaining=%.1f g finish_trim=%.1f g target_fast=%.1f g/s target_slow=%.1f g/s drip_wait=%.0f ms start_gate=%.1f%% slow_start_gate=%.1f%%",
                  (double)rt->adapted_near_close_g,
                  (double)rt->adapted_close_early_g,
                  (double)rt->predicted_remaining_g,
+                 (double)rt->learned_finish_trim_g,
                  (double)rt->learned_fast_rate_gps,
                  (double)rt->learned_slow_rate_gps,
                  (double)rt->adapted_drip_wait_ms,
-                 (double)rt->control_gate_cmd_pct);
+                 (double)rt->control_gate_cmd_pct,
+                 (double)flow_runtime_slow_start_gate_pct(rt, tick->params));
         env->publish_fill_start(tick->run_id,
                                 tick->slot_idx,
                                 tick->strategy_name,
@@ -767,17 +847,19 @@ static filler_state_t flow_step(filler_strategy_runtime_t *rt,
 
         if (remaining_g <= rt->adapted_near_close_g && !rt->near_close_logged) {
             rt->near_close_logged = true;
-            float slow_max = slow_gate_max_pct(tick->params);
-            if (rt->control_gate_cmd_pct > slow_max) {
-                flow_command_gate(rt, env, slow_max, "flow_slow_enter", tick->now_us, true);
+            rt->gate_at_slow_entry_pct = rt->control_gate_cmd_pct;
+            float slow_start_gate = flow_runtime_slow_start_gate_pct(rt, tick->params);
+            if (rt->control_gate_cmd_pct > slow_start_gate) {
+                flow_command_gate(rt, env, slow_start_gate, "flow_slow_enter", tick->now_us, true);
             }
             update_control_targets(rt, tick->params);
             ESP_LOGI(TAG,
-                     "flow slow-phase enter remaining=%.1f g threshold=%.1f g target_rate=%.1f g/s gate=%.1f%%",
+                     "flow slow-phase enter remaining=%.1f g threshold=%.1f g target_rate=%.1f g/s gate=%.1f%% start_gate=%.1f%%",
                      (double)remaining_g,
                      (double)rt->adapted_near_close_g,
                      (double)rt->control_target_rate_gps,
-                     (double)rt->control_gate_cmd_pct);
+                     (double)rt->control_gate_cmd_pct,
+                     (double)slow_start_gate);
             publish_runtime_snapshot(rt, env, tick);
             return state;
         }
