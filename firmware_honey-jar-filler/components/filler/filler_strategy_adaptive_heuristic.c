@@ -200,18 +200,18 @@ static void adaptive_defaults_from_params(adaptive_learned_entry_t *entry, const
 {
     if (!entry || !params) return;
     float poll_s = ((float)CONFIG_HX711_POLL_INTERVAL_MS / 1000.0f) * 2.5f;
-    float default_close_g = clampf_local(clampf_local((float)params->close_early_g * 0.55f, 1.0f, 120.0f) + CLOSE_BUFFER_G,
+    float default_close_g = clampf_local(clampf_local((float)params->close_remaining_g * 0.55f, 1.0f, 120.0f) + CLOSE_BUFFER_G,
                                          2.0f,
-                                         fmaxf((float)params->close_early_g * 1.8f, 8.0f));
+                                         fmaxf((float)params->close_remaining_g * 1.8f, 8.0f));
     entry->initialized = 1;
     entry->dead_time_s = clampf_local(poll_s, 0.25f, 1.20f);
-    entry->post_close_gain_g = clampf_local((float)params->close_early_g * 0.55f, 1.0f, 120.0f);
+    entry->post_close_gain_g = clampf_local((float)params->close_remaining_g * 0.55f, 1.0f, 120.0f);
     entry->fast_rate_gps = 0.0f;
     entry->slow_rate_gps = 0.0f;
     // Preserve preset-driven startup behavior by biasing the empirical
     // near-close correction so the first adaptive threshold stays close to the
     // preset's configured near-close delta until measured runs refine it.
-    entry->near_close_bias_g = clampf_local((float)params->near_close_delta_g -
+    entry->near_close_bias_g = clampf_local((float)params->slow_remaining_g -
                                             default_close_g -
                                             NEAR_CLOSE_TRANSITION_MARGIN_G,
                                             NEAR_CLOSE_BIAS_MIN_G,
@@ -376,8 +376,8 @@ static void update_adapted_thresholds(filler_strategy_runtime_t *rt, const fille
     // dead time again.
     rt->predicted_remaining_g = rt->learned_post_close_gain_g;
 
-    float close_max = fmaxf((float)tick->params->close_early_g * 1.8f, 8.0f);
-    float near_max = fmaxf((float)tick->params->near_close_delta_g * 2.0f, 20.0f);
+    float close_max = fmaxf((float)tick->params->close_remaining_g * 1.8f, 8.0f);
+    float near_max = fmaxf((float)tick->params->slow_remaining_g * 2.0f, 20.0f);
     float close_candidate = rt->predicted_remaining_g + CLOSE_BUFFER_G - rt->close_early_relax_g;
     // Near-close is still seeded from the dead-time/rate estimate, but the
     // learned bias carries the long-term empirical correction for each preset.
@@ -569,8 +569,8 @@ static void compute_thresholds_for_summary(const adaptive_learned_entry_t *entry
     // Rebuild the thresholds that the next fill would start from after the
     // current run's learning update has been applied.
     float predicted_remaining_g = entry->post_close_gain_g;
-    float close_max = fmaxf((float)params->close_early_g * 1.8f, 8.0f);
-    float near_max = fmaxf((float)params->near_close_delta_g * 2.0f, 20.0f);
+    float close_max = fmaxf((float)params->close_remaining_g * 1.8f, 8.0f);
+    float near_max = fmaxf((float)params->slow_remaining_g * 2.0f, 20.0f);
     float close_candidate = predicted_remaining_g + CLOSE_BUFFER_G - close_early_relax_g;
     float transition_mass_g = entry->dead_time_s * fmaxf(0.0f, fast_transition_rate_gps);
     float transition_extra_g = transition_mass_g +
@@ -784,7 +784,7 @@ static void adaptive_on_enter(filler_strategy_runtime_t *rt,
                  (double)rt->learned_near_close_bias_g,
                  (double)rt->adapted_drip_wait_ms,
                  (unsigned)tick->params->max_gate_pct,
-                 (unsigned)tick->params->near_close_gate_pct,
+                 (unsigned)tick->params->slow_gate_pct,
                  (double)adaptive_no_response_limit_s(rt),
                  (double)response_threshold_g(tick));
         env->publish_fill_start(tick->run_id,
@@ -883,9 +883,9 @@ static filler_state_t adaptive_step(filler_strategy_runtime_t *rt,
                          "safe-rate reduction filtered_rate=%.1f g/s limit=%.1f g/s -> gate=%u%%",
                          (double)rt->filtered_rate_gps,
                          (double)safe_limit_gps,
-                         (unsigned)tick->params->near_close_gate_pct);
+                         (unsigned)tick->params->slow_gate_pct);
             }
-            env->gate_set_percent_label(tick->params->near_close_gate_pct, "safe_reduce");
+            env->gate_set_percent_label(tick->params->slow_gate_pct, "safe_reduce");
             rt->near_close_logged = true;
             publish_runtime_snapshot(rt, env, tick);
             return state;
@@ -938,9 +938,9 @@ static filler_state_t adaptive_step(filler_strategy_runtime_t *rt,
                          (double)rt->near_close_transition_estimate_g,
                          (double)rt->learned_near_close_bias_g,
                          (double)rt->adapted_close_early_g,
-                         (unsigned)tick->params->near_close_gate_pct);
+                         (unsigned)tick->params->slow_gate_pct);
             }
-            env->gate_set_percent_label(tick->params->near_close_gate_pct, "adaptive_near");
+            env->gate_set_percent_label(tick->params->slow_gate_pct, "adaptive_near");
             rt->near_close_logged = true;
             publish_runtime_snapshot(rt, env, tick);
             return state;

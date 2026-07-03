@@ -175,10 +175,10 @@ static void app_apply_builtin_preset_defaults(uint8_t index, app_params_t *p)
         p->target_tol_low_g = 20;
         p->target_tol_high_g = 50;
         p->fill_timeout_ms = 600000;
-        p->near_close_delta_g = 30;
-        p->near_close_gate_pct = 35;
+        p->slow_remaining_g = 30;
+        p->slow_gate_pct = 35;
         p->max_gate_pct = 98;
-        p->close_early_g = 10;
+        p->close_remaining_g = 10;
         p->drip_delay_ms = 20000;
         break;
     case 1: // Medium viscosity
@@ -188,10 +188,10 @@ static void app_apply_builtin_preset_defaults(uint8_t index, app_params_t *p)
         p->target_tol_low_g = 20;
         p->target_tol_high_g = 52;
         p->fill_timeout_ms = 600000;
-        p->near_close_delta_g = 110;
-        p->near_close_gate_pct = 14;
+        p->slow_remaining_g = 110;
+        p->slow_gate_pct = 14;
         p->max_gate_pct = 22;
-        p->close_early_g = 5;
+        p->close_remaining_g = 5;
         p->drip_delay_ms = 11000;
         break;
     case 3: // Testing

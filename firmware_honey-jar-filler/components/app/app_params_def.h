@@ -44,22 +44,22 @@
                   GROUP("Target + verification"), APP_PARAM_SCOPE_PRESET)   \
                                                                           \
     /*=== Honey flow tuning ===*/                                         \
-    APP_PARAM_U32(VAR(near_close_delta_g), LABEL("Near-close threshold g"), UNIT("g"),   \
+    APP_PARAM_U32(VAR(slow_remaining_g), LABEL("Slow remaining g"), UNIT("g"),   \
                     DEFAULT(60), MIN(0), MAX(500), STEP(1),                 \
                     BRIEF("Grams missing to target, gate partially closes"),           \
                     DETAIL("Start slowing flow when this close to target"), \
                     GROUP("Honey flow tuning"), APP_PARAM_SCOPE_PRESET)     \
-    APP_PARAM_U32(VAR(near_close_gate_pct), LABEL("Near-close gate %"), UNIT("%"), \
+    APP_PARAM_U32(VAR(slow_gate_pct), LABEL("Slow gate %"), UNIT("%"), \
                     DEFAULT(20), MIN(1), MAX(100), STEP(1),                 \
                     BRIEF("Partial opening near target"),                  \
-                    DETAIL("Gate opening used after near-close delta reached"), \
+                    DETAIL("Gate opening used after slow_remaining_g reached"), \
                     GROUP("Honey flow tuning"), APP_PARAM_SCOPE_PRESET)     \
     APP_PARAM_U32(VAR(max_gate_pct), LABEL("Max gate %"), UNIT("%"),        \
                     DEFAULT(80), MIN(5), MAX(100), STEP(1),                 \
                     BRIEF("Max opening during initial bulk fill"),                 \
                     DETAIL("Caps full-open position to reduce max flow (e.g. small glass or water)"),      \
                     GROUP("Honey flow tuning"), APP_PARAM_SCOPE_PRESET)     \
-    APP_PARAM_U32(VAR(close_early_g), LABEL("Close early threshold"), UNIT("g"),       \
+    APP_PARAM_U32(VAR(close_remaining_g), LABEL("Close remaining g"), UNIT("g"),       \
                     DEFAULT(150), MIN(0), MAX(500), STEP(1),                 \
                     BRIEF("Close before target to compensate drips"),      \
                     DETAIL("Thick honey usually needs a larger value; thin honey needs less - equals estimated in-flight mass"), \

@@ -184,12 +184,12 @@ static void flow_defaults_from_params(flow_learned_entry_t *entry, const app_par
     float poll_s = ((float)CONFIG_HX711_POLL_INTERVAL_MS / 1000.0f) * 2.5f;
     entry->initialized = 1u;
     entry->dead_time_s = clampf_local(poll_s, 0.25f, 1.20f);
-    entry->post_close_gain_g = clampf_local((float)params->close_early_g * 0.55f, 1.0f, 120.0f);
+    entry->post_close_gain_g = clampf_local((float)params->close_remaining_g * 0.55f, 1.0f, 120.0f);
     entry->fast_rate_gps = fallback_fast_rate_gps(params);
     entry->slow_rate_gps = fallback_slow_rate_gps(params);
     entry->finish_trim_g = 0.0f;
     entry->fast_start_gate_pct = clampf_local((float)params->max_gate_pct, 0.0f, 100.0f);
-    entry->slow_start_gate_pct = clampf_local((float)params->near_close_gate_pct, 0.0f, 100.0f);
+    entry->slow_start_gate_pct = clampf_local((float)params->slow_gate_pct, 0.0f, 100.0f);
     entry->drip_wait_ms = clampf_local((float)params->drip_delay_ms, DRIP_WAIT_MIN_MS, DRIP_WAIT_MAX_MS);
 }
 
@@ -284,7 +284,7 @@ static float flow_start_gate_pct(const app_params_t *params)
 
 static float flow_slow_phase_start_gate_pct(const app_params_t *params)
 {
-    float start_gate = params ? (float)params->near_close_gate_pct : 20.0f;
+    float start_gate = params ? (float)params->slow_gate_pct : 20.0f;
     return clampf_local(start_gate, 0.0f, 100.0f);
 }
 
@@ -351,8 +351,8 @@ static void update_thresholds(filler_strategy_runtime_t *rt, const filler_strate
     // before the fully closed command can take effect.
     rt->predicted_remaining_g = rt->learned_post_close_gain_g + close_dead_mass_g;
 
-    float close_max = fmaxf((float)tick->params->close_early_g * 1.8f, 10.0f);
-    float near_max = fmaxf((float)tick->params->near_close_delta_g * 2.0f, 30.0f);
+    float close_max = fmaxf((float)tick->params->close_remaining_g * 1.8f, 10.0f);
+    float near_max = fmaxf((float)tick->params->slow_remaining_g * 2.0f, 30.0f);
     // A small learned finish trim compensates for repeatable mean fill error
     // that still sits inside tolerance. Positive trim closes later.
     float close_candidate = rt->predicted_remaining_g + CLOSE_BUFFER_G -
