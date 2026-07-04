@@ -63,6 +63,11 @@ typedef struct {
     float adapted_near_close_g;
     float adapted_close_early_g;
     float adapted_drip_wait_ms;
+    // Cascade / Smith-predictor diagnostics (0 for the other strategies).
+    float model_rate_gps;          // ŷ  delay-free model rate
+    float model_delayed_gps;       // ŷ_d model rate through the dead time
+    float control_integ_pct;       // PI integrator state
+    float gate_gain_gps_per_pct;   // K̂  identified plant gain
     uint32_t refill_count;
 } filler_strategy_sample_telemetry_t;
 

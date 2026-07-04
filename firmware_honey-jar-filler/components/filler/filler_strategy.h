@@ -47,6 +47,8 @@ typedef struct {
     float slow_rate_sum_gps;
     uint16_t fast_rate_count;
     uint16_t slow_rate_count;
+    float gate_gain_sum;
+    uint16_t gate_gain_count;
     uint8_t rate_hist_count;
     float rate_hist_rel_g[5];
     int64_t rate_hist_ts_us[5];
@@ -62,6 +64,7 @@ typedef struct {
     float learned_post_close_gain_g;
     float learned_fast_rate_gps;
     float learned_slow_rate_gps;
+    float learned_gate_gain_gps_per_pct;
     float learned_finish_trim_g;
     float learned_fast_start_gate_pct;
     float learned_slow_start_gate_pct;

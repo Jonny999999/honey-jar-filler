@@ -425,6 +425,10 @@ static bool scale_publish_telemetry_sample(int64_t ts_us, float weight_g)
         rec.adapted_near_close_g = strategy_sample.adapted_near_close_g;
         rec.adapted_close_early_g = strategy_sample.adapted_close_early_g;
         rec.adapted_drip_wait_ms = strategy_sample.adapted_drip_wait_ms;
+        rec.model_rate_gps = strategy_sample.model_rate_gps;
+        rec.model_delayed_gps = strategy_sample.model_delayed_gps;
+        rec.control_integ_pct = strategy_sample.control_integ_pct;
+        rec.gate_gain_gps_per_pct = strategy_sample.gate_gain_gps_per_pct;
         rec.refill_count = strategy_sample.refill_count;
     }
 

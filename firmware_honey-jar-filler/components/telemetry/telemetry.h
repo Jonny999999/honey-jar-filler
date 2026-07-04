@@ -75,6 +75,10 @@ typedef struct {
     float adapted_near_close_g;
     float adapted_close_early_g;
     float adapted_drip_wait_ms;
+    float model_rate_gps;
+    float model_delayed_gps;
+    float control_integ_pct;
+    float gate_gain_gps_per_pct;
     float next_drip_wait_ms;
     float fill_error_g;
     float measured_post_close_gain_g;
