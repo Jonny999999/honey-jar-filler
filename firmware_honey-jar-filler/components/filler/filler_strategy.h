@@ -32,6 +32,7 @@ typedef struct {
     int64_t first_close_ts_us;
     int64_t last_rate_ts_us;
     int64_t last_gain_ts_us;
+    int64_t safe_reduce_ts_us;
     float run_base_weight_g;
     float last_rel_g;
     float last_post_close_gain_g;
