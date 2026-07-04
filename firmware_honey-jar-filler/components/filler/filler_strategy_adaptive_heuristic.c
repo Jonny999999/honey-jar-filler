@@ -60,20 +60,28 @@
 
 // Response / dead-time detection:
 // Response threshold defines when the first real weight movement is accepted.
+// Thick honey can have a long transport dead time (well over 5 s), so the
+// bounds are generous: the no-response fault only guards against an empty
+// bucket / total clog, and must never fire before slow honey has had time to
+// reach the glass. On the first jar (dead time not yet learned) the limit
+// falls back to NO_RESPONSE_MIN_S.
 #define RESPONSE_THRESHOLD_MIN_G 1.5f
 #define RESPONSE_THRESHOLD_MAX_G 6.0f
 #define DEAD_TIME_MIN_S 0.10f
-#define DEAD_TIME_MAX_S 10.00f
-#define NO_RESPONSE_MIN_S 7.00f
-#define NO_RESPONSE_MAX_S 12.00f
+#define DEAD_TIME_MAX_S 15.00f
+#define NO_RESPONSE_MIN_S 15.00f
+#define NO_RESPONSE_MAX_S 30.00f
 #define NO_RESPONSE_DEAD_TIME_MULT 4.0f
 #define NO_RESPONSE_EXTRA_S 1.5f
 
 // Adaptive threshold shaping:
-// CLOSE_BUFFER_G keeps closing slightly conservative, REFILL_RELAX_STEP_G makes
-// the next refill attempt less conservative after an underfill.
+// CLOSE_BUFFER_G keeps closing slightly conservative. After an underfill the
+// close threshold is relaxed by roughly the measured deficit (scaled by
+// REFILL_CLOSE_RELAX_FACTOR, floored at REFILL_RELAX_STEP_G) so a single refill
+// reaches target instead of many tiny steps that keep closing too early.
 #define CLOSE_BUFFER_G 1.5f
 #define REFILL_RELAX_STEP_G 2.5f
+#define REFILL_CLOSE_RELAX_FACTOR 0.90f
 #define NEAR_CLOSE_REFILL_RELAX_STEP_G 3.0f
 #define NEAR_CLOSE_REFILL_RELAX_MAX_G 12.0f
 #define REFILL_MIN_OPEN_MS 1000.0f
@@ -91,6 +99,10 @@
 // so it scales with jar size and protects the FIRST jar (before any fast rate
 // is learned), when the medium is far thinner than the fixed gate % expects.
 #define ADAPT_MIN_CONTROLLED_FILL_S 8.0f
+// Ignore the brief flow spike when the honey stream first hits the glass:
+// require several consecutive over-limit samples before the safe-rate cutback
+// acts, so a transient impact peak neither reduces the gate nor trips a fault.
+#define RATE_SPIKE_CONFIRM_SAMPLES 3u
 // If the reduced gate still cannot bring the flow under the safe limit within
 // this grace period, the medium is too thin for the fixed gate settings and the
 // run faults so the operator can lower the (non-adapting) gate percentages.
@@ -252,6 +264,7 @@ static void reset_state_counters(filler_strategy_runtime_t *rt)
     rt->cnt_target = 0;
     rt->cnt_under = 0;
     rt->cnt_over = 0;
+    rt->cnt_safe_rate = 0;
     rt->sample_count = 0;
     rt->safe_reduce_ts_us = 0;
 }
@@ -693,9 +706,12 @@ static void publish_summary_and_learn(filler_strategy_runtime_t *rt,
         entry->post_close_gain_g = learn_ewma(entry->post_close_gain_g, rt->measured_post_close_gain_g, LEARN_ALPHA_POST_CLOSE, obs);
         if (fast_avg > 0.0f) entry->fast_rate_gps = learn_ewma(entry->fast_rate_gps, fast_avg, LEARN_ALPHA_RATE, obs);
         if (slow_avg > 0.0f) entry->slow_rate_gps = learn_ewma(entry->slow_rate_gps, slow_avg, LEARN_ALPHA_RATE, obs);
-        entry->drip_wait_ms = learn_ewma(entry->drip_wait_ms,
-                                         clampf_local(settled_wait_ms, DRIP_WAIT_MIN_MS, DRIP_WAIT_MAX_MS),
-                                         LEARN_ALPHA_DRIP_WAIT, obs);
+        // Drip wait deliberately does NOT use the warmup: it eases gently from
+        // the (generous) preset seed toward the observed settling time so it
+        // stays conservative and never snaps short on a single fast-settling run.
+        entry->drip_wait_ms = ewma(entry->drip_wait_ms,
+                                   clampf_local(settled_wait_ms, DRIP_WAIT_MIN_MS, DRIP_WAIT_MAX_MS),
+                                   LEARN_ALPHA_DRIP_WAIT);
         entry->near_close_bias_g = 0.0f; // retired; kept zero for layout compatibility
         entry->successful_fills++;
         adaptive_store_save();
@@ -945,10 +961,19 @@ static filler_state_t adaptive_step(filler_strategy_runtime_t *rt,
         }
 
         float safe_limit_gps = safe_rate_limit_gps(rt, tick);
-        // If the estimated rate rises well above the learned/plausible range,
+        // Debounce the safe-rate trigger over consecutive samples so the brief
+        // impact spike when honey first hits the glass does not act on it.
+        if (tick->new_sample) {
+            if (rt->filtered_rate_gps > safe_limit_gps) {
+                if (rt->cnt_safe_rate < 255) rt->cnt_safe_rate++;
+            } else {
+                rt->cnt_safe_rate = 0;
+            }
+        }
+        // If the estimated rate stays well above the learned/plausible range,
         // reduce to the preset's reduced gate opening before the target region
         // to stay conservative.
-        if (rt->filtered_rate_gps > safe_limit_gps) {
+        if (rt->cnt_safe_rate >= RATE_SPIKE_CONFIRM_SAMPLES) {
             if (rt->safe_reduce_ts_us == 0) {
                 rt->safe_reduce_ts_us = tick->now_us;
             }
@@ -1099,11 +1124,16 @@ static filler_state_t adaptive_step(filler_strategy_runtime_t *rt,
             float under = (float)tick->params->target_grams - rel_g;
             ESP_LOGI(TAG, "adaptive underweight: rel=%.1f g (-%.1f g) -> refill",
                      (double)rel_g, (double)under);
-            rt->close_early_relax_g += REFILL_RELAX_STEP_G;
+            // Close roughly the measured deficit later next time (scaled down a
+            // little to stay under target), so a single refill reaches the
+            // target band instead of many small steps that keep closing early.
+            float relax_step = fmaxf(under * REFILL_CLOSE_RELAX_FACTOR, REFILL_RELAX_STEP_G);
+            rt->close_early_relax_g += relax_step;
             rt->near_close_relax_g = fminf(rt->near_close_relax_g + NEAR_CLOSE_REFILL_RELAX_STEP_G,
                                            NEAR_CLOSE_REFILL_RELAX_MAX_G);
-            ESP_LOGI(TAG, "relax close_early by %.1f g -> total_relax=%.1f g",
-                     (double)REFILL_RELAX_STEP_G,
+            ESP_LOGI(TAG, "relax close_early by %.1f g (deficit %.1f g) -> total_relax=%.1f g",
+                     (double)relax_step,
+                     (double)under,
                      (double)rt->close_early_relax_g);
             ESP_LOGI(TAG, "relax near_close by %.1f g -> total_relax=%.1f g",
                      (double)NEAR_CLOSE_REFILL_RELAX_STEP_G,

@@ -22,6 +22,7 @@ typedef struct {
     uint8_t cnt_over;
     uint8_t no_flow_count;
     uint8_t sample_count;
+    uint8_t cnt_safe_rate;
     bool response_detected;
     bool first_close_seen;
     uint8_t active_preset_index;

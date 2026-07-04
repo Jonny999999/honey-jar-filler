@@ -6,8 +6,17 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 
-// Step used to relax close-early offset after an underweight retry (grams).
+// Refill loosening after an underweight retry: relax the close-early offset by
+// roughly the measured deficit (scaled down a little to stay under target) so a
+// single refill reaches the target band instead of many fixed small steps.
+// CLOSE_EARLY_STEP_G is the minimum step for tiny deficits.
 #define CLOSE_EARLY_STEP_G 4.0f
+#define REFILL_CLOSE_RELAX_FACTOR 0.90f
+
+// Measured dead time is clamped only to reject implausible values for the
+// thesis telemetry; thick honey can have a long transport dead time.
+#define DEAD_TIME_MIN_S 0.10f
+#define DEAD_TIME_MAX_S 15.00f
 
 // Require consecutive samples to confirm threshold crossings.
 #define THRESH_CONFIRM_COUNT 4
@@ -165,8 +174,8 @@ static void update_rate_estimates(filler_strategy_runtime_t *rt, const filler_st
         rt->response_detected = true;
         rt->first_response_ts_us = tick->latest->ts_us;
         rt->measured_dead_time_s = clampf_local((float)(tick->latest->ts_us - rt->fill_open_ts_us) / 1000000.0f,
-                                                0.10f,
-                                                3.00f);
+                                                DEAD_TIME_MIN_S,
+                                                DEAD_TIME_MAX_S);
         ESP_LOGI(TAG, "detected dead time: %.3f s", (double)rt->measured_dead_time_s);
     }
 
@@ -483,14 +492,18 @@ static filler_state_t heuristic_step(filler_strategy_runtime_t *rt,
             float close_early_g_cur = (float)tick->params->close_remaining_g - rt->close_early_relax_g;
             if (close_early_g_cur > 0.0f) {
                 float prev_g = close_early_g_cur;
-                rt->close_early_relax_g += CLOSE_EARLY_STEP_G;
+                // Relax by ~the measured deficit so one refill reaches target,
+                // floored at CLOSE_EARLY_STEP_G for tiny deficits.
+                float relax_step = under * REFILL_CLOSE_RELAX_FACTOR;
+                if (relax_step < CLOSE_EARLY_STEP_G) relax_step = CLOSE_EARLY_STEP_G;
+                rt->close_early_relax_g += relax_step;
                 if (rt->close_early_relax_g > (float)tick->params->close_remaining_g) {
                     rt->close_early_relax_g = (float)tick->params->close_remaining_g;
                 }
                 close_early_g_cur = (float)tick->params->close_remaining_g - rt->close_early_relax_g;
                 if (close_early_g_cur < 0.0f) close_early_g_cur = 0.0f;
-                ESP_LOGI(TAG, "relax close_early: %.1f g -> %.1f g",
-                         (double)prev_g, (double)close_early_g_cur);
+                ESP_LOGI(TAG, "relax close_early: %.1f g -> %.1f g (deficit %.1f g)",
+                         (double)prev_g, (double)close_early_g_cur, (double)under);
                 ESP_LOGW(TAG, "suggestion: decrease close_remaining_g (now %u g)",
                          (unsigned)tick->params->close_remaining_g);
             }
