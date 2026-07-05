@@ -1,6 +1,6 @@
 dependencies:
   esp-idf-lib/hx711: '*'
-  esp-idf-lib/encoder: '*'
+  esp-idf-lib/encoder: "^1.1.0"
   chill-sam/ssd1306: ^1.1.1
   espressif/servo: ^0.1.0
   espressif/led_strip: '*'

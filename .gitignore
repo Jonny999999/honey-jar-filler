@@ -16,7 +16,6 @@ settings.json
 # ESP-IDF default build directory
 build
 sdkconfig.old
-dependencies.lock
 managed_components
 
 # drawio files
