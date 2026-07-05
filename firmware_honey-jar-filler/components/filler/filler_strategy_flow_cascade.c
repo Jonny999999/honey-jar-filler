@@ -28,6 +28,12 @@
 #define LEARN_ALPHA_GATE_GAIN 0.20f
 #define LEARN_ALPHA_DRIP_WAIT 0.35f
 #define LEARN_ALPHA_FINISH_TRIM 0.18f
+// An overweight verify failure means the post-close gain was underestimated
+// and the run's own measurement of it is trustworthy (a normal close +
+// drip-wait cycle ran to completion, just landed high) -- correct hard and
+// immediately instead of the small steady-state fine-tuning nudge, so the
+// very next fill is meaningfully adjusted rather than repeating the miss.
+#define LEARN_ALPHA_FINISH_TRIM_MISS 0.55f
 
 #define VERIFY_CONFIRM_SAMPLES 4u
 
@@ -239,16 +245,23 @@ static void cascade_reset_counters(filler_strategy_runtime_t *rt)
     rt->safe_reduce_last_action_us = 0;
 }
 
+// Un-learned seed rates (only used before a preset's first fill; afterwards
+// the actually-measured fast/slow rate is learned back in and dominates).
+// Sized so a 500 g jar runs its fast phase around 30 g/s -- a full fill in
+// roughly ~20 s -- rather than racing to the gate cap, so the cascade's
+// deceleration/close behavior is visibly demonstrable instead of spending
+// nearly the whole run at max opening. The fast:slow ratio is kept close to
+// its previous value so the taper is still a clearly visible step down.
 static float fallback_fast_rate_gps(const app_params_t *params)
 {
     float target_g = params ? (float)params->target_grams : 500.0f;
-    return clampf_local(target_g * 0.16f, 25.0f, 120.0f);
+    return clampf_local(target_g * 0.06f, 15.0f, 120.0f);
 }
 
 static float fallback_slow_rate_gps(const app_params_t *params)
 {
     float target_g = params ? (float)params->target_grams : 500.0f;
-    return clampf_local(target_g * 0.045f, 6.0f, 45.0f);
+    return clampf_local(target_g * 0.018f, 4.0f, 45.0f);
 }
 
 static void cascade_defaults_from_params(cascade_learned_entry_t *entry, const app_params_t *params)
@@ -605,11 +618,24 @@ static void publish_summary_and_learn(filler_strategy_runtime_t *rt, const fille
         ? ((float)(rt->last_gain_ts_us - rt->first_close_ts_us) / 1000.0f) + DRIP_WAIT_SETTLE_MARGIN_MS
         : rt->adapted_drip_wait_ms;
 
-    bool plausible = success && rt->response_detected &&
-                     plausible_positive(rt->measured_dead_time_s, DEAD_TIME_MIN_S, DEAD_TIME_MAX_S) &&
-                     plausible_positive(rt->measured_post_close_gain_g, 0.0f, 150.0f) &&
-                     plausible_positive(fast_avg, 5.0f, 400.0f) &&
-                     (slow_avg == 0.0f || plausible_positive(slow_avg, 1.0f, 250.0f));
+    // An "overweight" verify failure still ran a complete, normal close +
+    // drip-wait cycle -- only the final tolerance check failed -- so the
+    // measured dead time / post-close gain / rates from it are just as
+    // trustworthy as a successful fill's, and are exactly the data that
+    // explains the miss (post-close gain landed higher than predicted).
+    // Gating learning on `success` alone meant the one failure mode that most
+    // needs a correction never applied one, so the same misjudged post-close
+    // gain kept repeating the overweight next time. Other fault reasons
+    // (hard_overfill, no_response, fill_timeout, flow_runaway, scale_stale)
+    // abort mid-fill or on stale data and are excluded: that data is not from
+    // a completed, normal fill cycle.
+    bool is_overweight_miss = reason && strcmp(reason, "overweight") == 0;
+    bool data_valid = rt->response_detected &&
+                      plausible_positive(rt->measured_dead_time_s, DEAD_TIME_MIN_S, DEAD_TIME_MAX_S) &&
+                      plausible_positive(rt->measured_post_close_gain_g, 0.0f, 150.0f) &&
+                      plausible_positive(fast_avg, 5.0f, 400.0f) &&
+                      (slow_avg == 0.0f || plausible_positive(slow_avg, 1.0f, 250.0f));
+    bool plausible = data_valid && (success || is_overweight_miss);
 
     cascade_learned_entry_t before = *entry;
     if (plausible) {
@@ -623,13 +649,18 @@ static void publish_summary_and_learn(filler_strategy_runtime_t *rt, const fille
             learn_ewma(entry->gate_gain_gps_per_pct, rt->learned_gate_gain_gps_per_pct, LEARN_ALPHA_GATE_GAIN, obs),
             CASC_GATE_GAIN_MIN, CASC_GATE_GAIN_MAX);
         // finish_trim is signed: plain EWMA (no warmup, no prev<=0 shortcut).
+        // A miss gets a much larger corrective alpha than steady-state tuning.
         float trim_sample = clampf_local(-fill_error_g, FINISH_TRIM_MIN_G, FINISH_TRIM_MAX_G);
-        entry->finish_trim_g += LEARN_ALPHA_FINISH_TRIM * (trim_sample - entry->finish_trim_g);
+        float trim_alpha = is_overweight_miss ? LEARN_ALPHA_FINISH_TRIM_MISS : LEARN_ALPHA_FINISH_TRIM;
+        entry->finish_trim_g += trim_alpha * (trim_sample - entry->finish_trim_g);
         entry->finish_trim_g = clampf_local(entry->finish_trim_g, FINISH_TRIM_MIN_G, FINISH_TRIM_MAX_G);
         entry->drip_wait_ms = ewma(entry->drip_wait_ms,
                                    clampf_local(settled_wait_ms, DRIP_WAIT_MIN_MS, DRIP_WAIT_MAX_MS),
                                    LEARN_ALPHA_DRIP_WAIT);
-        entry->successful_fills++;
+        // Only a verified-good fill counts toward the warmup/convergence
+        // pacing; a corrected-from-miss update keeps `obs` low so the next
+        // correction (if still needed) also gets the fast warmup alpha.
+        if (success) entry->successful_fills++;
         ESP_LOGI(TAG,
                  "learned reason=%s fills=%lu dead %.3f->%.3f post %.1f->%.1f fast %.1f->%.1f slow %.1f->%.1f K %.3f->%.3f trim %.1f->%.1f drip %.0f->%.0f",
                  reason ? reason : "ok", (unsigned long)obs,
