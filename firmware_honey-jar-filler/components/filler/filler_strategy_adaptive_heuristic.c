@@ -43,6 +43,22 @@
 // meaningless seed, which makes the estimate converge in a couple of jars while
 // staying smooth afterwards.
 
+// THESIS ILLUSTRATION TOGGLE (temporary): set to 1 to deliberately slow the
+// learning down - no first-fill warmup and reduced alphas - so the convergence
+// trend over many fills is clearly visible in the charts (parameters ease from
+// the conservative defaults, fill duration and error shrink gradually). Default
+// 0 = the optimized fast-converging behaviour. Reflash to switch; remove later.
+#ifndef ADAPT_LEARN_SLOW
+#define ADAPT_LEARN_SLOW 0
+#endif
+#if ADAPT_LEARN_SLOW
+#define LEARN_WARMUP_ENABLED 0
+#define LEARN_ALPHA_SCALE 0.35f
+#else
+#define LEARN_WARMUP_ENABLED 1
+#define LEARN_ALPHA_SCALE 1.0f
+#endif
+
 // Reduced ("slow") phase sizing:
 // The near-close handover (fast -> reduced gate) is derived from measured plant
 // behaviour rather than a self-referential bias term. It must happen early
@@ -170,8 +186,13 @@ static float ewma(float prev, float sample, float alpha)
 // observations dominate so a conservative preset seed is replaced quickly.
 static float learn_ewma(float prev, float sample, float base_alpha, uint32_t observations)
 {
+    float alpha = base_alpha * LEARN_ALPHA_SCALE;
+#if LEARN_WARMUP_ENABLED
     float warmup_alpha = 1.0f / (float)(observations + 1u);
-    float alpha = (warmup_alpha > base_alpha) ? warmup_alpha : base_alpha;
+    if (warmup_alpha > alpha) alpha = warmup_alpha;
+#else
+    (void)observations;   // slow-learning illustration: no warmup, ease from seed
+#endif
     return prev + alpha * (sample - prev);
 }
 
