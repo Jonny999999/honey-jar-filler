@@ -53,6 +53,23 @@ HELP_DIM = "\x1b[38;5;250m"
 LIVE_STATUS_HEADER_LINES = 3
 WEIGHT_PLOT_HEIGHT = 8
 LIVE_STATUS_LINE_COUNT = LIVE_STATUS_HEADER_LINES + WEIGHT_PLOT_HEIGHT
+# Always leave at least this many rows for the scrolling log area above the
+# sticky footer. Without this the fixed-height footer fills a short terminal and
+# the log region has no room to scroll (looks static on smaller laptop windows).
+MIN_LOG_ROWS = 6
+
+
+def compute_status_geometry() -> tuple[int, int]:
+    """Return (plot_height, status_line_count) sized to the current terminal.
+
+    The weight plot shrinks (down to 0) so the footer never consumes more than
+    ``terminal_lines - MIN_LOG_ROWS`` rows, guaranteeing a usable log scroll area
+    regardless of window height."""
+    term_lines = shutil.get_terminal_size((120, 24)).lines
+    footer_budget = max(1, term_lines - MIN_LOG_ROWS)
+    plot_height = max(0, min(WEIGHT_PLOT_HEIGHT, footer_budget - LIVE_STATUS_HEADER_LINES))
+    status_line_count = min(LIVE_STATUS_HEADER_LINES + plot_height, footer_budget)
+    return plot_height, max(1, status_line_count)
 
 
 @dataclass
@@ -436,9 +453,9 @@ def colorize_console_line(line: str, enabled: bool) -> str:
     return f"{color}{line}{ANSI_RESET}"
 
 
-def write_console_line(line: str, *, status_line_enabled: bool, colorize_logs: bool) -> None:
+def write_console_line(line: str, *, status_line_enabled: bool, colorize_logs: bool, line_count: int) -> None:
     if status_line_enabled:
-        clear_status_lines(True, LIVE_STATUS_LINE_COUNT)
+        clear_status_lines(True, line_count)
     sys.stdout.write(colorize_console_line(line, colorize_logs))
     sys.stdout.flush()
 
@@ -528,12 +545,12 @@ def main() -> int:
     pending_bytes = bytearray()
     live = LiveStatus()
     weight_history: deque[float] = deque(maxlen=180)
-    status_line_count = LIVE_STATUS_LINE_COUNT
+    _, status_line_count = compute_status_geometry()
     started_at = time.monotonic()
     interrupted = False
 
     def refresh_status(force: bool = False) -> None:
-        nonlocal last_status_refresh
+        nonlocal last_status_refresh, status_line_count
         if not status_line_enabled:
             return
         now = time.monotonic()
@@ -542,8 +559,12 @@ def main() -> int:
         active = f"run={current_run.run_id}" if current_run is not None else "run=idle"
         term_width = shutil.get_terminal_size((120, 24)).columns
         plot_width = max(24, min(108, term_width - 5))
-        plot_lines = build_weight_plot(weight_history, plot_width, WEIGHT_PLOT_HEIGHT, 0.0, 500.0)
+        plot_height, new_status_count = compute_status_geometry()
+        plot_lines = build_weight_plot(weight_history, plot_width, plot_height, 0.0, 500.0)
+        # Clear whatever footer is currently drawn (old count) before resizing.
         clear_status_lines(True, status_line_count)
+        status_line_count = new_status_count
+        visible_headers = max(0, status_line_count - len(plot_lines))
         print_status_block(
             True,
             [
@@ -570,8 +591,8 @@ def main() -> int:
                     f"{status_fmt_key('slot=')}{status_fmt_value(str(live.slot_idx))} "
                     f"{status_fmt_key('end=')}{status_fmt_value(live.last_end_reason[:12], dim=(live.last_end_reason == '-'))}"
                 ),
-                *plot_lines,
-            ],
+            ][:visible_headers]
+            + plot_lines,
         )
         last_status_refresh = now
 
@@ -588,14 +609,16 @@ def main() -> int:
         if payload is None:
             write_console_line(line,
                                status_line_enabled=status_line_enabled,
-                               colorize_logs=colorize_logs)
+                               colorize_logs=colorize_logs,
+                               line_count=status_line_count)
             refresh_status(force=True)
             return
 
         if args.show_tel:
             write_console_line(line,
                                status_line_enabled=status_line_enabled,
-                               colorize_logs=False)
+                               colorize_logs=False,
+                               line_count=status_line_count)
             refresh_status(force=True)
 
         telemetry_log.write(payload)
