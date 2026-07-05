@@ -6,7 +6,10 @@
 #include "app.h"
 #include "buzzer.h"
 #include "esp_log.h"
+#include "esp_system.h"
 #include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "scale_hx711.h"
 
 #define LINE2PIXEL(n) ((n) * 8)
@@ -22,6 +25,7 @@ typedef enum {
     MENU_HOME_MACHINE,
     MENU_HOME_TARE,
     MENU_HOME_CAL,
+    MENU_HOME_RESTART,
     MENU_HOME_COUNT
 } menu_home_item_t;
 
@@ -32,6 +36,7 @@ static const char *k_home_labels[MENU_HOME_COUNT] = {
     "Machine settings",
     "Tare scale",
     "Calibrate scale",
+    "Restart controller",
 };
 
 static void menu_format_value(const app_param_meta_t *meta,
@@ -176,6 +181,10 @@ static void menu_render_home_detail(const ui_menu_t *m,
                  (unsigned)m->working.scale_cal_ref_g);
         snprintf(line5, line5_len, "Ref wt: %u g",
                  (unsigned)m->working.scale_cal_ref_g);
+        break;
+    case MENU_HOME_RESTART:
+        snprintf(line4, line4_len, "Reboot the ESP32");
+        snprintf(line5, line5_len, "Click: resets learning");
         break;
     default:
         break;
@@ -342,6 +351,17 @@ bool ui_menu_on_click(ui_menu_t *m, app_params_t *out_apply)
             }
             app_params_get(&m->working);
             return false;
+        case MENU_HOME_RESTART:
+            // Full controller restart: clears all in-RAM learning (adaptive /
+            // flow-control / flow-cascade keep learned values only until reboot),
+            // so the next jar starts from the preset defaults again. Lets the
+            // learning be reset intentionally between chart runs without
+            // power-cycling the hardware.
+            ESP_LOGW(TAG, "action: restart controller (esp_restart) - resets learning");
+            buzzer_beep_long(3);
+            vTaskDelay(pdMS_TO_TICKS(400));   // let the beep play before rebooting
+            esp_restart();
+            return false;                     // not reached
         default:
             return false;
         }
