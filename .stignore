@@ -1,0 +1,15 @@
+// Syncthing ignore patterns for this folder.
+//
+// CRITICAL: never let Syncthing sync the git database. Syncthing copies .git
+// file-by-file and races / partially updates it, which corrupts the object
+// store. Symptoms: "packfile ... index unavailable", or a commit capturing a
+// stale tree (index overwritten mid-commit). Sync code between machines with
+// git push / git pull via the remote instead - not file-based.
+/.git
+
+// Machine-local build / history / cache artifacts: no value in syncing, and
+// they cause constant churn.
+/firmware_honey-jar-filler/build
+**/.history
+**/__pycache__
+**/.cache
