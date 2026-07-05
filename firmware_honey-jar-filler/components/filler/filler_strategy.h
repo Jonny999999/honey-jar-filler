@@ -34,6 +34,7 @@ typedef struct {
     int64_t last_rate_ts_us;
     int64_t last_gain_ts_us;
     int64_t safe_reduce_ts_us;
+    int64_t safe_reduce_last_action_us;
     float run_base_weight_g;
     float last_rel_g;
     float last_post_close_gain_g;
@@ -80,6 +81,7 @@ typedef struct {
     bool measured_near_close_valid;
     float target_g;
     float control_gate_cmd_pct;
+    float gate_ceiling_pct;
     float gate_at_slow_entry_pct;
     float gate_at_close_pct;
     float control_target_rate_gps;

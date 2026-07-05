@@ -57,15 +57,27 @@
 #define SAFE_RATE_MIN_GPS 25.0f
 #define SAFE_RATE_MAX_GPS 140.0f
 #define SAFE_RATE_MULT 1.8f
-#define SAFE_GATE_REDUCE_STEP_PCT 6.0f
 // Absolute safe-rate ceiling from the target mass: protects the first jar and
-// scales with jar size (a controlled fill should not complete faster than this).
-#define FLOW_MIN_CONTROLLED_FILL_S 8.0f
+// scales with jar size (a controlled fill should not complete faster than
+// this). Small jars intentionally run at a high g/s operating point (see the
+// fast gate phase), so this must stay below that intended rate with headroom,
+// or the safe-rate reducer fights the controller on every fill instead of
+// only reacting to genuine runaways.
+#define FLOW_MIN_CONTROLLED_FILL_S 4.0f
 // Debounce the safe-rate trigger so the impact spike when honey first hits the
 // glass does not reduce the gate; escalate to a fault if the reduced gate still
 // cannot tame the flow within the grace period (medium too thin for gate %).
 #define RATE_SPIKE_CONFIRM_SAMPLES 3u
 #define SAFE_REDUCE_ESCALATE_S 5.0f
+// Progressive safe-rate gate reduction: step size scales with how far the
+// rate is over the limit, instead of a single fixed cut, and is paced by the
+// plant dead time (control_holdoff_ms) so each step's effect is seen before
+// reacting again -- reacting on every sample ratcheted the gate closed well
+// before the fill's own dead time even elapsed once.
+#define SAFE_REDUCE_STEP_MIN_PCT 2.0f
+#define SAFE_REDUCE_STEP_MAX_PCT 20.0f
+#define SAFE_REDUCE_OVER_RATIO_SOFT 1.05f
+#define SAFE_REDUCE_OVER_RATIO_HARD 2.0f
 
 // Controller behavior.
 #define FLOW_CTRL_KP_PCT_PER_GPS 0.08f
@@ -192,6 +204,7 @@ static void flow_reset_counters(filler_strategy_runtime_t *rt)
     rt->cnt_safe_rate = 0;
     rt->sample_count = 0;
     rt->safe_reduce_ts_us = 0;
+    rt->safe_reduce_last_action_us = 0;
 }
 
 static float fallback_fast_rate_gps(const app_params_t *params)
@@ -911,22 +924,42 @@ static filler_state_t flow_step(filler_strategy_runtime_t *rt,
                 env->clear_sample_telemetry();
                 return FILLER_FAULT;
             }
-            float gate_min = rt->near_close_logged ? slow_gate_min_pct(tick->params) : fast_gate_min_pct(tick->params);
-            float reduced_gate = clampf_local(rt->control_gate_cmd_pct - SAFE_GATE_REDUCE_STEP_PCT,
-                                              gate_min,
-                                              fast_gate_max_pct(tick->params));
-            ESP_LOGW(TAG,
-                     "safe-rate reduction filtered_rate=%.1f g/s limit=%.1f g/s gate %.1f%%->%.1f%%",
-                     (double)rt->filtered_rate_gps,
-                     (double)safe_limit_gps,
-                     (double)rt->control_gate_cmd_pct,
-                     (double)reduced_gate);
-            flow_command_gate(rt, env, reduced_gate, "safe_reduce", tick->now_us, true);
+            // Pace corrective steps by the plant dead time so each step's effect
+            // is actually seen before reacting again, instead of ratcheting the
+            // gate down on every incoming sample.
+            float holdoff_ms = control_holdoff_ms(rt);
+            bool first_step = (rt->safe_reduce_last_action_us == 0);
+            bool holdoff_elapsed = !first_step &&
+                (tick->now_us - rt->safe_reduce_last_action_us) >= (int64_t)(holdoff_ms * 1000.0f);
+            if (first_step || holdoff_elapsed) {
+                // Scale the step with how far over the limit the rate is: just
+                // over the limit gets a small nudge, far over (a real runaway)
+                // still gets a large, fast step.
+                float over_ratio = (safe_limit_gps > 0.0f) ? (rt->filtered_rate_gps / safe_limit_gps) : SAFE_REDUCE_OVER_RATIO_HARD;
+                float severity = clampf_local((over_ratio - SAFE_REDUCE_OVER_RATIO_SOFT) /
+                                              (SAFE_REDUCE_OVER_RATIO_HARD - SAFE_REDUCE_OVER_RATIO_SOFT), 0.0f, 1.0f);
+                float reduce_step = SAFE_REDUCE_STEP_MIN_PCT + severity * (SAFE_REDUCE_STEP_MAX_PCT - SAFE_REDUCE_STEP_MIN_PCT);
+                float gate_min = rt->near_close_logged ? slow_gate_min_pct(tick->params) : fast_gate_min_pct(tick->params);
+                float reduced_gate = clampf_local(rt->control_gate_cmd_pct - reduce_step,
+                                                  gate_min,
+                                                  fast_gate_max_pct(tick->params));
+                ESP_LOGW(TAG,
+                         "safe-rate reduction filtered_rate=%.1f g/s limit=%.1f g/s gate %.1f%%->%.1f%% (step=%.1f%%, over=%.2fx)",
+                         (double)rt->filtered_rate_gps,
+                         (double)safe_limit_gps,
+                         (double)rt->control_gate_cmd_pct,
+                         (double)reduced_gate,
+                         (double)reduce_step,
+                         (double)over_ratio);
+                flow_command_gate(rt, env, reduced_gate, "safe_reduce", tick->now_us, true);
+                rt->safe_reduce_last_action_us = tick->now_us;
+            }
             publish_runtime_snapshot(rt, env, tick);
             return state;
         }
         // Flow back under the safe limit: clear the escalation timer.
         rt->safe_reduce_ts_us = 0;
+        rt->safe_reduce_last_action_us = 0;
 
         if (!tick->new_sample) {
             publish_runtime_snapshot(rt, env, tick);

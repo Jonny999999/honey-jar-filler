@@ -114,7 +114,10 @@
 // it would complete in less than this many seconds. Sized from the target mass
 // so it scales with jar size and protects the FIRST jar (before any fast rate
 // is learned), when the medium is far thinner than the fixed gate % expects.
-#define ADAPT_MIN_CONTROLLED_FILL_S 8.0f
+// Small jars intentionally run at a high g/s operating point (see max_gate_pct),
+// so this must stay below that intended rate with headroom, or the safe-rate
+// reducer fights the fixed gate % on every single fill.
+#define ADAPT_MIN_CONTROLLED_FILL_S 4.0f
 // Ignore the brief flow spike when the honey stream first hits the glass:
 // require several consecutive over-limit samples before the safe-rate cutback
 // acts, so a transient impact peak neither reduces the gate nor trips a fault.

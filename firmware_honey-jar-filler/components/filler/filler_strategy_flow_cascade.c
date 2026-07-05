@@ -53,9 +53,36 @@
 #define SAFE_RATE_MIN_GPS 25.0f
 #define SAFE_RATE_MAX_GPS 140.0f
 #define SAFE_RATE_MULT 1.8f
-#define MIN_CONTROLLED_FILL_S 8.0f
+// Lower bound on how fast a "controlled" fill may run (target_g / this =
+// abs_ceiling in safe_rate_limit_gps). Small jars run at a high g/s operating
+// point on purpose (see fast_rate_gps), so this must stay below that intended
+// rate with headroom, or the safe-rate reducer fights the cascade controller
+// on every fill instead of only reacting to genuine runaways.
+#define MIN_CONTROLLED_FILL_S 4.0f
 #define RATE_SPIKE_CONFIRM_SAMPLES 3u
 #define SAFE_REDUCE_ESCALATE_S 5.0f
+// Progressive safe-rate gate reduction: step size scales with how far the
+// rate is over the limit (ratio-based), instead of a single fixed cut. A rate
+// just over the limit gets a small nudge and then waits a full dead time to
+// see the effect before reacting again; a rate far over the limit (a real
+// runaway) still gets a large, fast step. Without pacing by the dead time,
+// the fixed-step version reacted on every sample -- much faster than the
+// plant could ever respond -- and ratcheted the gate closed in a handful of
+// samples well before the fill's own dead time even elapsed once.
+#define SAFE_REDUCE_STEP_MIN_PCT 2.0f
+#define SAFE_REDUCE_STEP_MAX_PCT 20.0f
+#define SAFE_REDUCE_OVER_RATIO_SOFT 1.05f
+#define SAFE_REDUCE_OVER_RATIO_HARD 2.0f
+
+// Gate ceiling ramp. The very first fill for a preset must stay at (or below)
+// the preset's configured max_gate_pct -- opening straight to the machine's
+// full 100% before anything about the medium/jar is known would be a
+// critical, messy failure mode. Once a preset has accumulated enough
+// successful fills to trust the learned rates and plant gain K, relax the
+// ceiling toward true machine max so the cascade is not permanently capped at
+// a value that was only ever meant as a first-fill safety margin.
+#define GATE_CEILING_MAX_PCT 100.0f
+#define GATE_CEILING_RELAX_FILLS 6u
 
 // Cascade controller. Deliberately gentle: the feedforward gate carries the
 // operating point, so the PI only trims. Updates are paced by the dead time so
@@ -209,6 +236,7 @@ static void cascade_reset_counters(filler_strategy_runtime_t *rt)
     rt->cnt_safe_rate = 0;
     rt->sample_count = 0;
     rt->safe_reduce_ts_us = 0;
+    rt->safe_reduce_last_action_us = 0;
 }
 
 static float fallback_fast_rate_gps(const app_params_t *params)
@@ -261,6 +289,17 @@ static cascade_learned_entry_t *cascade_entry_for_preset(uint8_t idx, const app_
         log_learned_entry("initialized cascade defaults for", idx, e);
     }
     return e;
+}
+
+// Confidence-based gate ceiling: preset max_gate_pct on an untried preset,
+// linearly relaxing to GATE_CEILING_MAX_PCT once GATE_CEILING_RELAX_FILLS
+// successful fills have been learned for it.
+static float gate_ceiling_for_entry(const cascade_learned_entry_t *entry, const app_params_t *params)
+{
+    float preset_cap = clampf_local(params ? (float)params->max_gate_pct : GATE_CEILING_MAX_PCT, 5.0f, 100.0f);
+    uint32_t fills = entry ? entry->successful_fills : 0u;
+    float progress = clampf_local((float)fills / (float)GATE_CEILING_RELAX_FILLS, 0.0f, 1.0f);
+    return preset_cap + progress * (GATE_CEILING_MAX_PCT - preset_cap);
 }
 
 static float response_threshold_g(const filler_strategy_tick_t *tick)
@@ -482,9 +521,9 @@ static void cascade_run_controller(filler_strategy_runtime_t *rt, const filler_s
         return;
     }
 
-    // max_gate_pct is a real flow limit (small jars / thin media): the
-    // controller may not open the gate beyond it.
-    float gate_cap = clampf_local((float)tick->params->max_gate_pct, 5.0f, 100.0f);
+    // Confidence-based ceiling (preset max_gate_pct until the preset has
+    // proven itself, then relaxing toward machine max -- see gate_ceiling_for_entry).
+    float gate_cap = clampf_local(rt->gate_ceiling_pct, 5.0f, 100.0f);
     float k = clampf_local(rt->learned_gate_gain_gps_per_pct, CASC_GATE_GAIN_MIN, CASC_GATE_GAIN_MAX);
     float gate_ff = rt->control_target_rate_gps / k;              // feedforward operating point
     s_integ_pct = clampf_local(s_integ_pct + CASC_KI_PCT_PER_GPS_S * error * holdoff_s,
@@ -661,10 +700,14 @@ static void cascade_on_enter(filler_strategy_runtime_t *rt, filler_state_t state
                 rt->run_base_weight_g = tick->latest ? tick->latest->grams : 0.0f;
             }
             rt->adapted_drip_wait_ms = entry->drip_wait_ms;
+            rt->gate_ceiling_pct = gate_ceiling_for_entry(entry, tick->params);
             // Start at the feedforward gate for the initial fast setpoint.
             float k = clampf_local(entry->gate_gain_gps_per_pct, CASC_GATE_GAIN_MIN, CASC_GATE_GAIN_MAX);
-            rt->control_gate_cmd_pct = clampf_local(entry->fast_rate_gps / k, 0.0f, (float)tick->params->max_gate_pct);
+            rt->control_gate_cmd_pct = clampf_local(entry->fast_rate_gps / k, 0.0f, rt->gate_ceiling_pct);
             log_learned_entry("starting cascade fill with", tick->preset_index, entry);
+            ESP_LOGI(TAG, "gate ceiling=%.1f%% (preset max=%u%%, successful_fills=%lu)",
+                     (double)rt->gate_ceiling_pct, (unsigned)tick->params->max_gate_pct,
+                     (unsigned long)entry->successful_fills);
         } else {
             rt->refill_count++;
             rt->first_close_seen = false;
@@ -675,7 +718,7 @@ static void cascade_on_enter(filler_strategy_runtime_t *rt, filler_state_t state
             rt->last_post_close_gain_g = 0.0f;
             s_integ_pct = 0.0f;
             cascade_model_reset();
-            rt->control_gate_cmd_pct = clampf_local(rt->control_gate_cmd_pct, 2.0f, (float)tick->params->max_gate_pct);
+            rt->control_gate_cmd_pct = clampf_local(rt->control_gate_cmd_pct, 2.0f, rt->gate_ceiling_pct);
             ESP_LOGI(TAG, "refill attempt=%u relaxed_close_early=%.1f g reopen_gate=%.1f%%",
                      (unsigned)rt->refill_count, (double)rt->close_early_relax_g, (double)rt->control_gate_cmd_pct);
         }
@@ -790,15 +833,34 @@ static filler_state_t cascade_step(filler_strategy_runtime_t *rt, filler_state_t
                 env->clear_sample_telemetry();
                 return FILLER_FAULT;
             }
-            float reduced = clampf_local(rt->control_gate_cmd_pct - 6.0f, 0.0f, 100.0f);
-            ESP_LOGW(TAG, "safe-rate reduction rate=%.1f g/s limit=%.1f g/s gate %.1f->%.1f",
-                     (double)rt->filtered_rate_gps, (double)safe_limit_gps, (double)rt->control_gate_cmd_pct, (double)reduced);
-            s_integ_pct = 0.0f;
-            cascade_command_gate(rt, env, reduced, "safe_reduce", tick->now_us, true);
+            // Pace corrective steps by the plant dead time so each step's effect
+            // is actually seen before reacting again, instead of ratcheting the
+            // gate down on every incoming sample.
+            float holdoff_ms = control_holdoff_ms(rt);
+            bool first_step = (rt->safe_reduce_last_action_us == 0);
+            bool holdoff_elapsed = !first_step &&
+                (tick->now_us - rt->safe_reduce_last_action_us) >= (int64_t)(holdoff_ms * 1000.0f);
+            if (first_step || holdoff_elapsed) {
+                // Scale the step with how far over the limit the rate is: just
+                // over the limit gets a small nudge, far over (a real runaway)
+                // still gets a large, fast step.
+                float over_ratio = (safe_limit_gps > 0.0f) ? (rt->filtered_rate_gps / safe_limit_gps) : SAFE_REDUCE_OVER_RATIO_HARD;
+                float severity = clampf_local((over_ratio - SAFE_REDUCE_OVER_RATIO_SOFT) /
+                                              (SAFE_REDUCE_OVER_RATIO_HARD - SAFE_REDUCE_OVER_RATIO_SOFT), 0.0f, 1.0f);
+                float reduce_step = SAFE_REDUCE_STEP_MIN_PCT + severity * (SAFE_REDUCE_STEP_MAX_PCT - SAFE_REDUCE_STEP_MIN_PCT);
+                float reduced = clampf_local(rt->control_gate_cmd_pct - reduce_step, 0.0f, 100.0f);
+                ESP_LOGW(TAG, "safe-rate reduction rate=%.1f g/s limit=%.1f g/s gate %.1f->%.1f (step=%.1f%%, over=%.2fx)",
+                         (double)rt->filtered_rate_gps, (double)safe_limit_gps, (double)rt->control_gate_cmd_pct,
+                         (double)reduced, (double)reduce_step, (double)over_ratio);
+                s_integ_pct = 0.0f;
+                cascade_command_gate(rt, env, reduced, "safe_reduce", tick->now_us, true);
+                rt->safe_reduce_last_action_us = tick->now_us;
+            }
             publish_runtime_snapshot(rt, env, tick);
             return state;
         }
         rt->safe_reduce_ts_us = 0;
+        rt->safe_reduce_last_action_us = 0;
 
         if (!tick->new_sample) {
             publish_runtime_snapshot(rt, env, tick);
