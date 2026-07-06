@@ -579,6 +579,14 @@ def action_plot(output_root: Path) -> None:
         [("d", "default 16:10 full-width"), ("n", "narrow taller variant for side-by-side")],
         "d",
     )
+    cascade_control_export = prompt_choice(
+        "Flow-cascade control export",
+        [
+            ("s", "separate plain control figure, debug stays merged"),
+            ("m", "merge control panel into plain figure too"),
+        ],
+        "s",
+    )
     session_summary = prompt_yes_no("Also generate session summary figures?", True)
     session_summary_groups = "all"
     if session_summary:
@@ -623,6 +631,8 @@ def action_plot(output_root: Path) -> None:
             "overlay" if rate_layout == "o" else "subplot",
             "--figure-profile",
             "narrow" if figure_profile == "n" else "default",
+            "--cascade-control-export",
+            "separate" if cascade_control_export == "s" else "merged",
         ]
         if plain_both_profiles:
             cmd.append("--plain-both-profiles")
