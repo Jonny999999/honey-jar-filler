@@ -303,30 +303,46 @@ static void telemetry_emit_record(const telemetry_record_t *rec)
                (double)rec->gate_pct);
         if (strategy_escaped[0] || text_escaped[0]) {
             printf(",\"strategy_name\":\"%s\",\"gate_phase\":\"%s\""
-                   ",\"rate_raw_gps\":%.3f,\"rate_filtered_gps\":%.3f"
+                   ",\"rate_raw_gps\":%.3f,\"rate_2sample_gps\":%.3f"
+                   ",\"rate_4sample_gps\":%.3f,\"rate_filtered_gps\":%.3f"
+                   ",\"rate_filtered_medium_gps\":%.3f,\"rate_filtered_slow_gps\":%.3f"
                    ",\"target_rate_gps\":%.3f,\"rate_error_gps\":%.3f"
                    ",\"predicted_remaining_g\":%.3f,\"measured_dead_time_s\":%.3f"
-                   ",\"measured_post_close_gain_g\":%.3f"
+                   ",\"measured_post_close_gain_g\":%.3f,\"measured_near_close_gain_g\":%.3f"
                    ",\"learned_dead_time_s\":%.3f,\"learned_post_close_gain_g\":%.3f"
                    ",\"learned_fast_rate_gps\":%.3f,\"learned_slow_rate_gps\":%.3f"
+                   ",\"learned_near_close_bias_g\":%.3f"
                    ",\"adapted_near_close_g\":%.3f,\"adapted_close_early_g\":%.3f"
-                   ",\"adapted_drip_wait_ms\":%.3f,\"refill_count\":%" PRIu32,
+                   ",\"adapted_drip_wait_ms\":%.3f"
+                   ",\"model_rate_gps\":%.3f,\"model_delayed_gps\":%.3f"
+                   ",\"control_integ_pct\":%.3f,\"gate_gain_gps_per_pct\":%.4f"
+                   ",\"refill_count\":%" PRIu32,
                    strategy_escaped,
                    text_escaped,
                    (double)rec->rate_raw_gps,
+                   (double)rec->rate_2sample_gps,
+                   (double)rec->rate_4sample_gps,
                    (double)rec->rate_filtered_gps,
+                   (double)rec->rate_filtered_medium_gps,
+                   (double)rec->rate_filtered_slow_gps,
                    (double)rec->target_rate_gps,
                    (double)rec->rate_error_gps,
                    (double)rec->predicted_remaining_g,
                    (double)rec->measured_dead_time_s,
                    (double)rec->measured_post_close_gain_g,
+                   (double)rec->measured_near_close_gain_g,
                    (double)rec->learned_dead_time_s,
                    (double)rec->learned_post_close_gain_g,
                    (double)rec->learned_fast_rate_gps,
                    (double)rec->learned_slow_rate_gps,
+                   (double)rec->learned_near_close_bias_g,
                    (double)rec->adapted_near_close_g,
                    (double)rec->adapted_close_early_g,
                    (double)rec->adapted_drip_wait_ms,
+                   (double)rec->model_rate_gps,
+                   (double)rec->model_delayed_gps,
+                   (double)rec->control_integ_pct,
+                   (double)rec->gate_gain_gps_per_pct,
                    rec->refill_count);
         }
         printf("}\n");
@@ -397,12 +413,21 @@ static void telemetry_emit_record(const telemetry_record_t *rec)
                ",\"strategy_name\":\"%s\",\"target_g\":%" PRIu32
                ",\"final_mass_g\":%.3f,\"final_relative_fill_g\":%.3f"
                ",\"fill_error_g\":%.3f,\"measured_dead_time_s\":%.3f"
-               ",\"measured_post_close_gain_g\":%.3f,\"measured_fast_rate_gps\":%.3f"
-               ",\"measured_slow_rate_gps\":%.3f,\"rate_at_close_gps\":%.3f"
+               ",\"measured_post_close_gain_g\":%.3f,\"measured_near_close_gain_g\":%.3f"
+               ",\"measured_fast_rate_gps\":%.3f,\"measured_slow_rate_gps\":%.3f"
+               ",\"rate_at_close_gps\":%.3f,\"rate_2sample_at_close_gps\":%.3f"
+               ",\"rate_4sample_at_close_gps\":%.3f"
+               ",\"rate_filtered_medium_at_close_gps\":%.3f"
+               ",\"rate_filtered_slow_at_close_gps\":%.3f"
                ",\"fill_duration_s\":%.3f,\"drip_wait_used_ms\":%.3f"
-               ",\"refill_count\":%" PRIu32 ",\"next_dead_time_s\":%.3f"
+               ",\"refill_count\":%" PRIu32
+               ",\"used_dead_time_s\":%.3f,\"used_post_close_gain_g\":%.3f"
+               ",\"used_fast_rate_gps\":%.3f,\"used_slow_rate_gps\":%.3f"
+               ",\"used_near_close_bias_g\":%.3f,\"used_near_close_g\":%.3f"
+               ",\"used_close_early_g\":%.3f,\"next_dead_time_s\":%.3f"
                ",\"next_post_close_gain_g\":%.3f,\"next_fast_rate_gps\":%.3f"
-               ",\"next_slow_rate_gps\":%.3f,\"next_near_close_g\":%.3f"
+               ",\"next_slow_rate_gps\":%.3f,\"next_near_close_bias_g\":%.3f"
+               ",\"next_near_close_g\":%.3f"
                ",\"next_close_early_g\":%.3f,\"next_drip_wait_ms\":%.3f"
                ",\"params\":{",
                rec->ts_us,
@@ -417,16 +442,29 @@ static void telemetry_emit_record(const telemetry_record_t *rec)
                (double)rec->fill_error_g,
                (double)rec->measured_dead_time_s,
                (double)rec->measured_post_close_gain_g,
+               (double)rec->measured_near_close_gain_g,
                (double)rec->measured_fast_rate_gps,
                (double)rec->measured_slow_rate_gps,
                (double)rec->rate_at_close_gps,
+               (double)rec->rate_2sample_at_close_gps,
+               (double)rec->rate_4sample_at_close_gps,
+               (double)rec->rate_filtered_medium_at_close_gps,
+               (double)rec->rate_filtered_slow_at_close_gps,
                (double)rec->fill_duration_s,
                (double)rec->adapted_drip_wait_ms,
                rec->refill_count,
+               (double)rec->used_dead_time_s,
+               (double)rec->used_post_close_gain_g,
+               (double)rec->used_fast_rate_gps,
+               (double)rec->used_slow_rate_gps,
+               (double)rec->used_near_close_bias_g,
+               (double)rec->used_near_close_g,
+               (double)rec->used_close_early_g,
                (double)rec->learned_dead_time_s,
                (double)rec->learned_post_close_gain_g,
                (double)rec->learned_fast_rate_gps,
                (double)rec->learned_slow_rate_gps,
+               (double)rec->learned_near_close_bias_g,
                (double)rec->adapted_near_close_g,
                (double)rec->adapted_close_early_g,
                (double)rec->next_drip_wait_ms);

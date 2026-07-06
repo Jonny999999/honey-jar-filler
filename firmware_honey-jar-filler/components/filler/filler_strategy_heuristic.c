@@ -6,8 +6,17 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 
-// Step used to relax close-early offset after an underweight retry (grams).
+// Refill loosening after an underweight retry: relax the close-early offset by
+// roughly the measured deficit (scaled down a little to stay under target) so a
+// single refill reaches the target band instead of many fixed small steps.
+// CLOSE_EARLY_STEP_G is the minimum step for tiny deficits.
 #define CLOSE_EARLY_STEP_G 4.0f
+#define REFILL_CLOSE_RELAX_FACTOR 0.90f
+
+// Measured dead time is clamped only to reject implausible values for the
+// thesis telemetry; thick honey can have a long transport dead time.
+#define DEAD_TIME_MIN_S 0.10f
+#define DEAD_TIME_MAX_S 15.00f
 
 // Require consecutive samples to confirm threshold crossings.
 #define THRESH_CONFIRM_COUNT 4
@@ -114,7 +123,7 @@ static float response_threshold_g(const filler_strategy_tick_t *tick)
 static float current_close_early_g(const filler_strategy_runtime_t *rt, const filler_strategy_tick_t *tick)
 {
     if (!rt || !tick || !tick->params) return 0.0f;
-    float value = (float)tick->params->close_early_g - rt->close_early_relax_g;
+    float value = (float)tick->params->close_remaining_g - rt->close_early_relax_g;
     return (value > 0.0f) ? value : 0.0f;
 }
 
@@ -165,8 +174,8 @@ static void update_rate_estimates(filler_strategy_runtime_t *rt, const filler_st
         rt->response_detected = true;
         rt->first_response_ts_us = tick->latest->ts_us;
         rt->measured_dead_time_s = clampf_local((float)(tick->latest->ts_us - rt->fill_open_ts_us) / 1000000.0f,
-                                                0.10f,
-                                                3.00f);
+                                                DEAD_TIME_MIN_S,
+                                                DEAD_TIME_MAX_S);
         ESP_LOGI(TAG, "detected dead time: %.3f s", (double)rt->measured_dead_time_s);
     }
 
@@ -200,7 +209,7 @@ static void mark_first_close(filler_strategy_runtime_t *rt, const filler_strateg
 static void publish_runtime_snapshot(filler_strategy_runtime_t *rt,
                                      const filler_strategy_env_t *env,
                                      const filler_strategy_tick_t *tick,
-                                     float near_close_delta_g,
+                                     float slow_remaining_g,
                                      float close_early_g_cur,
                                      float drip_wait_ms)
 {
@@ -212,7 +221,7 @@ static void publish_runtime_snapshot(filler_strategy_runtime_t *rt,
         .filtered_rate_gps = rt->filtered_rate_gps,
         .measured_dead_time_s = rt->measured_dead_time_s,
         .measured_post_close_gain_g = rt->measured_post_close_gain_g,
-        .adapted_near_close_g = near_close_delta_g,
+        .adapted_near_close_g = slow_remaining_g,
         .adapted_close_early_g = close_early_g_cur,
         .adapted_drip_wait_ms = drip_wait_ms,
         .refill_count = rt->refill_count,
@@ -312,7 +321,7 @@ static void heuristic_on_enter(filler_strategy_runtime_t *rt,
                                 tick->latest ? tick->latest->grams : 0.0f);
         env->gate_set_percent_label(tick->params->max_gate_pct, "max_gate");
         publish_runtime_snapshot(rt, env, tick,
-                                 (float)tick->params->near_close_delta_g,
+                                 (float)tick->params->slow_remaining_g,
                                  current_close_early_g(rt, tick),
                                  (float)tick->params->drip_delay_ms);
         break;
@@ -321,7 +330,7 @@ static void heuristic_on_enter(filler_strategy_runtime_t *rt,
         mark_first_close(rt, tick);
         env->gate_close_label("drip_wait");
         publish_runtime_snapshot(rt, env, tick,
-                                 (float)tick->params->near_close_delta_g,
+                                 (float)tick->params->slow_remaining_g,
                                  current_close_early_g(rt, tick),
                                  (float)tick->params->drip_delay_ms);
         break;
@@ -329,7 +338,7 @@ static void heuristic_on_enter(filler_strategy_runtime_t *rt,
         ESP_LOGD(TAG, "verify target: gate closed");
         env->gate_close_label("close");
         publish_runtime_snapshot(rt, env, tick,
-                                 (float)tick->params->near_close_delta_g,
+                                 (float)tick->params->slow_remaining_g,
                                  current_close_early_g(rt, tick),
                                  (float)tick->params->drip_delay_ms);
         break;
@@ -363,7 +372,7 @@ static filler_state_t heuristic_step(filler_strategy_runtime_t *rt,
         float rel_g = tick->latest->grams - (has_tare ? tare_g : 0.0f);
         update_rate_estimates(rt, tick);
         float close_early_g_cur = current_close_early_g(rt, tick);
-        float near_close = (float)tick->params->target_grams - (float)tick->params->near_close_delta_g;
+        float near_close = (float)tick->params->target_grams - (float)tick->params->slow_remaining_g;
         float close_early = (float)tick->params->target_grams - close_early_g_cur;
 
         if ((tick->now_us - tick->state_enter_us) > ((int64_t)tick->params->fill_timeout_ms * 1000)) {
@@ -372,7 +381,7 @@ static filler_state_t heuristic_step(filler_strategy_runtime_t *rt,
             env->set_fault(FLT_SERVO_TIMEOUT);
             mark_first_close(rt, tick);
             publish_runtime_snapshot(rt, env, tick,
-                                     (float)tick->params->near_close_delta_g,
+                                     (float)tick->params->slow_remaining_g,
                                      close_early_g_cur,
                                      (float)tick->params->drip_delay_ms);
             publish_summary(rt, env, tick, "fill_timeout", false);
@@ -381,7 +390,7 @@ static filler_state_t heuristic_step(filler_strategy_runtime_t *rt,
         }
         if (!tick->new_sample) {
             publish_runtime_snapshot(rt, env, tick,
-                                     (float)tick->params->near_close_delta_g,
+                                     (float)tick->params->slow_remaining_g,
                                      close_early_g_cur,
                                      (float)tick->params->drip_delay_ms);
             return state;
@@ -392,7 +401,7 @@ static filler_state_t heuristic_step(filler_strategy_runtime_t *rt,
             env->gate_close_label("target");
             mark_first_close(rt, tick);
             publish_runtime_snapshot(rt, env, tick,
-                                     (float)tick->params->near_close_delta_g,
+                                     (float)tick->params->slow_remaining_g,
                                      close_early_g_cur,
                                      (float)tick->params->drip_delay_ms);
             return FILLER_DRIP_WAIT;
@@ -403,7 +412,7 @@ static filler_state_t heuristic_step(filler_strategy_runtime_t *rt,
             env->gate_close_label("close_early");
             mark_first_close(rt, tick);
             publish_runtime_snapshot(rt, env, tick,
-                                     (float)tick->params->near_close_delta_g,
+                                     (float)tick->params->slow_remaining_g,
                                      close_early_g_cur,
                                      (float)tick->params->drip_delay_ms);
             return FILLER_DRIP_WAIT;
@@ -413,9 +422,9 @@ static filler_state_t heuristic_step(filler_strategy_runtime_t *rt,
                 ESP_LOGD(TAG, "near close: rel=%.1f g -> partial gate", (double)rel_g);
                 rt->near_close_logged = true;
             }
-            env->gate_set_percent_label(tick->params->near_close_gate_pct, "near_close");
+            env->gate_set_percent_label(tick->params->slow_gate_pct, "near_close");
             publish_runtime_snapshot(rt, env, tick,
-                                     (float)tick->params->near_close_delta_g,
+                                     (float)tick->params->slow_remaining_g,
                                      close_early_g_cur,
                                      (float)tick->params->drip_delay_ms);
             return state;
@@ -423,7 +432,7 @@ static filler_state_t heuristic_step(filler_strategy_runtime_t *rt,
 
         env->gate_set_percent_label(tick->params->max_gate_pct, "max_gate");
         publish_runtime_snapshot(rt, env, tick,
-                                 (float)tick->params->near_close_delta_g,
+                                 (float)tick->params->slow_remaining_g,
                                  close_early_g_cur,
                                  (float)tick->params->drip_delay_ms);
         return state;
@@ -433,7 +442,7 @@ static filler_state_t heuristic_step(filler_strategy_runtime_t *rt,
         update_rate_estimates(rt, tick);
         track_post_close_gain(rt, tick);
         publish_runtime_snapshot(rt, env, tick,
-                                 (float)tick->params->near_close_delta_g,
+                                 (float)tick->params->slow_remaining_g,
                                  current_close_early_g(rt, tick),
                                  (float)tick->params->drip_delay_ms);
         if ((tick->now_us - tick->state_enter_us) >= ((int64_t)tick->params->drip_delay_ms * 1000)) {
@@ -462,11 +471,11 @@ static filler_state_t heuristic_step(filler_strategy_runtime_t *rt,
             float over = rel_g - (float)tick->params->target_grams;
             ESP_LOGE(TAG, "overweight: rel=%.1f g (+%.1f g, tol=+%.1f g)",
                      (double)rel_g, (double)over, (double)tol_high_g);
-            ESP_LOGW(TAG, "suggestion: increase close_early_g (now %u g)",
-                     (unsigned)tick->params->close_early_g);
+            ESP_LOGW(TAG, "suggestion: increase close_remaining_g (now %u g)",
+                     (unsigned)tick->params->close_remaining_g);
             env->set_fault(FLT_WEIGHT_RANGE);
             publish_runtime_snapshot(rt, env, tick,
-                                     (float)tick->params->near_close_delta_g,
+                                     (float)tick->params->slow_remaining_g,
                                      current_close_early_g(rt, tick),
                                      (float)tick->params->drip_delay_ms);
             publish_summary(rt, env, tick, "overweight", false);
@@ -480,22 +489,26 @@ static filler_state_t heuristic_step(filler_strategy_runtime_t *rt,
             ESP_LOGI(TAG, "underweight: rel=%.1f g (-%.1f g, tol=-%.1f g) -> refill",
                      (double)rel_g, (double)under, (double)tol_low_g);
 
-            float close_early_g_cur = (float)tick->params->close_early_g - rt->close_early_relax_g;
+            float close_early_g_cur = (float)tick->params->close_remaining_g - rt->close_early_relax_g;
             if (close_early_g_cur > 0.0f) {
                 float prev_g = close_early_g_cur;
-                rt->close_early_relax_g += CLOSE_EARLY_STEP_G;
-                if (rt->close_early_relax_g > (float)tick->params->close_early_g) {
-                    rt->close_early_relax_g = (float)tick->params->close_early_g;
+                // Relax by ~the measured deficit so one refill reaches target,
+                // floored at CLOSE_EARLY_STEP_G for tiny deficits.
+                float relax_step = under * REFILL_CLOSE_RELAX_FACTOR;
+                if (relax_step < CLOSE_EARLY_STEP_G) relax_step = CLOSE_EARLY_STEP_G;
+                rt->close_early_relax_g += relax_step;
+                if (rt->close_early_relax_g > (float)tick->params->close_remaining_g) {
+                    rt->close_early_relax_g = (float)tick->params->close_remaining_g;
                 }
-                close_early_g_cur = (float)tick->params->close_early_g - rt->close_early_relax_g;
+                close_early_g_cur = (float)tick->params->close_remaining_g - rt->close_early_relax_g;
                 if (close_early_g_cur < 0.0f) close_early_g_cur = 0.0f;
-                ESP_LOGI(TAG, "relax close_early: %.1f g -> %.1f g",
-                         (double)prev_g, (double)close_early_g_cur);
-                ESP_LOGW(TAG, "suggestion: decrease close_early_g (now %u g)",
-                         (unsigned)tick->params->close_early_g);
+                ESP_LOGI(TAG, "relax close_early: %.1f g -> %.1f g (deficit %.1f g)",
+                         (double)prev_g, (double)close_early_g_cur, (double)under);
+                ESP_LOGW(TAG, "suggestion: decrease close_remaining_g (now %u g)",
+                         (unsigned)tick->params->close_remaining_g);
             }
             publish_runtime_snapshot(rt, env, tick,
-                                     (float)tick->params->near_close_delta_g,
+                                     (float)tick->params->slow_remaining_g,
                                      close_early_g_cur,
                                      (float)tick->params->drip_delay_ms);
             return FILLER_FILL;
@@ -506,7 +519,7 @@ static filler_state_t heuristic_step(filler_strategy_runtime_t *rt,
             ESP_LOGI(TAG, "target verified: rel=%.1f g", (double)rel_g);
             ESP_LOGI(TAG, "slot complete: %u -> %u", (unsigned)tick->slot_idx, (unsigned)next);
             publish_runtime_snapshot(rt, env, tick,
-                                     (float)tick->params->near_close_delta_g,
+                                     (float)tick->params->slow_remaining_g,
                                      current_close_early_g(rt, tick),
                                      (float)tick->params->drip_delay_ms);
             publish_summary(rt, env, tick, "ok", true);
@@ -515,7 +528,7 @@ static filler_state_t heuristic_step(filler_strategy_runtime_t *rt,
             return FILLER_FIND_SLOT;
         }
         publish_runtime_snapshot(rt, env, tick,
-                                 (float)tick->params->near_close_delta_g,
+                                 (float)tick->params->slow_remaining_g,
                                  current_close_early_g(rt, tick),
                                  (float)tick->params->drip_delay_ms);
         return state;

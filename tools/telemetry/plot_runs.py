@@ -70,26 +70,53 @@ FIGURE_PROFILES = {
     "default": (8.67, 5.0),
     "narrow": (6.8, 4.65),
 }
+SESSION_SUMMARY_GROUP_ORDER = ["overview", "adaptive", "compare"]
 PLAIN_PROFILE_SUFFIX = {
     "default": "wide",
     "narrow": "narrow",
 }
-DEBUG_META_WIDTH = 5.2
+DEBUG_META_WIDTH = 8.6
 LINE_FILL_MASS = "#c81e1e"
 LINE_GATE = "#7e22ce"
 LINE_TARGET = "#1f5f3a"
 LINE_FAULT = "#b91c1c"
-LINE_RATE_RAW = "#94a3b8"
-LINE_RATE_FILTERED = "#2563eb"
+RATE_SERIES_SPECS: dict[str, dict[str, str]] = {
+    "raw": {"field": "rate_raw_gps", "label": "Rohrate [g/s]", "color": "#94a3b8"},
+    "2sample": {"field": "rate_2sample_gps", "label": "2-Sample-Rate [g/s]", "color": "#0f766e"},
+    "4sample": {"field": "rate_4sample_gps", "label": "4-Sample-Rate [g/s]", "color": "#0ea5e9"},
+    "filtered": {"field": "rate_filtered_gps", "label": "Gefilterte Füllrate [g/s]", "color": "#2563eb"},
+    "medium": {"field": "rate_filtered_medium_gps", "label": "Mittlere Filterrate [g/s]", "color": "#7c3aed"},
+    "slow": {"field": "rate_filtered_slow_gps", "label": "Langsame Filterrate [g/s]", "color": "#ea580c"},
+}
+RATE_SELECTION_ORDER = ["raw", "2sample", "4sample", "filtered", "medium", "slow"]
+LINE_RATE_FILTERED = RATE_SERIES_SPECS["filtered"]["color"]
+LINE_TARGET_RATE = "#15803d"
 STATE_BAND_EDGE = "#94a3b8"
 STATE_BAND_KEYS = {"FILL", "DRIP_WAIT", "VERIFY_TARGET", "FAULT"}
 RATE_AXIS_LABEL = "Füllrate [g/s]"
-STATE_BAND_FIGURE_EXTRA_H = 0.42
-STATE_BAND_HEIGHT_RATIO = 0.52
+STATE_BAND_FIGURE_EXTRA_H = 0.32
+STATE_BAND_HEIGHT_RATIO = 0.44
 MAIN_PLOT_HEIGHT_RATIO = 3.8
 RATE_PLOT_HEIGHT_RATIO = 1.7
+DEBUG_FIGURE_EXTRA_H = 1.1
 STATE_BAND_LABEL_MIN_WIDTH_S = 0.35
 STATE_BAND_LABEL_OUTSIDE_WIDTH_S = 1.45
+SESSION_LINE_COLORS = {
+    "fill_error_g": "#c81e1e",
+    "fill_duration_s": "#2563eb",
+    "refill_count": "#7c3aed",
+    "used_near_close_g": "#7e22ce",
+    "used_close_early_g": "#db2777",
+    "drip_wait_used_ms": "#ea580c",
+    "measured_post_close_gain_g": "#dc2626",
+    "next_post_close_gain_g": "#16a34a",
+    "measured_dead_time_s": "#0f766e",
+    "next_dead_time_s": "#1d4ed8",
+    "measured_fast_rate_gps": "#2563eb",
+    "next_fast_rate_gps": "#1e40af",
+    "measured_slow_rate_gps": "#14b8a6",
+    "next_slow_rate_gps": "#0f766e",
+}
 
 
 def _parse_fill_selection(value: str) -> list[int]:
@@ -197,6 +224,12 @@ def _format_meta_value(value: Any, unit: str | None = None, decimals: int = 2) -
     return f"{text} {unit}" if unit else text
 
 
+def _format_series_value(value: float | None, unit: str, decimals: int = 2) -> str:
+    if value is None:
+        return "-"
+    return f"{value:.{decimals}f} {unit}"
+
+
 def _figure_size(profile: str) -> tuple[float, float]:
     return FIGURE_PROFILES.get(profile, FIGURE_PROFILES["default"])
 
@@ -236,6 +269,10 @@ def _output_stem_base(session_dir: Path, fill_run: FillRun) -> str:
     )
 
 
+def _session_output_stem_base(session_dir: Path) -> str:
+    return _session_output_token(session_dir.name)
+
+
 def _figure_style() -> None:
     plt.rcParams.update(
         {
@@ -247,6 +284,60 @@ def _figure_style() -> None:
             "ytick.labelsize": 9,
         }
     )
+
+
+def _parse_show_rate(value: str) -> str:
+    raw = value.strip().lower()
+    if raw in {"none", "off", "n"}:
+        return "none"
+    if raw in {"all", "a"}:
+        return "all"
+    aliases = {
+        "both": "raw,filtered",
+        "f": "filtered",
+        "r": "raw",
+        "m": "medium",
+        "s": "slow",
+    }
+    raw = aliases.get(raw, raw)
+    tokens = [part.strip().lower() for part in raw.split(",") if part.strip()]
+    if not tokens:
+        return "none"
+    invalid = [token for token in tokens if token not in RATE_SERIES_SPECS]
+    if invalid:
+        raise argparse.ArgumentTypeError(
+            f"Unknown rate series: {', '.join(invalid)}. "
+            f"Use one of: {', '.join(RATE_SELECTION_ORDER)}, all, none."
+        )
+    ordered = [name for name in RATE_SELECTION_ORDER if name in tokens]
+    return ",".join(ordered) if ordered else "none"
+
+
+def _parse_session_summary_groups(value: str) -> list[str]:
+    raw = value.strip().lower()
+    if raw in {"all", "*"}:
+        return SESSION_SUMMARY_GROUP_ORDER.copy()
+    tokens = [part.strip().lower() for part in raw.split(",") if part.strip()]
+    if not tokens:
+        raise argparse.ArgumentTypeError(
+            f"Use one or more of: {', '.join(SESSION_SUMMARY_GROUP_ORDER)}, all."
+        )
+    invalid = [token for token in tokens if token not in SESSION_SUMMARY_GROUP_ORDER]
+    if invalid:
+        raise argparse.ArgumentTypeError(
+            f"Unknown session summary groups: {', '.join(invalid)}. "
+            f"Use one or more of: {', '.join(SESSION_SUMMARY_GROUP_ORDER)}, all."
+        )
+    return [name for name in SESSION_SUMMARY_GROUP_ORDER if name in tokens]
+
+
+def _selected_rate_series(show_rate: str) -> list[str]:
+    if show_rate == "none":
+        return []
+    if show_rate == "all":
+        return RATE_SELECTION_ORDER.copy()
+    selected = [part.strip() for part in show_rate.split(",") if part.strip()]
+    return [name for name in RATE_SELECTION_ORDER if name in selected]
 
 
 def _gate_label_de(record: dict[str, Any]) -> str:
@@ -322,7 +413,7 @@ def _series_from_samples(
     list[float],
     list[float | None],
     list[float | None],
-    list[float | None],
+    dict[str, list[float | None]],
     list[float | None],
     float | None,
 ]:
@@ -341,9 +432,17 @@ def _series_from_samples(
         for x_value, weight in zip(x_samples, absolute_weights, strict=True)
     ]
     gate_pct = [_float_value(record, "gate_pct") for record in samples]
-    raw_rate = [_float_value(record, "rate_raw_gps") for record in samples]
-    filtered_rate = [_float_value(record, "rate_filtered_gps") for record in samples]
-    return x_samples, fill_mass, gate_pct, raw_rate, filtered_rate, base_weight_g
+    rate_series = {
+        name: [_float_value(record, spec["field"]) for record in samples]
+        for name, spec in RATE_SERIES_SPECS.items()
+    }
+    target_rate_series = [_float_value(record, "target_rate_gps") for record in samples]
+    if (fill_run.strategy_name or "").strip().lower() == "flow-control":
+        target_rate_series = [
+            0.0 if gate_value is not None and gate_value <= 0.5 else target_rate
+            for gate_value, target_rate in zip(gate_pct, target_rate_series, strict=True)
+        ]
+    return x_samples, fill_mass, gate_pct, rate_series, target_rate_series, base_weight_g
 
 
 def _plot_state_background(
@@ -507,13 +606,31 @@ def _annotate_gate_events(
     gates: list[dict[str, Any]],
     samples: list[dict[str, Any]],
 ) -> None:
+    strategy_name = (fill_run.strategy_name or "").strip().lower()
+    flow_control_mode = strategy_name == "flow-control"
+    first_open_index: int | None = None
+    last_zero_index: int | None = None
+    if flow_control_mode:
+        for index, gate_record in enumerate(gates):
+            gate_pct = _float_value(gate_record, "gate_pct")
+            if gate_pct is None:
+                continue
+            if first_open_index is None and gate_pct > 5.0:
+                first_open_index = index
+            if gate_pct <= 5.0:
+                last_zero_index = index
+
     seen_zero_labels = 0
-    for gate_record in gates:
+    for index, gate_record in enumerate(gates):
         gate_pct = _float_value(gate_record, "gate_pct")
         if gate_pct is None:
             continue
         x_gate = _aligned_gate_x(fill_run, gate_record, samples, gate_pct)
         ax2.scatter([x_gate], [gate_pct], color=LINE_GATE, s=20, zorder=6)
+        if flow_control_mode:
+            if index not in {first_open_index, last_zero_index}:
+                continue
+
         label = f"{gate_pct:.0f} %"
         xytext = (-8, 0)
         va = "center"
@@ -604,6 +721,164 @@ def _fill_summary_record(
     return matches[-1] if matches else None
 
 
+def _session_summary_entries(
+    fill_runs: list[FillRun],
+    fill_records: dict[int, list[dict[str, Any]]],
+) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    for fill_run in sorted(fill_runs, key=lambda item: item.fill_id):
+        records = fill_records.get(fill_run.fill_id, [])
+        summary = _fill_summary_record(records, fill_run)
+        if summary is None:
+            continue
+        entries.append(
+            {
+                "fill_run": fill_run,
+                "summary": summary,
+                "fill_id": fill_run.fill_id,
+                "run_id": fill_run.run_id,
+                "slot_idx": fill_run.slot_idx,
+                "preset_name": fill_run.preset_name,
+                "strategy_name": fill_run.strategy_name,
+            }
+        )
+    return entries
+
+
+def _summary_series(
+    entries: list[dict[str, Any]],
+    field: str,
+) -> tuple[list[int], list[float]]:
+    x_values: list[int] = []
+    y_values: list[float] = []
+    for entry in entries:
+        value = _float_value(entry["summary"], field)
+        if value is None:
+            continue
+        x_values.append(int(entry["fill_id"]))
+        y_values.append(value)
+    return x_values, y_values
+
+
+def _unique_or_mixed(values: list[str | None], fallback: str) -> str:
+    filtered = [value for value in values if value]
+    if not filtered:
+        return fallback
+    unique = list(dict.fromkeys(filtered))
+    if len(unique) == 1:
+        return unique[0]
+    if len(unique) == 2:
+        return f"{unique[0]}, {unique[1]}"
+    return f"{unique[0]}, {unique[1]}, ..."
+
+
+def _session_summary_subtitle(session_dir: Path, entries: list[dict[str, Any]]) -> str:
+    presets = [entry.get("preset_name") for entry in entries]
+    strategies = [entry.get("strategy_name") for entry in entries]
+    subtitle = (
+        f"Sitzung: {session_dir.name} | "
+        f"Preset: {_unique_or_mixed(presets, '-')} | "
+        f"Strategie: {_unique_or_mixed(strategies, '-')}"
+    )
+    return textwrap.fill(subtitle, width=110)
+
+
+def _setup_session_axes(
+    axes: Any,
+    x_values: list[int],
+    *,
+    xlabel: str = "Fülllauf / Füll-ID [-]",
+) -> None:
+    if isinstance(axes, list):
+        axes_list = axes
+    elif hasattr(axes, "__iter__") and not hasattr(axes, "plot"):
+        axes_list = list(axes)
+    else:
+        axes_list = [axes]
+    for index, ax in enumerate(axes_list):
+        ax.grid(True, axis="both", color="#cbd5e1", linewidth=0.7, alpha=0.65)
+        ax.set_axisbelow(True)
+        ax.set_xticks(x_values)
+        ax.margins(x=0.04)
+        if index < len(axes_list) - 1:
+            ax.tick_params(labelbottom=False)
+        else:
+            ax.set_xlabel(xlabel)
+
+
+def _plot_single_series(
+    ax: Any,
+    entries: list[dict[str, Any]],
+    *,
+    field: str,
+    ylabel: str,
+    title: str,
+    color: str,
+) -> bool:
+    x_values, y_values = _summary_series(entries, field)
+    if not x_values:
+        return False
+    ax.plot(
+        x_values,
+        y_values,
+        color=color,
+        linewidth=1.9,
+        marker="o",
+        markersize=4.8,
+    )
+    ax.set_ylabel(ylabel)
+    ax.set_title(title, loc="left", fontsize=10.5, color="#0f172a")
+    return True
+
+
+def _plot_compare_series(
+    ax: Any,
+    entries: list[dict[str, Any]],
+    *,
+    left_field: str,
+    left_label: str,
+    left_color: str,
+    right_field: str,
+    right_label: str,
+    right_color: str,
+    ylabel: str,
+    title: str,
+    right_linestyle: str = "--",
+) -> bool:
+    plotted = False
+    left_x, left_y = _summary_series(entries, left_field)
+    if left_x:
+        ax.plot(
+            left_x,
+            left_y,
+            color=left_color,
+            linewidth=1.8,
+            marker="o",
+            markersize=4.6,
+            label=left_label,
+        )
+        plotted = True
+    right_x, right_y = _summary_series(entries, right_field)
+    if right_x:
+        ax.plot(
+            right_x,
+            right_y,
+            color=right_color,
+            linewidth=1.8,
+            linestyle=right_linestyle,
+            marker="s",
+            markersize=4.2,
+            label=right_label,
+        )
+        plotted = True
+    if not plotted:
+        return False
+    ax.set_ylabel(ylabel)
+    ax.set_title(title, loc="left", fontsize=10.5, color="#0f172a")
+    ax.legend(frameon=False, loc="upper left", ncol=2)
+    return True
+
+
 def _first_adaptive_sample(
     records: list[dict[str, Any]],
     fill_run: FillRun,
@@ -635,16 +910,16 @@ def _draw_meta_section(
         title,
         ha="left",
         va="top",
-        fontsize=9.5,
+        fontsize=8.8,
         color="#0f172a",
         fontweight="bold",
     )
-    y = y_start - 0.05
+    y = y_start - 0.043
     for label, value in entries:
-        meta_ax.text(x_label, y, f"{label}:", ha="left", va="top", fontsize=8.2, color="#475569")
-        meta_ax.text(x_value, y, value, ha="left", va="top", fontsize=8.2, color="#0f172a")
-        y -= 0.042
-    return y - 0.03
+        meta_ax.text(x_label, y, f"{label}:", ha="left", va="top", fontsize=7.2, color="#475569")
+        meta_ax.text(x_value, y, value, ha="left", va="top", fontsize=7.2, color="#0f172a")
+        y -= 0.036
+    return y - 0.022
 
 
 def _draw_debug_metadata(
@@ -700,6 +975,7 @@ def _draw_debug_metadata(
                 ("Nachtropfen Start", _format_meta_value(_float_value(first_adaptive_sample, "adapted_drip_wait_ms"), "ms", 0)),
                 ("Totzeit Schätzwert", _format_meta_value(_float_value(first_adaptive_sample, "learned_dead_time_s"), "s", 3)),
                 ("Nachlauf Schätzwert", _format_meta_value(_float_value(first_adaptive_sample, "learned_post_close_gain_g"), "g", 1)),
+                ("Bias Nahe Schließen", _format_meta_value(_float_value(first_adaptive_sample, "learned_near_close_bias_g"), "g", 1)),
             ]
         )
     if summary is not None:
@@ -717,9 +993,21 @@ def _draw_debug_metadata(
             [
                 ("Totzeit Messung", _format_meta_value(_float_value(summary, "measured_dead_time_s"), "s", 3)),
                 ("Nachlauf Messung", _format_meta_value(_float_value(summary, "measured_post_close_gain_g"), "g", 1)),
+                ("Near-Close Ist", _format_meta_value(_float_value(summary, "measured_near_close_gain_g"), "g", 1)),
                 ("Rate schnell", _format_meta_value(_float_value(summary, "measured_fast_rate_gps"), "g/s", 1)),
                 ("Rate reduziert", _format_meta_value(_float_value(summary, "measured_slow_rate_gps"), "g/s", 1)),
                 ("Rate beim Schließen", _format_meta_value(_float_value(summary, "rate_at_close_gps"), "g/s", 1)),
+                ("2-Sample beim Schließen", _format_meta_value(_float_value(summary, "rate_2sample_at_close_gps"), "g/s", 1)),
+                ("4-Sample beim Schließen", _format_meta_value(_float_value(summary, "rate_4sample_at_close_gps"), "g/s", 1)),
+                ("Mittel beim Schließen", _format_meta_value(_float_value(summary, "rate_filtered_medium_at_close_gps"), "g/s", 1)),
+                ("Langsam beim Schließen", _format_meta_value(_float_value(summary, "rate_filtered_slow_at_close_gps"), "g/s", 1)),
+                ("Totzeit Start", _format_meta_value(_float_value(summary, "used_dead_time_s"), "s", 3)),
+                ("Nachlauf Start", _format_meta_value(_float_value(summary, "used_post_close_gain_g"), "g", 1)),
+                ("Rate schnell Start", _format_meta_value(_float_value(summary, "used_fast_rate_gps"), "g/s", 1)),
+                ("Rate reduziert Start", _format_meta_value(_float_value(summary, "used_slow_rate_gps"), "g/s", 1)),
+                ("Bias Start", _format_meta_value(_float_value(summary, "used_near_close_bias_g"), "g", 1)),
+                ("Near-Close Start", _format_meta_value(_float_value(summary, "used_near_close_g"), "g", 1)),
+                ("Früh schließen Start", _format_meta_value(_float_value(summary, "used_close_early_g"), "g", 1)),
                 ("Nachtropfen Ist", _format_meta_value(_float_value(summary, "drip_wait_used_ms"), "ms", 0)),
             ]
         )
@@ -729,6 +1017,7 @@ def _draw_debug_metadata(
                 ("Nächster Nachlauf", _format_meta_value(_float_value(summary, "next_post_close_gain_g"), "g", 1)),
                 ("Nächste Rate schnell", _format_meta_value(_float_value(summary, "next_fast_rate_gps"), "g/s", 1)),
                 ("Nächste Rate reduziert", _format_meta_value(_float_value(summary, "next_slow_rate_gps"), "g/s", 1)),
+                ("Nächster Bias", _format_meta_value(_float_value(summary, "next_near_close_bias_g"), "g", 1)),
                 ("Nächstes Nachtropfen", _format_meta_value(_float_value(summary, "next_drip_wait_ms"), "ms", 0)),
                 ("Nächstes Nahe Schließen", _format_meta_value(_float_value(summary, "next_near_close_g"), "g", 1)),
                 ("Nächstes Früh schließen", _format_meta_value(_float_value(summary, "next_close_early_g"), "g", 1)),
@@ -745,18 +1034,18 @@ def _draw_debug_metadata(
         color="#0f172a",
         fontweight="bold",
     )
-    meta_ax.text(0.0, 0.955, "Session", ha="left", va="top", fontsize=8.2, color="#475569")
-    meta_ax.text(0.0, 0.925, wrapped_session, ha="left", va="top", fontsize=8.2, color="#0f172a", linespacing=1.05)
+    meta_ax.text(0.0, 0.955, "Session", ha="left", va="top", fontsize=7.6, color="#475569")
+    meta_ax.text(0.0, 0.925, wrapped_session, ha="left", va="top", fontsize=7.4, color="#0f172a", linespacing=1.02)
     session_lines = max(1, wrapped_session.count("\n") + 1)
     y_after_session = 0.925 - (session_lines * 0.042) - 0.045
 
     left_y = y_after_session
     right_y = y_after_session
-    left_y = _draw_meta_section(meta_ax, "Lauf", general_lines, x_label=0.0, x_value=0.30, y_start=left_y)
-    left_y = _draw_meta_section(meta_ax, "Ergebnis", result_lines, x_label=0.0, x_value=0.30, y_start=left_y)
-    _draw_meta_section(meta_ax, "Preset-Parameter", preset_lines, x_label=0.0, x_value=0.30, y_start=left_y)
-    right_y = _draw_meta_section(meta_ax, "Laufzeitwerte", runtime_lines, x_label=0.56, x_value=0.86, y_start=right_y)
-    _draw_meta_section(meta_ax, "Adaptionswerte", adaptive_next_lines, x_label=0.56, x_value=0.86, y_start=right_y)
+    left_y = _draw_meta_section(meta_ax, "Lauf", general_lines, x_label=0.0, x_value=0.26, y_start=left_y)
+    left_y = _draw_meta_section(meta_ax, "Ergebnis", result_lines, x_label=0.0, x_value=0.26, y_start=left_y)
+    _draw_meta_section(meta_ax, "Preset-Parameter", preset_lines, x_label=0.0, x_value=0.26, y_start=left_y)
+    right_y = _draw_meta_section(meta_ax, "Laufzeitwerte", runtime_lines, x_label=0.50, x_value=0.79, y_start=right_y)
+    _draw_meta_section(meta_ax, "Adaptionswerte", adaptive_next_lines, x_label=0.50, x_value=0.79, y_start=right_y)
 
 
 def _create_figure_axes(
@@ -773,6 +1062,8 @@ def _create_figure_axes(
     subplot_rate = want_rate and rate_layout == "subplot"
 
     figure_height = figure_height_base + (STATE_BAND_FIGURE_EXTRA_H if want_band else 0.0)
+    if debug:
+        figure_height += DEBUG_FIGURE_EXTRA_H
     left_rows = 1 + (1 if want_band else 0) + (1 if subplot_rate else 0)
     left_height_ratios: list[float] = []
     if want_band:
@@ -782,10 +1073,7 @@ def _create_figure_axes(
         left_height_ratios.append(RATE_PLOT_HEIGHT_RATIO)
 
     if debug:
-        fig = plt.figure(
-            figsize=(figure_width + DEBUG_META_WIDTH, figure_height),
-            constrained_layout=True,
-        )
+        fig = plt.figure(figsize=(figure_width + DEBUG_META_WIDTH, figure_height))
         gs = fig.add_gridspec(
             left_rows,
             2,
@@ -802,7 +1090,7 @@ def _create_figure_axes(
             return fig, band_ax, ax, ax.twinx(), meta_ax
         return fig, band_ax, ax, rate_ax, meta_ax
 
-    fig = plt.figure(figsize=(figure_width, figure_height), constrained_layout=True)
+    fig = plt.figure(figsize=(figure_width, figure_height))
     gs = fig.add_gridspec(left_rows, 1, height_ratios=left_height_ratios)
     main_row = 1 if want_band else 0
     ax = fig.add_subplot(gs[main_row, 0])
@@ -815,11 +1103,84 @@ def _create_figure_axes(
     return fig, band_ax, ax, None, None
 
 
+def _outside_legend_columns(
+    *,
+    legend_count: int,
+    figure_profile: str,
+    subplot_rate: bool,
+) -> int:
+    if legend_count <= 0:
+        return 1
+    if figure_profile == "narrow":
+        return min(2, legend_count)
+    if subplot_rate or legend_count > 6:
+        return min(3, legend_count)
+    return min(4, legend_count)
+
+
+def _outside_legend_anchor_x(*, debug: bool, figure_profile: str) -> float:
+    if not debug:
+        return 0.5
+    figure_width, _ = _figure_size(figure_profile)
+    total_width = figure_width + DEBUG_META_WIDTH
+    return (figure_width / total_width) * 0.5
+
+
+def _layout_bottom_margin(
+    *,
+    debug: bool,
+    subplot_rate: bool,
+    outside_legend_rows: int,
+) -> float:
+    bottom = 0.08
+    if subplot_rate:
+        bottom = 0.11
+    if outside_legend_rows > 0:
+        bottom += 0.07 + 0.058 * max(0, outside_legend_rows - 1)
+    if debug:
+        bottom += 0.14 if subplot_rate else 0.07
+    return min(bottom, 0.42)
+
+
+def _apply_figure_layout(
+    fig: Any,
+    *,
+    debug: bool,
+    subplot_rate: bool,
+    want_band: bool,
+    outside_legend_rows: int,
+) -> None:
+    top = 0.945 if want_band else 0.965
+    bottom = _layout_bottom_margin(
+        debug=debug,
+        subplot_rate=subplot_rate,
+        outside_legend_rows=outside_legend_rows,
+    )
+    if debug:
+        fig.subplots_adjust(
+            left=0.075,
+            right=0.985,
+            top=top,
+            bottom=bottom,
+            wspace=0.10,
+            hspace=0.28 if subplot_rate else 0.05,
+        )
+        return
+
+    fig.tight_layout(
+        rect=(0.03, bottom, 0.985, top),
+        pad=0.35,
+        h_pad=0.95 if subplot_rate else 0.45,
+        w_pad=0.6,
+    )
+
+
 def _plot_rate_panel(
     rate_ax: Any,
+    fill_run: FillRun,
     x_samples: list[float],
-    raw_rate: list[float | None],
-    filtered_rate: list[float | None],
+    rate_series: dict[str, list[float | None]],
+    target_rate_series: list[float | None],
     *,
     show_rate: str,
     overlay: bool,
@@ -827,34 +1188,38 @@ def _plot_rate_panel(
     plotted_any = False
     handles: list[Any] = []
     labels: list[str] = []
-    if show_rate in {"both"}:
-        if any(value is not None for value in raw_rate):
-            (line_raw,) = rate_ax.plot(
+    selected_series = _selected_rate_series(show_rate)
+    for z_index, name in enumerate(selected_series, start=2):
+        values = rate_series.get(name, [])
+        if not any(value is not None for value in values):
+            continue
+        spec = RATE_SERIES_SPECS[name]
+        (line_rate,) = rate_ax.plot(
+            x_samples,
+            values,
+            color=spec["color"],
+            linewidth=1.1 if name == "raw" else (1.2 if overlay else 1.5),
+            label=spec["label"],
+            zorder=(6 + z_index) if overlay else z_index,
+            alpha=0.85 if name == "raw" else (0.92 if overlay else 1.0),
+        )
+        handles.append(line_rate)
+        labels.append(spec["label"])
+        plotted_any = True
+    if (fill_run.strategy_name or "").strip().lower() == "flow-control":
+        if any(value is not None for value in target_rate_series):
+            (line_target_rate,) = rate_ax.plot(
                 x_samples,
-                raw_rate,
-                color=LINE_RATE_RAW,
-                linewidth=1.0 if overlay else 1.0,
-                label="Rohrate [g/s]",
-                zorder=6 if overlay else 2,
-                alpha=0.85 if overlay else 1.0,
+                target_rate_series,
+                color=LINE_TARGET_RATE,
+                linewidth=1.5 if overlay else 1.6,
+                linestyle=(0, (5, 2)),
+                label="Ziel-Füllrate [g/s]",
+                zorder=5 if overlay else 2,
+                alpha=0.95,
             )
-            handles.append(line_raw)
-            labels.append("Rohrate [g/s]")
-            plotted_any = True
-    if show_rate in {"filtered", "both"}:
-        if any(value is not None for value in filtered_rate):
-            filtered_label = "Gefilterte Füllrate [g/s]" if show_rate == "both" else "Füllrate [g/s]"
-            (line_filtered,) = rate_ax.plot(
-                x_samples,
-                filtered_rate,
-                color=LINE_RATE_FILTERED,
-                linewidth=1.2 if overlay else 1.6,
-                label=filtered_label,
-                zorder=7 if overlay else 3,
-                alpha=0.9 if overlay else 1.0,
-            )
-            handles.append(line_filtered)
-            labels.append(filtered_label)
+            handles.append(line_target_rate)
+            labels.append("Ziel-Füllrate [g/s]")
             plotted_any = True
     if overlay:
         rate_ax.set_ylabel(RATE_AXIS_LABEL, color=LINE_RATE_FILTERED)
@@ -904,7 +1269,7 @@ def _render_fill_variant(
     states = _state_events(records)
     gates = _gate_events(records)
     faults = _fault_events(records)
-    x_samples, y_fill_mass, y_gate, raw_rate, filtered_rate, base_weight_g = _series_from_samples(fill_run, samples)
+    x_samples, y_fill_mass, y_gate, rate_series, target_rate_series, base_weight_g = _series_from_samples(fill_run, samples)
 
     _figure_style()
     fig, band_ax, ax, rate_ax, meta_ax = _create_figure_axes(
@@ -966,7 +1331,7 @@ def _render_fill_variant(
     _annotate_faults(ax, fill_run, faults)
 
     ax.set_xlabel("" if (rate_ax is not None and not overlay_rate) else "Zeit relativ zum Füllbeginn [s]")
-    ax.tick_params(labelbottom=True)
+    ax.tick_params(labelbottom=True, axis="x", pad=1)
     ax.set_ylabel("Füllmasse [g]")
     ax2.set_ylabel("Klappenstellung [%]")
     ax2.set_ylim(-2, 112)
@@ -979,21 +1344,41 @@ def _render_fill_variant(
     if rate_ax is not None:
         handles3, labels3 = _plot_rate_panel(
             rate_ax,
+            fill_run,
             x_samples,
-            raw_rate,
-            filtered_rate,
+            rate_series,
+            target_rate_series,
             show_rate=show_rate,
             overlay=overlay_rate,
         )
         if not overlay_rate:
-            rate_ax.tick_params(labelbottom=True)
+            rate_ax.tick_params(labelbottom=True, axis="x", pad=4)
 
     handles1, labels1 = ax.get_legend_handles_labels()
     handles2, labels2 = ax2.get_legend_handles_labels()
     legend_count = len(handles1) + len(handles2) + len(handles3)
-    outside_legend_cols = max(1, legend_count)
-    if figure_profile == "narrow" and not overlay_rate:
-        outside_legend_cols = min(3, outside_legend_cols)
+    outside_legend_cols = _outside_legend_columns(
+        legend_count=legend_count,
+        figure_profile=figure_profile,
+        subplot_rate=(rate_ax is not None and not overlay_rate),
+    )
+    outside_legend_rows = 0
+    if legend_placement == "outside":
+        outside_legend_rows = max(1, (legend_count + outside_legend_cols - 1) // outside_legend_cols)
+    bottom_margin = _layout_bottom_margin(
+        debug=debug,
+        subplot_rate=(rate_ax is not None and not overlay_rate),
+        outside_legend_rows=outside_legend_rows,
+    )
+
+    _apply_figure_layout(
+        fig,
+        debug=debug,
+        subplot_rate=(rate_ax is not None and not overlay_rate),
+        want_band=(band_ax is not None),
+        outside_legend_rows=outside_legend_rows,
+    )
+
     legend_kwargs = {
         "handles": handles1 + handles2 + handles3,
         "labels": labels1 + labels2 + labels3,
@@ -1019,19 +1404,17 @@ def _render_fill_variant(
                 borderaxespad=0.2,
             )
     else:
-        legend_y = -0.16 if overlay_rate else -0.54
-        if not overlay_rate and figure_profile == "narrow":
-            legend_y = -0.62
-        if not overlay_rate and debug:
-            legend_y -= 0.10
-        legend_kwargs.update(
-            {
-                "loc": "upper center",
-                "bbox_to_anchor": (0.5, legend_y),
-            }
-        )
-        legend_target = rate_ax if (rate_ax is not None and not overlay_rate) else ax
-        legend_target.legend(**legend_kwargs)
+        if legend_count > 0:
+            legend_y = max(0.02, bottom_margin - (0.10 if debug else 0.01))
+            fig.legend(
+                **legend_kwargs,
+                loc="upper center",
+                bbox_to_anchor=(
+                    _outside_legend_anchor_x(debug=debug, figure_profile=figure_profile),
+                    legend_y,
+                ),
+                bbox_transform=fig.transFigure,
+            )
 
     if debug and meta_ax is not None:
         _draw_debug_metadata(meta_ax, session_dir, fill_run, base_weight_g, records)
@@ -1096,6 +1479,346 @@ def _plot_fill(
             )
         )
     return exported
+
+
+def _export_session_figure(
+    fig: Any,
+    output_dir: Path,
+    *,
+    session_dir: Path,
+    suffix: str,
+    formats: list[str],
+) -> list[Path]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    stem = output_dir / f"{_session_output_stem_base(session_dir)}__{suffix}"
+    exported: list[Path] = []
+    for fmt in formats:
+        out_path = stem.parent / f"{stem.name}.{fmt}"
+        fig.savefig(out_path, dpi=180 if fmt == "png" else None)
+        exported.append(out_path)
+    plt.close(fig)
+    return exported
+
+
+def _plot_session_overview(
+    session_dir: Path,
+    entries: list[dict[str, Any]],
+    output_dir: Path,
+    formats: list[str],
+) -> list[Path]:
+    x_ticks = [int(entry["fill_id"]) for entry in entries]
+    fig, axes = plt.subplots(3, 1, sharex=True, figsize=(8.67, 7.9))
+    fig.suptitle("Sitzungsübersicht Füllläufe", x=0.08, y=0.985, ha="left", fontsize=13, color="#0f172a")
+    fig.text(0.08, 0.955, _session_summary_subtitle(session_dir, entries), ha="left", va="top", fontsize=9.2, color="#475569")
+
+    plotted = [
+        _plot_single_series(
+            axes[0],
+            entries,
+            field="fill_error_g",
+            ylabel="Fehler zur Zielmasse [g]",
+            title="Abweichung pro Fülllauf",
+            color=SESSION_LINE_COLORS["fill_error_g"],
+        ),
+        _plot_single_series(
+            axes[1],
+            entries,
+            field="fill_duration_s",
+            ylabel="Fülldauer [s]",
+            title="Fülldauer pro Fülllauf",
+            color=SESSION_LINE_COLORS["fill_duration_s"],
+        ),
+        _plot_single_series(
+            axes[2],
+            entries,
+            field="refill_count",
+            ylabel="Nachfüllungen [-]",
+            title="Nachfüllzyklen pro Fülllauf",
+            color=SESSION_LINE_COLORS["refill_count"],
+        ),
+    ]
+    if not any(plotted):
+        plt.close(fig)
+        return []
+    _setup_session_axes(list(axes), x_ticks)
+    fig.tight_layout(rect=(0.06, 0.06, 0.98, 0.93))
+    return _export_session_figure(
+        fig,
+        output_dir,
+        session_dir=session_dir,
+        suffix="session-summary",
+        formats=formats,
+    )
+
+
+def _plot_session_adaptive(
+    session_dir: Path,
+    entries: list[dict[str, Any]],
+    output_dir: Path,
+    formats: list[str],
+) -> list[Path]:
+    metrics = [
+        ("used_near_close_g", "Nahe Schließen [g]", "Eingesetzter Schwellwert für Nahe Schließen", SESSION_LINE_COLORS["used_near_close_g"]),
+        ("used_close_early_g", "Früh schließen [g]", "Eingesetzter Früh-Schließen-Wert", SESSION_LINE_COLORS["used_close_early_g"]),
+        ("drip_wait_used_ms", "Nachtropfzeit [ms]", "Tatsächlich verwendete Nachtropfzeit", SESSION_LINE_COLORS["drip_wait_used_ms"]),
+    ]
+    available = [
+        metric for metric in metrics if _summary_series(entries, metric[0])[0]
+    ]
+    if not available:
+        return []
+
+    x_ticks = [int(entry["fill_id"]) for entry in entries]
+    fig, axes = plt.subplots(len(available), 1, sharex=True, figsize=(8.67, 2.15 * len(available) + 1.0))
+    axes_list = [axes] if len(available) == 1 else list(axes)
+    fig.suptitle("Sitzungsübersicht adaptive Parameter", x=0.08, y=0.985, ha="left", fontsize=13, color="#0f172a")
+    fig.text(0.08, 0.955, _session_summary_subtitle(session_dir, entries), ha="left", va="top", fontsize=9.2, color="#475569")
+
+    for ax, (field, ylabel, title, color) in zip(axes_list, available, strict=True):
+        _plot_single_series(
+            ax,
+            entries,
+            field=field,
+            ylabel=ylabel,
+            title=title,
+            color=color,
+        )
+
+    _setup_session_axes(axes_list, x_ticks)
+    fig.tight_layout(rect=(0.06, 0.06, 0.98, 0.93))
+    return _export_session_figure(
+        fig,
+        output_dir,
+        session_dir=session_dir,
+        suffix="session-learning",
+        formats=formats,
+    )
+
+
+def _plot_session_compare(
+    session_dir: Path,
+    entries: list[dict[str, Any]],
+    output_dir: Path,
+    formats: list[str],
+) -> list[Path]:
+    panel_builders = [
+        (
+            "post_close",
+            lambda ax: _plot_compare_series(
+                ax,
+                entries,
+                left_field="measured_post_close_gain_g",
+                left_label="Gemessener Nachlauf",
+                left_color=SESSION_LINE_COLORS["measured_post_close_gain_g"],
+                right_field="next_post_close_gain_g",
+                right_label="Nächster Nachlauf",
+                right_color=SESSION_LINE_COLORS["next_post_close_gain_g"],
+                ylabel="Nachlauf [g]",
+                title="Nachlauf: gemessen vs. nächster Schätzwert",
+            ),
+        ),
+        (
+            "dead_time",
+            lambda ax: _plot_compare_series(
+                ax,
+                entries,
+                left_field="measured_dead_time_s",
+                left_label="Gemessene Totzeit",
+                left_color=SESSION_LINE_COLORS["measured_dead_time_s"],
+                right_field="next_dead_time_s",
+                right_label="Nächste Totzeit",
+                right_color=SESSION_LINE_COLORS["next_dead_time_s"],
+                ylabel="Totzeit [s]",
+                title="Totzeit: Messung vs. nächster Schätzwert",
+            ),
+        ),
+        (
+            "rates",
+            lambda ax: (
+                _plot_compare_series(
+                    ax,
+                    entries,
+                    left_field="measured_fast_rate_gps",
+                    left_label="Gemessene schnelle Rate",
+                    left_color=SESSION_LINE_COLORS["measured_fast_rate_gps"],
+                    right_field="next_fast_rate_gps",
+                    right_label="Nächste schnelle Rate",
+                    right_color=SESSION_LINE_COLORS["next_fast_rate_gps"],
+                    ylabel="Füllrate [g/s]",
+                    title="Füllraten schnell/langsam: Messung vs. nächster Schätzwert",
+                )
+                or _plot_compare_series(
+                    ax,
+                    entries,
+                    left_field="measured_slow_rate_gps",
+                    left_label="Gemessene reduzierte Rate",
+                    left_color=SESSION_LINE_COLORS["measured_slow_rate_gps"],
+                    right_field="next_slow_rate_gps",
+                    right_label="Nächste reduzierte Rate",
+                    right_color=SESSION_LINE_COLORS["next_slow_rate_gps"],
+                    ylabel="Füllrate [g/s]",
+                    title="Füllraten schnell/langsam: Messung vs. nächster Schätzwert",
+                )
+            ),
+        ),
+    ]
+    available_keys: list[str] = []
+    for key, _ in panel_builders:
+        if key == "post_close" and (_summary_series(entries, "measured_post_close_gain_g")[0] or _summary_series(entries, "next_post_close_gain_g")[0]):
+            available_keys.append(key)
+        elif key == "dead_time" and (_summary_series(entries, "measured_dead_time_s")[0] or _summary_series(entries, "next_dead_time_s")[0]):
+            available_keys.append(key)
+        elif key == "rates" and (
+            _summary_series(entries, "measured_fast_rate_gps")[0]
+            or _summary_series(entries, "next_fast_rate_gps")[0]
+            or _summary_series(entries, "measured_slow_rate_gps")[0]
+            or _summary_series(entries, "next_slow_rate_gps")[0]
+        ):
+            available_keys.append(key)
+    if not available_keys:
+        return []
+
+    x_ticks = [int(entry["fill_id"]) for entry in entries]
+    fig, axes = plt.subplots(len(available_keys), 1, sharex=True, figsize=(8.67, 2.3 * len(available_keys) + 1.0))
+    axes_list = [axes] if len(available_keys) == 1 else list(axes)
+    fig.suptitle("Sitzungsübersicht Messwerte und Folgeschätzungen", x=0.08, y=0.985, ha="left", fontsize=13, color="#0f172a")
+    fig.text(0.08, 0.955, _session_summary_subtitle(session_dir, entries), ha="left", va="top", fontsize=9.2, color="#475569")
+
+    for ax, key in zip(axes_list, available_keys, strict=True):
+        if key == "post_close":
+            _plot_compare_series(
+                ax,
+                entries,
+                left_field="measured_post_close_gain_g",
+                left_label="Gemessener Nachlauf",
+                left_color=SESSION_LINE_COLORS["measured_post_close_gain_g"],
+                right_field="next_post_close_gain_g",
+                right_label="Nächster Nachlauf",
+                right_color=SESSION_LINE_COLORS["next_post_close_gain_g"],
+                ylabel="Nachlauf [g]",
+                title="Nachlauf: gemessen vs. nächster Schätzwert",
+            )
+        elif key == "dead_time":
+            _plot_compare_series(
+                ax,
+                entries,
+                left_field="measured_dead_time_s",
+                left_label="Gemessene Totzeit",
+                left_color=SESSION_LINE_COLORS["measured_dead_time_s"],
+                right_field="next_dead_time_s",
+                right_label="Nächste Totzeit",
+                right_color=SESSION_LINE_COLORS["next_dead_time_s"],
+                ylabel="Totzeit [s]",
+                title="Totzeit: Messung vs. nächster Schätzwert",
+            )
+        else:
+            plotted_fast = _plot_compare_series(
+                ax,
+                entries,
+                left_field="measured_fast_rate_gps",
+                left_label="Gemessene schnelle Rate",
+                left_color=SESSION_LINE_COLORS["measured_fast_rate_gps"],
+                right_field="next_fast_rate_gps",
+                right_label="Nächste schnelle Rate",
+                right_color=SESSION_LINE_COLORS["next_fast_rate_gps"],
+                ylabel="Füllrate [g/s]",
+                title="Füllraten: Messung vs. nächster Schätzwert",
+            )
+            slow_left_x, slow_left_y = _summary_series(entries, "measured_slow_rate_gps")
+            slow_right_x, slow_right_y = _summary_series(entries, "next_slow_rate_gps")
+            if slow_left_x:
+                ax.plot(
+                    slow_left_x,
+                    slow_left_y,
+                    color=SESSION_LINE_COLORS["measured_slow_rate_gps"],
+                    linewidth=1.6,
+                    marker="^",
+                    markersize=4.0,
+                    label="Gemessene reduzierte Rate",
+                )
+            if slow_right_x:
+                ax.plot(
+                    slow_right_x,
+                    slow_right_y,
+                    color=SESSION_LINE_COLORS["next_slow_rate_gps"],
+                    linewidth=1.6,
+                    linestyle=":",
+                    marker="v",
+                    markersize=4.0,
+                    label="Nächste reduzierte Rate",
+                )
+            if plotted_fast or slow_left_x or slow_right_x:
+                ax.legend(frameon=False, loc="upper left", ncol=2)
+
+    _setup_session_axes(axes_list, x_ticks)
+    fig.tight_layout(rect=(0.06, 0.06, 0.98, 0.93))
+    return _export_session_figure(
+        fig,
+        output_dir,
+        session_dir=session_dir,
+        suffix="session-adaptation",
+        formats=formats,
+    )
+
+
+def _plot_session_summaries(
+    session_dir: Path,
+    fill_runs: list[FillRun],
+    fill_records: dict[int, list[dict[str, Any]]],
+    output_dir: Path,
+    formats: list[str],
+    *,
+    groups: list[str],
+) -> tuple[list[Path], list[dict[str, Any]]]:
+    entries = _session_summary_entries(fill_runs, fill_records)
+    if not entries:
+        return [], []
+
+    _figure_style()
+    exported: list[Path] = []
+    if "overview" in groups:
+        exported.extend(_plot_session_overview(session_dir, entries, output_dir, formats))
+    if "adaptive" in groups:
+        exported.extend(_plot_session_adaptive(session_dir, entries, output_dir, formats))
+    if "compare" in groups:
+        exported.extend(_plot_session_compare(session_dir, entries, output_dir, formats))
+    return exported, entries
+
+
+def _print_session_summary_console(session_dir: Path, entries: list[dict[str, Any]]) -> None:
+    if not entries:
+        print("Session summary: no matching fill_summary records found.")
+        return
+
+    error_values = [abs(value) for value in (_float_value(entry["summary"], "fill_error_g") for entry in entries) if value is not None]
+    duration_values = [value for value in (_float_value(entry["summary"], "fill_duration_s") for entry in entries) if value is not None]
+    refill_values = [int(value) for value in (_float_value(entry["summary"], "refill_count") for entry in entries) if value is not None]
+
+    first_summary = entries[0]["summary"]
+    last_summary = entries[-1]["summary"]
+    first_error = _float_value(first_summary, "fill_error_g")
+    last_error = _float_value(last_summary, "fill_error_g")
+    first_duration = _float_value(first_summary, "fill_duration_s")
+    last_duration = _float_value(last_summary, "fill_duration_s")
+
+    mean_abs_error = sum(error_values) / len(error_values) if error_values else None
+    mean_duration = sum(duration_values) / len(duration_values) if duration_values else None
+    total_refills = sum(refill_values)
+
+    print()
+    print(f"Session summary: {session_dir.name}")
+    print(f"  Included fills:       {len(entries)}")
+    print(f"  Mean abs. error:      {_format_series_value(mean_abs_error, 'g', 2)}")
+    print(f"  Mean fill duration:   {_format_series_value(mean_duration, 's', 2)}")
+    print(f"  Total refills:        {total_refills}")
+    print(
+        "  First -> last error:  "
+        f"{_format_series_value(first_error, 'g', 2)} -> {_format_series_value(last_error, 'g', 2)}"
+    )
+    print(
+        "  First -> last Dauer:  "
+        f"{_format_series_value(first_duration, 's', 2)} -> {_format_series_value(last_duration, 's', 2)}"
+    )
 
 
 def main() -> int:
@@ -1164,9 +1887,12 @@ def main() -> int:
     )
     parser.add_argument(
         "--show-rate",
-        choices=["none", "filtered", "both"],
+        type=_parse_show_rate,
         default="none",
-        help="Show fill-rate telemetry in addition to mass and gate traces",
+        help=(
+            "Show rate telemetry as none, all, or a comma list such as "
+            "raw,filtered,medium"
+        ),
     )
     parser.add_argument(
         "--rate-layout",
@@ -1185,7 +1911,28 @@ def main() -> int:
         action="store_true",
         help="Export the plain chart in both wide and narrow variants with suffixed filenames; debug is exported once",
     )
-    parser.set_defaults(clear_output=True)
+    parser.add_argument(
+        "--session-summary",
+        dest="session_summary",
+        action="store_true",
+        help="Export additional session-level summary figures based on fill_summary records (default)",
+    )
+    parser.add_argument(
+        "--no-session-summary",
+        dest="session_summary",
+        action="store_false",
+        help="Disable session-level summary figure export",
+    )
+    parser.add_argument(
+        "--session-summary-groups",
+        type=_parse_session_summary_groups,
+        default=SESSION_SUMMARY_GROUP_ORDER.copy(),
+        help=(
+            "Comma list of session summary groups to export: "
+            "overview,adaptive,compare, or all"
+        ),
+    )
+    parser.set_defaults(clear_output=True, session_summary=True)
     args = parser.parse_args()
 
     session_dir, fill_runs, fill_records = _load_input(
@@ -1230,6 +1977,18 @@ def main() -> int:
                 plain_both_profiles=args.plain_both_profiles,
             )
         )
+    session_summary_exported: list[Path] = []
+    session_summary_entries: list[dict[str, Any]] = []
+    if args.session_summary:
+        session_summary_exported, session_summary_entries = _plot_session_summaries(
+            session_dir=session_dir,
+            fill_runs=selected_fills,
+            fill_records=fill_records,
+            output_dir=output_dir,
+            formats=formats,
+            groups=args.session_summary_groups,
+        )
+        exported.extend(session_summary_exported)
 
     print(f"Session:  {session_dir}")
     print(f"Output:   {output_dir}")
@@ -1242,9 +2001,14 @@ def main() -> int:
     print(f"Layout:   {args.rate_layout}")
     print(f"Profile:  {args.figure_profile}")
     print(f"Plain:    {'wide+narrow' if args.plain_both_profiles else args.figure_profile}")
+    print(f"Session summaries: {'on' if args.session_summary else 'off'}")
+    if args.session_summary:
+        print(f"Summary groups: {', '.join(args.session_summary_groups)}")
     print()
     for fill_run in selected_fills:
         print(format_fill_brief(fill_run))
+    if args.session_summary:
+        _print_session_summary_console(session_dir, session_summary_entries)
     print()
     for path in exported:
         print(path)

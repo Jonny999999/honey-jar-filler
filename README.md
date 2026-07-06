@@ -51,6 +51,16 @@ cd firmware_honey-jar-filler
 idf.py set-target esp32
 idf.py build
 ```
+- No separate "install components" step is needed — `idf.py build` auto-fetches
+  the managed components listed in `main/idf_component.yml` (esp-idf-lib hx711/
+  encoder, ssd1306, servo, led_strip) into `managed_components/` on first run.
+  `managed_components/` and `build/` are gitignored and regenerated per machine.
+- `dependencies.lock` **is** committed and pins exact component versions — do
+  not delete it. Some `idf_component.yml` entries use unbounded ranges (e.g.
+  `esp-idf-lib/hx711: '*'`), and upstream has shipped breaking API changes
+  under those ranges before (`esp-idf-lib/encoder` v2.0.0 rewrote the whole
+  API); without the lock file, a fresh clone can silently resolve to an
+  incompatible version and fail to compile.
 - Flash and monitor (adjust serial port as needed):
 ```bash
 idf.py -p /dev/ttyUSB0 flash monitor

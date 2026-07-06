@@ -52,7 +52,22 @@ HELP_VALUE = "\x1b[38;5;120m"
 HELP_DIM = "\x1b[38;5;250m"
 LIVE_STATUS_HEADER_LINES = 3
 WEIGHT_PLOT_HEIGHT = 8
-LIVE_STATUS_LINE_COUNT = LIVE_STATUS_HEADER_LINES + WEIGHT_PLOT_HEIGHT
+# Always leave at least this many rows for the scrolling log area above the
+# sticky footer. Without this the fixed-height footer fills a short terminal and
+# the log region has no room to scroll (looks static on smaller laptop windows).
+MIN_LOG_ROWS = 6
+
+
+def compute_status_geometry(term_lines: int) -> tuple[int, int]:
+    """Return (plot_height, status_line_count) sized to the current terminal.
+
+    The weight plot shrinks (down to 0) so the footer never consumes more than
+    ``term_lines - MIN_LOG_ROWS`` rows, guaranteeing a usable log scroll area
+    regardless of window height."""
+    footer_budget = max(1, term_lines - MIN_LOG_ROWS)
+    plot_height = max(0, min(WEIGHT_PLOT_HEIGHT, footer_budget - LIVE_STATUS_HEADER_LINES))
+    status_line_count = min(LIVE_STATUS_HEADER_LINES + plot_height, footer_budget)
+    return plot_height, max(1, status_line_count)
 
 
 @dataclass
@@ -247,7 +262,7 @@ def write_session_meta(meta_path: Path, *, port: str, baud: int, pre_run_ms: int
     meta_path.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
 
 
-def print_usage_summary(*, status_line_enabled: bool) -> None:
+def print_usage_summary(*, status_line_enabled: bool, scroll_bottom: int | None = None) -> None:
     sep = f"{HELP_DIM}{'=' * 72}{ANSI_RESET}"
     lines = [
         sep,
@@ -267,7 +282,7 @@ def print_usage_summary(*, status_line_enabled: bool) -> None:
         sep,
     ]
     for line in lines:
-        print_status_note(status_line_enabled, line)
+        print_status_note(status_line_enabled, line, scroll_bottom=scroll_bottom)
 
 
 def open_run_capture(runs_dir: Path, run_id: int) -> RunCapture:
@@ -286,51 +301,47 @@ def status_enabled() -> bool:
     return sys.stdout.isatty() and os.environ.get("TERM", "dumb") != "dumb"
 
 
-def clear_status_lines(enabled: bool, line_count: int) -> None:
-    if not enabled:
-        return
-    if line_count <= 0:
-        return
-    for idx in range(line_count):
-        sys.stdout.write("\x1b[2K\r")
-        if idx != line_count - 1:
-            sys.stdout.write("\x1b[1B")
-    if line_count > 1:
-        sys.stdout.write(f"\x1b[{line_count - 1}A\r")
-    sys.stdout.flush()
+def set_scroll_region(top: int, bottom: int) -> None:
+    """Restrict scrolling (via LF/IND at the bottom margin) to rows top..bottom.
+
+    Rows below `bottom` (the sticky footer) are left untouched by log output,
+    instead of relying on relative cursor motion to fake independent scrolling."""
+    sys.stdout.write(f"\x1b[{top};{bottom}r")
 
 
-def print_status_block(enabled: bool, lines: list[str]) -> None:
-    if not enabled:
+def reset_scroll_region() -> None:
+    sys.stdout.write("\x1b[r")
+
+
+def move_cursor(row: int, col: int = 1) -> None:
+    sys.stdout.write(f"\x1b[{row};{col}H")
+
+
+def clear_rows(row_start: int, row_count: int) -> None:
+    """Clear `row_count` absolute terminal rows starting at `row_start`."""
+    if row_count <= 0:
         return
+    for offset in range(row_count):
+        sys.stdout.write(f"\x1b[{row_start + offset};1H\x1b[2K")
+
+
+def print_status_block(lines: list[str], *, footer_top: int, term_cols: int) -> None:
     if not lines:
         return
-    term_width = shutil.get_terminal_size((120, 24)).columns
-    rendered = []
-    for line in lines:
-        text = clip_ansi_text(line, max(0, term_width - 1))
-        rendered.append(f"{STATUS_BG}{STATUS_FG}{text}\x1b[K{ANSI_RESET}")
-    sys.stdout.write("\r" + "\n".join(rendered))
-    if len(lines) > 1:
-        sys.stdout.write(f"\x1b[{len(lines) - 1}A\r")
+    for offset, line in enumerate(lines):
+        text = clip_ansi_text(line, max(0, term_cols - 1))
+        sys.stdout.write(
+            f"\x1b[{footer_top + offset};1H\x1b[2K"
+            f"{STATUS_BG}{STATUS_FG}{text}\x1b[K{ANSI_RESET}"
+        )
     sys.stdout.flush()
 
 
-def leave_status_area(enabled: bool, line_count: int) -> None:
+def detach_status_area(enabled: bool, term_lines: int) -> None:
     if not enabled:
         return
-    clear_status_lines(True, line_count)
-    if line_count > 1:
-        sys.stdout.write(f"\x1b[{line_count - 1}B\r")
-    sys.stdout.write("\x1b[2K\r")
-    sys.stdout.flush()
-
-
-def detach_status_area(enabled: bool, line_count: int) -> None:
-    if not enabled:
-        return
-    if line_count > 1:
-        sys.stdout.write(f"\x1b[{line_count - 1}B\r")
+    reset_scroll_region()
+    move_cursor(term_lines, 1)
     sys.stdout.write("\n")
     sys.stdout.write(ANSI_RESET)
     sys.stdout.flush()
@@ -399,12 +410,14 @@ def print_shutdown_summary(
     print(sep)
 
 
-def print_status_note(enabled: bool, text: str) -> None:
-    if not enabled:
+def print_status_note(enabled: bool, text: str, *, scroll_bottom: int | None = None) -> None:
+    if not enabled or scroll_bottom is None:
         print(text)
         return
-    clear_status_lines(True, 1)
+    move_cursor(scroll_bottom, 1)
+    sys.stdout.write("\x1b[2K")
     print(text)
+    sys.stdout.flush()
 
 
 def should_colorize(mode: str) -> bool:
@@ -436,9 +449,10 @@ def colorize_console_line(line: str, enabled: bool) -> str:
     return f"{color}{line}{ANSI_RESET}"
 
 
-def write_console_line(line: str, *, status_line_enabled: bool, colorize_logs: bool) -> None:
+def write_console_line(line: str, *, status_line_enabled: bool, colorize_logs: bool, scroll_bottom: int) -> None:
     if status_line_enabled:
-        clear_status_lines(True, LIVE_STATUS_LINE_COUNT)
+        move_cursor(scroll_bottom, 1)
+        sys.stdout.write("\x1b[2K")
     sys.stdout.write(colorize_console_line(line, colorize_logs))
     sys.stdout.flush()
 
@@ -507,12 +521,22 @@ def main() -> int:
     telemetry_log = (session_dir / "telemetry.ndjson").open("w", encoding="utf-8", buffering=1)
 
     status_line_enabled = status_enabled()
-    print_usage_summary(status_line_enabled=status_line_enabled)
-    print_status_note(status_line_enabled, f"Telemetry session: {session_dir}")
+    term_size = shutil.get_terminal_size((120, 24))
+    plot_height, status_line_count = compute_status_geometry(term_size.lines)
+    scroll_bottom = max(1, term_size.lines - status_line_count)
+    if status_line_enabled:
+        # Confine LF-triggered scrolling to rows 1..scroll_bottom so the sticky
+        # footer below it never freezes the log area, regardless of terminal
+        # height (see compute_status_geometry / MIN_LOG_ROWS).
+        set_scroll_region(1, scroll_bottom)
+        move_cursor(scroll_bottom, 1)
+
+    print_usage_summary(status_line_enabled=status_line_enabled, scroll_bottom=scroll_bottom)
+    print_status_note(status_line_enabled, f"Telemetry session: {session_dir}", scroll_bottom=scroll_bottom)
     port_note = format_port_selection_note(args.port)
     if port_note:
-        print_status_note(status_line_enabled, port_note)
-    print_status_note(status_line_enabled, f"Opening serial port {port} @ {args.baud} baud")
+        print_status_note(status_line_enabled, port_note, scroll_bottom=scroll_bottom)
+    print_status_note(status_line_enabled, f"Opening serial port {port} @ {args.baud} baud", scroll_bottom=scroll_bottom)
 
     serial_dev = serial.Serial(port=port, baudrate=args.baud, timeout=0.25)
     colorize_logs = should_colorize(args.color)
@@ -528,24 +552,33 @@ def main() -> int:
     pending_bytes = bytearray()
     live = LiveStatus()
     weight_history: deque[float] = deque(maxlen=180)
-    status_line_count = LIVE_STATUS_LINE_COUNT
     started_at = time.monotonic()
     interrupted = False
 
     def refresh_status(force: bool = False) -> None:
-        nonlocal last_status_refresh
+        nonlocal last_status_refresh, status_line_count, scroll_bottom
         if not status_line_enabled:
             return
         now = time.monotonic()
         if not force and (now - last_status_refresh) < 0.1:
             return
         active = f"run={current_run.run_id}" if current_run is not None else "run=idle"
-        term_width = shutil.get_terminal_size((120, 24)).columns
+        term_size = shutil.get_terminal_size((120, 24))
+        term_width = term_size.columns
         plot_width = max(24, min(108, term_width - 5))
-        plot_lines = build_weight_plot(weight_history, plot_width, WEIGHT_PLOT_HEIGHT, 0.0, 500.0)
-        clear_status_lines(True, status_line_count)
+        plot_height, new_status_count = compute_status_geometry(term_size.lines)
+        new_scroll_bottom = max(1, term_size.lines - new_status_count)
+        plot_lines = build_weight_plot(weight_history, plot_width, plot_height, 0.0, 500.0)
+        if (new_scroll_bottom, new_status_count) != (scroll_bottom, status_line_count):
+            # Geometry changed (window resize or chart-height change): clear
+            # both the old and new footer rows, then move the scroll margin.
+            clear_rows(scroll_bottom + 1, status_line_count)
+            clear_rows(new_scroll_bottom + 1, new_status_count)
+            set_scroll_region(1, new_scroll_bottom)
+            scroll_bottom = new_scroll_bottom
+            status_line_count = new_status_count
+        visible_headers = max(0, status_line_count - len(plot_lines))
         print_status_block(
-            True,
             [
                 (
                     f"{status_fmt_key('[capture]')} "
@@ -570,8 +603,10 @@ def main() -> int:
                     f"{status_fmt_key('slot=')}{status_fmt_value(str(live.slot_idx))} "
                     f"{status_fmt_key('end=')}{status_fmt_value(live.last_end_reason[:12], dim=(live.last_end_reason == '-'))}"
                 ),
-                *plot_lines,
-            ],
+            ][:visible_headers]
+            + plot_lines,
+            footer_top=scroll_bottom + 1,
+            term_cols=term_width,
         )
         last_status_refresh = now
 
@@ -588,14 +623,16 @@ def main() -> int:
         if payload is None:
             write_console_line(line,
                                status_line_enabled=status_line_enabled,
-                               colorize_logs=colorize_logs)
+                               colorize_logs=colorize_logs,
+                               scroll_bottom=scroll_bottom)
             refresh_status(force=True)
             return
 
         if args.show_tel:
             write_console_line(line,
                                status_line_enabled=status_line_enabled,
-                               colorize_logs=False)
+                               colorize_logs=False,
+                               scroll_bottom=scroll_bottom)
             refresh_status(force=True)
 
         telemetry_log.write(payload)
@@ -627,6 +664,7 @@ def main() -> int:
                     print_status_note(
                         status_line_enabled,
                         f"Warning: closing unfinished run {current_run.run_id} before new run_start.",
+                        scroll_bottom=scroll_bottom,
                     )
                     close_run_capture(current_run)
                 current_run = open_run_capture(runs_dir, run_id)
@@ -730,7 +768,7 @@ def main() -> int:
         interrupted = True
     finally:
         if status_line_enabled:
-            detach_status_area(status_line_enabled, status_line_count)
+            detach_status_area(status_line_enabled, shutil.get_terminal_size((120, 24)).lines)
         reset_terminal_state()
         session_log.flush()
         telemetry_log.flush()

@@ -15,9 +15,9 @@ IMPORTANT_PARAM_KEYS = [
     "VAR(target_tol_low_g)",
     "VAR(target_tol_high_g)",
     "VAR(max_gate_pct)",
-    "VAR(near_close_delta_g)",
-    "VAR(near_close_gate_pct)",
-    "VAR(close_early_g)",
+    "VAR(slow_remaining_g)",
+    "VAR(slow_gate_pct)",
+    "VAR(close_remaining_g)",
     "VAR(drip_delay_ms)",
 ]
 
@@ -26,11 +26,34 @@ PARAM_LABELS = {
     "VAR(target_tol_low_g)": "Tol low",
     "VAR(target_tol_high_g)": "Tol high",
     "VAR(max_gate_pct)": "Max gate",
-    "VAR(near_close_delta_g)": "Near close d",
-    "VAR(near_close_gate_pct)": "Near gate",
-    "VAR(close_early_g)": "Close early",
+    "VAR(slow_remaining_g)": "Slow rem",
+    "VAR(slow_gate_pct)": "Slow gate",
+    "VAR(close_remaining_g)": "Close rem",
     "VAR(drip_delay_ms)": "Drip wait",
 }
+
+# Legacy parameter keys kept for backward compatibility with telemetry captured
+# before the near-close/close-early parameters were renamed. Maps the current
+# key to the historic key(s) that carried the same value in older log files.
+PARAM_KEY_ALIASES = {
+    "VAR(slow_remaining_g)": ["VAR(near_close_delta_g)"],
+    "VAR(slow_gate_pct)": ["VAR(near_close_gate_pct)"],
+    "VAR(close_remaining_g)": ["VAR(close_early_g)"],
+}
+
+
+def resolve_param(params: dict[str, Any], key: str) -> tuple[str, Any] | None:
+    """Look up a parameter by its current key, falling back to legacy aliases.
+
+    Returns the (present_key, value) that was found, or None if neither the
+    current key nor any known legacy alias is present.
+    """
+    if key in params:
+        return key, params[key]
+    for legacy_key in PARAM_KEY_ALIASES.get(key, ()):
+        if legacy_key in params:
+            return legacy_key, params[legacy_key]
+    return None
 
 
 @dataclass(slots=True)
@@ -411,8 +434,9 @@ def format_fill_brief(fill_run: FillRun) -> str:
 def important_params(fill_run: FillRun) -> list[tuple[str, Any]]:
     items: list[tuple[str, Any]] = []
     for key in IMPORTANT_PARAM_KEYS:
-        if key in fill_run.params:
-            items.append((PARAM_LABELS.get(key, key), fill_run.params[key]))
+        resolved = resolve_param(fill_run.params, key)
+        if resolved is not None:
+            items.append((PARAM_LABELS.get(key, key), resolved[1]))
     return items
 
 

@@ -40,12 +40,17 @@ typedef struct {
     char strategy_name[FILLER_STRATEGY_NAME_MAX];
     char gate_phase[FILLER_GATE_PHASE_MAX];
     float raw_rate_gps;
+    float rate_2sample_gps;
+    float rate_4sample_gps;
     float filtered_rate_gps;
+    float filtered_rate_medium_gps;
+    float filtered_rate_slow_gps;
     float target_rate_gps;
     float rate_error_gps;
     float predicted_remaining_g;
     float measured_dead_time_s;
     float measured_post_close_gain_g;
+    float measured_near_close_gain_g;
     // Learning / experimental strategies publish learned or live-adapted
     // values here. Fixed heuristic mode reuses the same fields for the
     // currently active static thresholds/waits so comparison charts can share
@@ -54,9 +59,15 @@ typedef struct {
     float learned_post_close_gain_g;
     float learned_fast_rate_gps;
     float learned_slow_rate_gps;
+    float learned_near_close_bias_g;
     float adapted_near_close_g;
     float adapted_close_early_g;
     float adapted_drip_wait_ms;
+    // Cascade / Smith-predictor diagnostics (0 for the other strategies).
+    float model_rate_gps;          // ŷ  delay-free model rate
+    float model_delayed_gps;       // ŷ_d model rate through the dead time
+    float control_integ_pct;       // PI integrator state
+    float gate_gain_gps_per_pct;   // K̂  identified plant gain
     uint32_t refill_count;
 } filler_strategy_sample_telemetry_t;
 
