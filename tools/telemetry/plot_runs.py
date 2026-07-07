@@ -4,7 +4,9 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import shlex
 import shutil
+import sys
 import tempfile
 import textwrap
 from pathlib import Path
@@ -96,8 +98,8 @@ LINE_MODEL_RATE = "#9333ea"
 STATE_BAND_EDGE = "#94a3b8"
 STATE_BAND_KEYS = {"FILL", "DRIP_WAIT", "VERIFY_TARGET", "FAULT"}
 RATE_AXIS_LABEL = "Füllrate [g/s]"
-STATE_BAND_FIGURE_EXTRA_H = 0.32
-STATE_BAND_HEIGHT_RATIO = 0.44
+STATE_BAND_FIGURE_EXTRA_H = 0.52
+STATE_BAND_HEIGHT_RATIO = 0.66
 MAIN_PLOT_HEIGHT_RATIO = 3.8
 RATE_PLOT_HEIGHT_RATIO = 1.7
 RATE_PLOT_HEIGHT_RATIO_DENSE = 2.8
@@ -108,6 +110,7 @@ CONTROL_PLOT_HEIGHT_RATIO = 1.5
 CONTROL_FIGURE_EXTRA_H = 1.05
 DEBUG_FIGURE_EXTRA_H = 1.1
 EXPORT_PAD_INCHES = 0.06
+COMMAND_LOG_FILENAME = "plot_runs_last_command.txt"
 # Cascade control-loop panel signals.
 LINE_RATE_ERROR = "#e11d48"
 LINE_CONTROL_INTEG = "#0891b2"
@@ -951,6 +954,7 @@ def _draw_debug_metadata(
     fill_run: FillRun,
     base_weight_g: float | None,
     records: list[dict[str, Any]],
+    command_text: str | None,
 ) -> None:
     summary = _fill_summary_record(records, fill_run)
     first_adaptive_sample = _first_adaptive_sample(records, fill_run)
@@ -1066,9 +1070,34 @@ def _draw_debug_metadata(
     right_y = y_after_session
     left_y = _draw_meta_section(meta_ax, "Lauf", general_lines, x_label=0.0, x_value=0.26, y_start=left_y)
     left_y = _draw_meta_section(meta_ax, "Ergebnis", result_lines, x_label=0.0, x_value=0.26, y_start=left_y)
-    _draw_meta_section(meta_ax, "Preset-Parameter", preset_lines, x_label=0.0, x_value=0.26, y_start=left_y)
+    left_y = _draw_meta_section(meta_ax, "Preset-Parameter", preset_lines, x_label=0.0, x_value=0.26, y_start=left_y)
     right_y = _draw_meta_section(meta_ax, "Laufzeitwerte", runtime_lines, x_label=0.50, x_value=0.79, y_start=right_y)
-    _draw_meta_section(meta_ax, "Adaptionswerte", adaptive_next_lines, x_label=0.50, x_value=0.79, y_start=right_y)
+    right_y = _draw_meta_section(meta_ax, "Adaptionswerte", adaptive_next_lines, x_label=0.50, x_value=0.79, y_start=right_y)
+
+    if command_text:
+        command_title_y = min(left_y, right_y)
+        wrapped_command = "\n".join(textwrap.wrap(command_text, width=92)) or command_text
+        meta_ax.text(
+            0.0,
+            command_title_y,
+            "Plot command",
+            ha="left",
+            va="top",
+            fontsize=8.8,
+            color="#0f172a",
+            fontweight="bold",
+        )
+        meta_ax.text(
+            0.0,
+            command_title_y - 0.043,
+            wrapped_command,
+            ha="left",
+            va="top",
+            fontsize=6.0,
+            color="#334155",
+            family="monospace",
+            linespacing=1.08,
+        )
 
 
 def _create_figure_axes(
@@ -1401,6 +1430,19 @@ def _rate_panel_layout(strategy: str, show_rate: str, rate_layout: str) -> tuple
     return RATE_PLOT_HEIGHT_RATIO, 0.0
 
 
+def _scaled_rate_panel_layout(
+    strategy: str,
+    show_rate: str,
+    rate_layout: str,
+    rate_height_scale: float,
+) -> tuple[float, float]:
+    rate_ratio, extra_h = _rate_panel_layout(strategy, show_rate, rate_layout)
+    if show_rate == "none" or rate_layout != "subplot":
+        return rate_ratio, extra_h
+    scale = max(0.2, rate_height_scale)
+    return rate_ratio * scale, extra_h * scale
+
+
 def _save_figure(fig: Any, out_path: Path, fmt: str) -> None:
     # Final tight crop is more reliable than trying to predict every title/legend
     # combination up front with fixed subplot margins.
@@ -1412,6 +1454,16 @@ def _save_figure(fig: Any, out_path: Path, fmt: str) -> None:
         pad_inches=EXPORT_PAD_INCHES,
         facecolor="white",
     )
+
+
+def _command_text(argv: list[str]) -> str:
+    return shlex.join(argv)
+
+
+def _write_command_log(session_dir: Path, command_text: str) -> Path:
+    out_path = session_dir / COMMAND_LOG_FILENAME
+    out_path.write_text(command_text + "\n", encoding="utf-8")
+    return out_path
 
 
 def _render_fill_variant(
@@ -1429,6 +1481,10 @@ def _render_fill_variant(
     figure_profile: str,
     output_name: str,
     include_control_panel: bool,
+    show_target: bool,
+    mass_y_max: float | None,
+    rate_height_scale: float,
+    command_text: str | None,
 ) -> list[Path]:
     samples = _sample_events(records)
     if not samples:
@@ -1440,7 +1496,9 @@ def _render_fill_variant(
     x_samples, y_fill_mass, y_gate, rate_series, target_rate_series, control_series, base_weight_g = _series_from_samples(fill_run, samples)
     strategy = (fill_run.strategy_name or "").strip().lower()
     show_control_panel = include_control_panel and _has_cascade_control_series(strategy, control_series)
-    rate_plot_height_ratio, rate_figure_extra_h = _rate_panel_layout(strategy, show_rate, rate_layout)
+    rate_plot_height_ratio, rate_figure_extra_h = _scaled_rate_panel_layout(
+        strategy, show_rate, rate_layout, rate_height_scale
+    )
 
     _figure_style()
     fig, band_ax, ax, rate_ax, control_ax, meta_ax = _create_figure_axes(
@@ -1463,7 +1521,7 @@ def _render_fill_variant(
     if debug:
         _annotate_state_badges(ax, fill_run, states)
 
-    if fill_run.target_g is not None:
+    if show_target and fill_run.target_g is not None:
         tol_low = fill_run.params.get("VAR(target_tol_low_g)")
         tol_high = fill_run.params.get("VAR(target_tol_high_g)")
         if isinstance(tol_low, (int, float)) and isinstance(tol_high, (int, float)):
@@ -1511,6 +1569,8 @@ def _render_fill_variant(
     ax2.set_ylabel("Klappenstellung [%]")
     ax2.set_ylim(-2, 112)
     ax2.set_yticks([0, 20, 40, 60, 80, 100])
+    if mass_y_max is not None:
+        ax.set_ylim(0.0, mass_y_max)
     ax.grid(True, axis="both", color="#cbd5e1", linewidth=0.7, alpha=0.65)
     ax.set_axisbelow(True)
 
@@ -1612,7 +1672,7 @@ def _render_fill_variant(
             )
 
     if debug and meta_ax is not None:
-        _draw_debug_metadata(meta_ax, session_dir, fill_run, base_weight_g, records)
+        _draw_debug_metadata(meta_ax, session_dir, fill_run, base_weight_g, records, command_text)
 
     exported: list[Path] = []
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1634,6 +1694,7 @@ def _render_control_only_variant(
     *,
     figure_profile: str,
     output_name: str,
+    rate_height_scale: float,
 ) -> list[Path]:
     samples = _sample_events(records)
     if not samples:
@@ -1646,7 +1707,7 @@ def _render_control_only_variant(
 
     _figure_style()
     figure_width, figure_height_base = _figure_size(figure_profile)
-    fig, control_ax = plt.subplots(1, 1, figsize=(figure_width, max(2.45, figure_height_base * 0.64)))
+    fig, control_ax = plt.subplots(1, 1, figsize=(figure_width, max(2.45, figure_height_base * 0.64 * max(0.2, rate_height_scale))))
     handles, labels = _plot_control_panel(control_ax, x_samples, rate_series, control_series)
     if handles:
         control_ax.legend(handles=handles, labels=labels, frameon=False, loc="upper right", ncol=1, borderaxespad=0.2)
@@ -1676,6 +1737,10 @@ def _plot_fill(
     figure_profile: str,
     plain_both_profiles: bool,
     cascade_control_export: str,
+    show_target: bool,
+    mass_y_max: float | None,
+    rate_height_scale: float,
+    command_text: str | None,
 ) -> list[Path]:
     strategy = (fill_run.strategy_name or "").strip().lower()
     split_cascade_control = strategy == "flow-cascade" and cascade_control_export == "separate"
@@ -1693,6 +1758,10 @@ def _plot_fill(
         figure_profile=figure_profile,
         output_name="debug",
         include_control_panel=True,
+        show_target=show_target,
+        mass_y_max=mass_y_max,
+        rate_height_scale=rate_height_scale,
+        command_text=command_text,
     )
     plain_profiles = ["default", "narrow"] if plain_both_profiles else [figure_profile]
     for plain_profile in plain_profiles:
@@ -1714,6 +1783,10 @@ def _plot_fill(
                 figure_profile=plain_profile,
                 output_name=output_name,
                 include_control_panel=not split_cascade_control,
+                show_target=show_target,
+                mass_y_max=mass_y_max,
+                rate_height_scale=rate_height_scale,
+                command_text=command_text,
             )
         )
         if split_cascade_control:
@@ -1729,6 +1802,7 @@ def _plot_fill(
                     formats,
                     figure_profile=plain_profile,
                     output_name=control_output_name,
+                    rate_height_scale=rate_height_scale,
                 )
             )
     return exported
@@ -2169,6 +2243,22 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--hide-target",
+        action="store_true",
+        help="Disable target-mass line and tolerance band overlays",
+    )
+    parser.add_argument(
+        "--mass-y-max",
+        type=float,
+        help="Force the fill-mass axis upper limit, for example 200",
+    )
+    parser.add_argument(
+        "--rate-height-scale",
+        type=float,
+        default=1.0,
+        help="Multiply the dedicated rate subplot height, for example 1.5",
+    )
+    parser.add_argument(
         "--plain-both-profiles",
         action="store_true",
         help="Export the plain chart in both wide and narrow variants with suffixed filenames; debug is exported once",
@@ -2196,6 +2286,10 @@ def main() -> int:
     )
     parser.set_defaults(clear_output=True, session_summary=True)
     args = parser.parse_args()
+    if args.rate_height_scale <= 0:
+        raise SystemExit("--rate-height-scale must be > 0")
+    if args.mass_y_max is not None and args.mass_y_max <= 0:
+        raise SystemExit("--mass-y-max must be > 0")
 
     session_dir, fill_runs, fill_records = _load_input(
         args.input_path,
@@ -2222,6 +2316,8 @@ def main() -> int:
     if args.clear_output and output_dir.exists():
         shutil.rmtree(output_dir)
         cleared_output = True
+    command_text = _command_text([sys.executable, *sys.argv]) if sys.argv else _command_text([sys.executable])
+    command_log_path = _write_command_log(session_dir, command_text)
     exported: list[Path] = []
     for fill_run in selected_fills:
         exported.extend(
@@ -2238,6 +2334,10 @@ def main() -> int:
                 figure_profile=args.figure_profile,
                 plain_both_profiles=args.plain_both_profiles,
                 cascade_control_export=args.cascade_control_export,
+                show_target=not args.hide_target,
+                mass_y_max=args.mass_y_max,
+                rate_height_scale=args.rate_height_scale,
+                command_text=command_text,
             )
         )
     session_summary_exported: list[Path] = []
@@ -2257,6 +2357,7 @@ def main() -> int:
     print(f"Output:   {output_dir}")
     print(f"Cleared:  {'yes' if cleared_output else 'no'}")
     print(f"Formats:  {', '.join(formats)}")
+    print(f"Command:  {command_log_path}")
     print(f"Plotted:  {len(selected_fills)} fill runs")
     print("Variants: debug, plain")
     print(f"Legend:   {args.legend_placement}")
