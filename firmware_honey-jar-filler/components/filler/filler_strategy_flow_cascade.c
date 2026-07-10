@@ -102,21 +102,29 @@
 #define CASC_HOLDOFF_MAX_MS 2500.0f
 
 // Outer deceleration profile: full fast rate while far from target, then a
-// linear taper down to the slow rate as the (in-flight-compensated) remaining
-// mass shrinks into the deceleration band.
+// linear taper down to a low terminal rate as the (in-flight-compensated)
+// remaining mass shrinks into the deceleration band. The terminal rate is a
+// fixed fraction of the fast rate (see profile_target_rate_gps) rather than the
+// learned slow rate, which collapses toward the fast rate when a continuous
+// profile never produces a distinct slow phase.
 #define CASC_DECEL_BAND_MIN_G 20.0f
 #define CASC_DECEL_BAND_MULT 1.6f
 #define CASC_RATE_MIN_FLOOR_GPS 3.0f
+#define CASC_TERMINAL_RATE_FRAC 0.25f
 
-// Plant-gain (K̂ = rate per % gate) plausibility bounds for the feedforward and
-// Smith model.
+// Affine plant model  rate = K*gate + b.  K [g/s per %] bounds, offset b [g/s]
+// bounds (negative for the flow-onset threshold), and the minimum gate
+// separation between the two operating points needed to trust a fresh slope.
 #define CASC_GATE_GAIN_MIN 0.02f
 #define CASC_GATE_GAIN_MAX 3.00f
-// Live plant-gain identification: only sample K̂ once the gate has been held
+#define CASC_GAIN_B_MIN -60.0f
+#define CASC_GAIN_B_MAX 15.0f
+#define CASC_GAIN_MIN_GATE_SEP_PCT 8.0f
+// Live plant-gain identification: only sample once the gate has been held
 // longer than the dead time (plus a settle margin), so the measured rate
 // reflects the current gate rather than the one commanded a dead time ago.
 #define CASC_GAIN_SETTLE_MARGIN_S 0.5f
-#define CASC_GAIN_LIVE_ALPHA 0.10f
+#define CASC_GAIN_LIVE_ALPHA 0.15f
 
 // Smith predictor model.
 #define CASC_MODEL_TAU_S 0.60f
@@ -135,7 +143,8 @@ typedef struct {
     float post_close_gain_g;
     float fast_rate_gps;
     float slow_rate_gps;
-    float gate_gain_gps_per_pct;   // K̂ for feedforward + Smith model
+    float gate_gain_gps_per_pct;   // affine slope K [g/s per %]
+    float gain_b;                  // affine offset b [g/s] (flow onset, usually <0)
     float finish_trim_g;
     float drip_wait_ms;
 } cascade_learned_entry_t;
@@ -270,13 +279,23 @@ static void cascade_defaults_from_params(cascade_learned_entry_t *entry, const a
     float poll_s = ((float)CONFIG_HX711_POLL_INTERVAL_MS / 1000.0f) * 2.5f;
     entry->initialized = 1u;
     entry->dead_time_s = clampf_local(poll_s, 0.25f, 1.20f);
-    entry->post_close_gain_g = clampf_local((float)params->close_remaining_g * 0.55f, 1.0f, 120.0f);
+    // Seed the post-close residual for a HIGH-rate close (the cascade does not
+    // slow to a trickle before closing on the first jar). close_remaining_g is a
+    // slowed-close heuristic value and far too small here, so also floor the
+    // seed at a small fraction of the target; the first successful fill then
+    // replaces it with the measured value (warmup).
+    entry->post_close_gain_g = clampf_local(
+        fmaxf((float)params->close_remaining_g * 0.55f, (float)params->target_grams * 0.025f),
+        1.0f, 120.0f);
     entry->fast_rate_gps = fallback_fast_rate_gps(params);
     entry->slow_rate_gps = fallback_slow_rate_gps(params);
-    // Seed K̂ from the fast rate reached near the preset's max gate opening.
+    // Seed the affine model: slope K from the fast rate near the preset's max
+    // gate, offset b=0 (through origin). The first fills learn the real offset
+    // (flow onset) and refine the slope.
     float max_gate = clampf_local((float)params->max_gate_pct, 5.0f, 100.0f);
     entry->gate_gain_gps_per_pct = clampf_local(entry->fast_rate_gps / max_gate,
                                                 CASC_GATE_GAIN_MIN, CASC_GATE_GAIN_MAX);
+    entry->gain_b = 0.0f;
     entry->finish_trim_g = 0.0f;
     entry->drip_wait_ms = clampf_local((float)params->drip_delay_ms, DRIP_WAIT_MIN_MS, DRIP_WAIT_MAX_MS);
 }
@@ -323,10 +342,43 @@ static float response_threshold_g(const filler_strategy_tick_t *tick)
 
 static bool plausible_positive(float v, float lo, float hi) { return v >= lo && v <= hi; }
 
+// Affine plant model  rate = K*gate + b  (floored at 0 = no reverse flow).
+static float rate_of_gate(float k, float b, float gate)
+{
+    float r = k * clampf_local(gate, 0.0f, 100.0f) + b;
+    return (r > 0.0f) ? r : 0.0f;
+}
+
+// Inverse: gate opening needed for a target rate,  gate = (rate - b) / K.
+static float gate_of_rate(float k, float b, float target_rate)
+{
+    if (k < CASC_GATE_GAIN_MIN) k = CASC_GATE_GAIN_MIN;
+    return clampf_local((target_rate - b) / k, 0.0f, 100.0f);
+}
+
+// Refit the affine model from the two learned operating points (high/low gate).
+// Needs enough gate separation to trust a fresh slope; otherwise keep the slope
+// and just re-center the offset on the (still updating) high-gate point.
+static void cascade_refit_gain(filler_strategy_runtime_t *rt)
+{
+    if (!rt) return;
+    float da = rt->gain_hi_gate_pct - rt->gain_lo_gate_pct;
+    if (da >= CASC_GAIN_MIN_GATE_SEP_PCT) {
+        float k = (rt->gain_hi_rate_gps - rt->gain_lo_rate_gps) / da;
+        k = clampf_local(k, CASC_GATE_GAIN_MIN, CASC_GATE_GAIN_MAX);
+        rt->learned_gate_gain_gps_per_pct = k;
+        rt->learned_gain_b = clampf_local(rt->gain_hi_rate_gps - k * rt->gain_hi_gate_pct,
+                                          CASC_GAIN_B_MIN, CASC_GAIN_B_MAX);
+    } else {
+        float k = rt->learned_gate_gain_gps_per_pct;
+        rt->learned_gain_b = clampf_local(rt->gain_hi_rate_gps - k * rt->gain_hi_gate_pct,
+                                          CASC_GAIN_B_MIN, CASC_GAIN_B_MAX);
+    }
+}
+
 static bool model_is_usable(const filler_strategy_runtime_t *rt)
 {
-    // Only trust the Smith prediction once the plant gain is plausibly known;
-    // otherwise the controller falls back to the raw measured rate.
+    // Trust the Smith prediction once the plant slope is plausibly known.
     return rt && rt->learned_gate_gain_gps_per_pct >= CASC_GATE_GAIN_MIN &&
            rt->learned_gate_gain_gps_per_pct <= CASC_GATE_GAIN_MAX &&
            rt->learned_fast_rate_gps > 1.0f;
@@ -337,9 +389,8 @@ static bool model_is_usable(const filler_strategy_runtime_t *rt)
 static void cascade_update_model(filler_strategy_runtime_t *rt, float dt_s)
 {
     if (!rt || dt_s <= 0.0f) return;
-    float k = rt->learned_gate_gain_gps_per_pct;
-    if (k < CASC_GATE_GAIN_MIN) k = CASC_GATE_GAIN_MIN;
-    float ss = k * rt->control_gate_cmd_pct;                 // steady-state model rate
+    // Steady-state model rate from the learned affine model  rate = K*gate + b.
+    float ss = rate_of_gate(rt->learned_gate_gain_gps_per_pct, rt->learned_gain_b, rt->control_gate_cmd_pct);
     float a = clampf_local(dt_s / CASC_MODEL_TAU_S, 0.0f, 1.0f);
     s_model_rate_gps += a * (ss - s_model_rate_gps);
 
@@ -405,12 +456,21 @@ static void update_rate_estimates(filler_strategy_runtime_t *rt, const filler_st
                 ? (float)(tick->latest->ts_us - rt->control_last_update_us) / 1000000.0f : 0.0f;
             if (rt->filtered_rate_gps > 1.0f && rt->control_gate_cmd_pct > 5.0f &&
                 gate_stable_s > (rt->learned_dead_time_s + CASC_GAIN_SETTLE_MARGIN_S)) {
-                float k = rt->filtered_rate_gps / rt->control_gate_cmd_pct;
-                if (k >= CASC_GATE_GAIN_MIN && k <= CASC_GATE_GAIN_MAX) {
-                    rt->learned_gate_gain_gps_per_pct =
-                        ewma(rt->learned_gate_gain_gps_per_pct, k, CASC_GAIN_LIVE_ALPHA);
-                    if (rt->gate_gain_count < 65535) rt->gate_gain_count++;
+                // Feed this steady-state (gate, rate) sample into the high- or
+                // low-gate operating point (the fast phase runs at a higher gate,
+                // the slow/terminal phase at a lower one), then refit the affine
+                // model K,b from the two points. This continuously tracks the
+                // plant (incl. the offset / flow onset) as it drifts, without
+                // needing a full gate sweep.
+                if (runtime_phase(rt) != CASC_PHASE_SLOW) {
+                    rt->gain_hi_gate_pct = ewma(rt->gain_hi_gate_pct, rt->control_gate_cmd_pct, CASC_GAIN_LIVE_ALPHA);
+                    rt->gain_hi_rate_gps = ewma(rt->gain_hi_rate_gps, rt->filtered_rate_gps, CASC_GAIN_LIVE_ALPHA);
+                } else {
+                    rt->gain_lo_gate_pct = ewma(rt->gain_lo_gate_pct, rt->control_gate_cmd_pct, CASC_GAIN_LIVE_ALPHA);
+                    rt->gain_lo_rate_gps = ewma(rt->gain_lo_rate_gps, rt->filtered_rate_gps, CASC_GAIN_LIVE_ALPHA);
                 }
+                cascade_refit_gain(rt);
+                if (rt->gate_gain_count < 65535) rt->gate_gain_count++;
             }
 
             if (!rt->first_close_seen) cascade_update_model(rt, dt_s);
@@ -488,9 +548,12 @@ static float profile_target_rate_gps(const filler_strategy_runtime_t *rt, const 
                                      float remaining_g)
 {
     float fast = (rt->learned_fast_rate_gps > 1.0f) ? rt->learned_fast_rate_gps : fallback_fast_rate_gps(tick->params);
-    float slow = (rt->learned_slow_rate_gps > 0.5f) ? rt->learned_slow_rate_gps : fallback_slow_rate_gps(tick->params);
-    if (slow < CASC_RATE_MIN_FLOOR_GPS) slow = CASC_RATE_MIN_FLOOR_GPS;
-    if (fast < slow) fast = slow;
+    // Terminal (approach) rate: a genuine slow phase for a controllable close,
+    // as a fixed fraction of the fast rate. Using the learned slow rate here
+    // does not work with a continuous profile - without a distinct slow phase
+    // it collapses toward the fast rate, flattening the taper and leaving the
+    // rate high at closing (large, variable in-flight mass -> overfill).
+    float terminal = clampf_local(fast * CASC_TERMINAL_RATE_FRAC, CASC_RATE_MIN_FLOOR_GPS, fast);
 
     // Compensate for the mass still in flight so the taper is referenced to the
     // mass that will actually still be controllable.
@@ -501,7 +564,7 @@ static float profile_target_rate_gps(const filler_strategy_runtime_t *rt, const 
     float band = fmaxf(CASC_DECEL_BAND_MIN_G, rt->learned_post_close_gain_g * CASC_DECEL_BAND_MULT +
                                               rt->learned_dead_time_s * fast);
     float frac = clampf_local(eff_remaining / band, 0.0f, 1.0f);
-    return slow + (fast - slow) * frac;
+    return terminal + (fast - terminal) * frac;
 }
 
 static void update_control_targets(filler_strategy_runtime_t *rt, const filler_strategy_tick_t *tick, float remaining_g)
@@ -537,8 +600,9 @@ static void cascade_run_controller(filler_strategy_runtime_t *rt, const filler_s
     // Confidence-based ceiling (preset max_gate_pct until the preset has
     // proven itself, then relaxing toward machine max -- see gate_ceiling_for_entry).
     float gate_cap = clampf_local(rt->gate_ceiling_pct, 5.0f, 100.0f);
-    float k = clampf_local(rt->learned_gate_gain_gps_per_pct, CASC_GATE_GAIN_MIN, CASC_GATE_GAIN_MAX);
-    float gate_ff = rt->control_target_rate_gps / k;              // feedforward operating point
+    // Feedforward gate: invert the learned affine model,  gate = (ṁ* - b)/K.
+    float gate_ff = gate_of_rate(rt->learned_gate_gain_gps_per_pct, rt->learned_gain_b,
+                                 rt->control_target_rate_gps);
     s_integ_pct = clampf_local(s_integ_pct + CASC_KI_PCT_PER_GPS_S * error * holdoff_s,
                                -CASC_INTEG_LIMIT_PCT, CASC_INTEG_LIMIT_PCT);
     float raw_gate = gate_ff + CASC_KP_PCT_PER_GPS * error + s_integ_pct;
@@ -561,13 +625,24 @@ static void cascade_run_controller(filler_strategy_runtime_t *rt, const filler_s
 static void update_thresholds(filler_strategy_runtime_t *rt, const filler_strategy_tick_t *tick)
 {
     if (!rt || !tick || !tick->params) return;
-    float close_rate = (rt->near_close_logged && rt->filtered_rate_gps > 0.5f)
-        ? rt->filtered_rate_gps
-        : ((rt->learned_slow_rate_gps > 0.5f) ? rt->learned_slow_rate_gps : fallback_slow_rate_gps(tick->params));
-    float close_dead_mass = rt->learned_dead_time_s * close_rate;
-    rt->predicted_remaining_g = rt->learned_post_close_gain_g + close_dead_mass;
+    // The learned post-close gain already captures ALL mass that arrives after
+    // the close command (in-flight during the closing dead time + drip), so it
+    // IS the remaining mass to leave at closing. The previous version added
+    // dead_time*rate on top, double-counting the in-flight portion. Combined
+    // with the close_max cap below (tied to the small heuristic-era
+    // close_remaining_g), the threshold was clamped to a few grams while a
+    // high-rate fill actually needed to close tens of grams early -> the
+    // persistent overfill seen in the data.
+    rt->predicted_remaining_g = rt->learned_post_close_gain_g;
 
-    float close_max = fmaxf((float)tick->params->close_remaining_g * 1.8f, 10.0f);
+    // Bound the close threshold generously: the cascade may close from a higher
+    // rate than the slowed heuristics, so the true residual can be large. Do not
+    // cap it at close_remaining_g (meant for a slowed close); allow up to the
+    // learned residual with headroom, but never more than a sane fraction of the
+    // target.
+    float close_max = fmaxf(fmaxf((float)tick->params->close_remaining_g * 1.8f, 10.0f),
+                            rt->learned_post_close_gain_g * 1.5f + 15.0f);
+    close_max = fminf(close_max, (float)tick->params->target_grams * 0.6f);
     float close_candidate = rt->predicted_remaining_g + CLOSE_BUFFER_G -
                             rt->close_early_relax_g - rt->learned_finish_trim_g;
     rt->adapted_close_early_g = clampf_local(close_candidate, 2.0f, close_max);
@@ -644,10 +719,17 @@ static void publish_summary_and_learn(filler_strategy_runtime_t *rt, const fille
         entry->post_close_gain_g = learn_ewma(entry->post_close_gain_g, rt->measured_post_close_gain_g, LEARN_ALPHA_POST_CLOSE, obs);
         entry->fast_rate_gps = learn_ewma(entry->fast_rate_gps, fast_avg, LEARN_ALPHA_RATE, obs);
         if (slow_avg > 0.0f) entry->slow_rate_gps = learn_ewma(entry->slow_rate_gps, slow_avg, LEARN_ALPHA_RATE, obs);
-        // Persist the live-refined (steady-state) plant gain, not a noisy mean.
-        if (rt->gate_gain_count > 0) entry->gate_gain_gps_per_pct = clampf_local(
-            learn_ewma(entry->gate_gain_gps_per_pct, rt->learned_gate_gain_gps_per_pct, LEARN_ALPHA_GATE_GAIN, obs),
-            CASC_GATE_GAIN_MIN, CASC_GATE_GAIN_MAX);
+        // Persist the live-refined affine model (slope K + offset b) that the
+        // in-fill two-point fit converged to this run.
+        if (rt->gate_gain_count > 0) {
+            entry->gate_gain_gps_per_pct = learn_ewma(entry->gate_gain_gps_per_pct,
+                                                      rt->learned_gate_gain_gps_per_pct,
+                                                      LEARN_ALPHA_GATE_GAIN, obs);
+            entry->gate_gain_gps_per_pct = clampf_local(entry->gate_gain_gps_per_pct,
+                                                        CASC_GATE_GAIN_MIN, CASC_GATE_GAIN_MAX);
+            entry->gain_b = learn_ewma(entry->gain_b, rt->learned_gain_b, LEARN_ALPHA_GATE_GAIN, obs);
+            entry->gain_b = clampf_local(entry->gain_b, CASC_GAIN_B_MIN, CASC_GAIN_B_MAX);
+        }
         // finish_trim is signed: plain EWMA (no warmup, no prev<=0 shortcut).
         // A miss gets a much larger corrective alpha than steady-state tuning.
         float trim_sample = clampf_local(-fill_error_g, FINISH_TRIM_MIN_G, FINISH_TRIM_MAX_G);
@@ -726,15 +808,24 @@ static void cascade_on_enter(filler_strategy_runtime_t *rt, filler_state_t state
             rt->learned_fast_rate_gps = entry->fast_rate_gps;
             rt->learned_slow_rate_gps = entry->slow_rate_gps;
             rt->learned_gate_gain_gps_per_pct = entry->gate_gain_gps_per_pct;
+            rt->learned_gain_b = entry->gain_b;
+            // Seed the two live operating points from the persisted affine model
+            // so the in-fill refit starts consistent and only nudges from here.
+            rt->gain_hi_gate_pct = 60.0f;
+            rt->gain_hi_rate_gps = rate_of_gate(entry->gate_gain_gps_per_pct, entry->gain_b, 60.0f);
+            rt->gain_lo_gate_pct = 30.0f;
+            rt->gain_lo_rate_gps = rate_of_gate(entry->gate_gain_gps_per_pct, entry->gain_b, 30.0f);
             rt->learned_finish_trim_g = entry->finish_trim_g;
             if (!env->jar_tare_get || !env->jar_tare_get(&rt->run_base_weight_g)) {
                 rt->run_base_weight_g = tick->latest ? tick->latest->grams : 0.0f;
             }
             rt->adapted_drip_wait_ms = entry->drip_wait_ms;
             rt->gate_ceiling_pct = gate_ceiling_for_entry(entry, tick->params);
-            // Start at the feedforward gate for the initial fast setpoint.
-            float k = clampf_local(entry->gate_gain_gps_per_pct, CASC_GATE_GAIN_MIN, CASC_GATE_GAIN_MAX);
-            rt->control_gate_cmd_pct = clampf_local(entry->fast_rate_gps / k, 0.0f, rt->gate_ceiling_pct);
+            // Start at the feedforward gate for the initial fast setpoint
+            // (invert the learned affine model).
+            rt->control_gate_cmd_pct = clampf_local(
+                gate_of_rate(rt->learned_gate_gain_gps_per_pct, rt->learned_gain_b, entry->fast_rate_gps),
+                0.0f, rt->gate_ceiling_pct);
             log_learned_entry("starting cascade fill with", tick->preset_index, entry);
             ESP_LOGI(TAG, "gate ceiling=%.1f%% (preset max=%u%%, successful_fills=%lu)",
                      (double)rt->gate_ceiling_pct, (unsigned)tick->params->max_gate_pct,

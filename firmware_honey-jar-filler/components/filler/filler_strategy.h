@@ -65,7 +65,16 @@ typedef struct {
     float learned_post_close_gain_g;
     float learned_fast_rate_gps;
     float learned_slow_rate_gps;
-    float learned_gate_gain_gps_per_pct;
+    // Cascade affine plant model  rate = K*gate + b  (learned_gate_gain = slope
+    // K [g/s per %], learned_gain_b = offset [g/s], typically <0 for the flow
+    // onset). K,b are fit continuously from two EWMA operating points
+    // (high/low gate) that the deceleration profile provides.
+    float learned_gate_gain_gps_per_pct;   // slope K
+    float learned_gain_b;                  // offset b
+    float gain_hi_gate_pct;                // EWMA high-gate operating point (gate, rate)
+    float gain_hi_rate_gps;
+    float gain_lo_gate_pct;                // EWMA low-gate operating point (gate, rate)
+    float gain_lo_rate_gps;
     float learned_finish_trim_g;
     float learned_fast_start_gate_pct;
     float learned_slow_start_gate_pct;
