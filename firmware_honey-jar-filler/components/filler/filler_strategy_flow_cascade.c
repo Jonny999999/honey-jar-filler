@@ -103,7 +103,10 @@
 // more it closes" without letting it lunge open by the same amount.
 #define CASC_STEP_MAX_DOWN_PCT 15.0f
 #define CASC_INTEG_LIMIT_PCT 35.0f
-#define CASC_DEADBAND_GPS 0.6f
+// A dripping medium cannot be regulated to fractions of a g/s; a tight deadband
+// just makes the loop twitch on drip-to-drip residue. Hold the gate unless the
+// averaged rate error is clearly outside this band.
+#define CASC_DEADBAND_GPS 1.5f
 #define CASC_HOLDOFF_MIN_MS 300.0f
 #define CASC_HOLDOFF_MAX_MS 2500.0f
 
@@ -159,6 +162,21 @@
 #define CASC_GAIN_DWELL_TOL_PCT 1.0f
 #define CASC_GAIN_MIN_WINDOW_S 1.5f
 
+// Flow-onset gate ("dead angle"): the gate % that must be opened before the
+// gaskets clear and ANY flow starts. It is a mechanical near-constant of the
+// valve (viscosity changes the slope K, not where flow begins), so learn it
+// slowly from steady flowing points (onset = gate - rate/K) and anchor the
+// affine offset to it: b = -K*onset. The controller then never commands below
+// onset + margin while it still needs flow, so a transient over-reaction cannot
+// dip the gate into the no-flow region and stall the loop.
+#define CASC_ONSET_SEED_PCT 10.0f
+#define CASC_ONSET_MIN_PCT 2.0f
+#define CASC_ONSET_MAX_PCT 40.0f
+#define CASC_ONSET_MARGIN_PCT 2.0f
+#define CASC_ONSET_LIVE_ALPHA 0.10f
+#define LEARN_ALPHA_ONSET 0.30f
+#define CASC_FLOW_EPS_GPS 1.0f
+
 // Smith predictor model.
 #define CASC_MODEL_TAU_S 0.60f
 #define SMITH_DELAY_MAX 256
@@ -178,6 +196,7 @@ typedef struct {
     float slow_rate_gps;
     float gate_gain_gps_per_pct;   // affine slope K [g/s per %]
     float gain_b;                  // affine offset b [g/s] (flow onset, usually <0)
+    float onset_gate_pct;          // flow-onset gate ("dead angle"); b = -K*onset
     float finish_trim_g;
     float drip_wait_ms;
 } cascade_learned_entry_t;
@@ -237,6 +256,8 @@ static void clear_live_rate_estimates(filler_strategy_runtime_t *rt)
     rt->no_flow_count = 0;
 }
 
+static void ctrl_rate_reset(void);   // defined below (drip-averaged control rate)
+
 static void cascade_model_reset(void)
 {
     s_model_rate_gps = 0.0f;
@@ -250,6 +271,7 @@ static void cascade_model_reset(void)
     s_gain_anchor_us = 0;
     s_gain_anchor_rel_g = 0.0f;
     s_gain_anchor_valid = false;
+    ctrl_rate_reset();
 }
 
 static bool stable_above(float value, float threshold, uint8_t *count, uint8_t required)
@@ -346,12 +368,14 @@ static void cascade_defaults_from_params(cascade_learned_entry_t *entry, const a
     entry->fast_rate_gps = fallback_fast_rate_gps(params);
     entry->slow_rate_gps = fallback_slow_rate_gps(params);
     // Seed the affine model: slope K from the fast rate near the preset's max
-    // gate, offset b=0 (through origin). The first fills learn the real offset
-    // (flow onset) and refine the slope.
+    // gate, and anchor the offset to a nominal flow-onset gate ("dead angle"):
+    // b = -K*onset. The first fills learn the real onset and refine the slope.
     float max_gate = clampf_local((float)params->max_gate_pct, 5.0f, 100.0f);
     entry->gate_gain_gps_per_pct = clampf_local(entry->fast_rate_gps / max_gate,
                                                 CASC_GATE_GAIN_MIN, CASC_GATE_GAIN_MAX);
-    entry->gain_b = 0.0f;
+    entry->onset_gate_pct = CASC_ONSET_SEED_PCT;
+    entry->gain_b = clampf_local(-entry->gate_gain_gps_per_pct * entry->onset_gate_pct,
+                                 CASC_GAIN_B_MIN, CASC_GAIN_B_MAX);
     entry->finish_trim_g = 0.0f;
     entry->drip_wait_ms = clampf_local((float)params->drip_delay_ms, DRIP_WAIT_MIN_MS, DRIP_WAIT_MAX_MS);
 }
@@ -470,36 +494,46 @@ static void cascade_update_model(filler_strategy_runtime_t *rt, float dt_s)
     }
 }
 
-// Least-squares slope of rel_g over the recent sample window. A far smoother
-// flow-rate estimate than the per-sample difference, whose ±sample noise on a
-// splashing thin medium (weight jumps 0,+21,0,+15,...) is what makes the inner
-// loop oscillate. The safe-rate limiter keeps the fast EWMA rate for spike
-// detection; only the control feedback uses this smoothed rate.
-#define CASC_CTRL_RATE_WINDOW 5
-static void push_rate_hist(filler_strategy_runtime_t *rt, int64_t ts_us, float rel_g)
+// Control-feedback rate: least-squares slope of rel_g over a window as long as
+// the drip period. A sticky medium releases in bursts (~1 s apart) even at a
+// steady, well-open gate, so a short window still swings 0<->20 g/s and the
+// loop chases each burst (opens in the gap, slams shut on the burst). Averaging
+// over ~1.5 s makes the controller see the smooth mean flow and hold the gate
+// steady. The safe-rate limiter keeps the fast EWMA rate for spike detection;
+// only the control feedback uses this. File-scope ring (one fill at a time).
+#define CASC_CTRL_RATE_WINDOW 15          // ~1.5 s at 100 ms sampling
+#define CASC_CTRL_RATE_MIN_SPAN_S 0.5f
+static int64_t s_ctrl_ts[CASC_CTRL_RATE_WINDOW];
+static float   s_ctrl_rel[CASC_CTRL_RATE_WINDOW];
+static uint8_t s_ctrl_count;
+
+static void ctrl_rate_reset(void) { s_ctrl_count = 0; }
+
+static void ctrl_rate_push(int64_t ts_us, float rel_g)
 {
-    int n = rt->rate_hist_count;
-    if (n >= CASC_CTRL_RATE_WINDOW) {
+    if (s_ctrl_count >= CASC_CTRL_RATE_WINDOW) {
         for (int i = 1; i < CASC_CTRL_RATE_WINDOW; i++) {
-            rt->rate_hist_ts_us[i - 1] = rt->rate_hist_ts_us[i];
-            rt->rate_hist_rel_g[i - 1] = rt->rate_hist_rel_g[i];
+            s_ctrl_ts[i - 1] = s_ctrl_ts[i];
+            s_ctrl_rel[i - 1] = s_ctrl_rel[i];
         }
-        n = CASC_CTRL_RATE_WINDOW - 1;
+        s_ctrl_count = CASC_CTRL_RATE_WINDOW - 1;
     }
-    rt->rate_hist_ts_us[n] = ts_us;
-    rt->rate_hist_rel_g[n] = rel_g;
-    rt->rate_hist_count = (uint8_t)(n + 1);
+    s_ctrl_ts[s_ctrl_count] = ts_us;
+    s_ctrl_rel[s_ctrl_count] = rel_g;
+    s_ctrl_count++;
 }
 
-static float windowed_rate_gps(const filler_strategy_runtime_t *rt)
+static float ctrl_rate_gps(void)
 {
-    int n = rt->rate_hist_count;
+    int n = s_ctrl_count;
     if (n < 2) return 0.0f;
-    double t0 = (double)rt->rate_hist_ts_us[0];
+    double span = ((double)s_ctrl_ts[n - 1] - (double)s_ctrl_ts[0]) / 1e6;
+    if (span < CASC_CTRL_RATE_MIN_SPAN_S) return 0.0f;
+    double t0 = (double)s_ctrl_ts[0];
     double sx = 0, sy = 0, sxx = 0, sxy = 0;
     for (int i = 0; i < n; i++) {
-        double x = ((double)rt->rate_hist_ts_us[i] - t0) / 1e6;
-        double y = (double)rt->rate_hist_rel_g[i];
+        double x = ((double)s_ctrl_ts[i] - t0) / 1e6;
+        double y = (double)s_ctrl_rel[i];
         sx += x; sy += y; sxx += x * x; sxy += x * y;
     }
     double denom = (double)n * sxx - sx * sx;
@@ -589,10 +623,28 @@ static void update_rate_estimates(filler_strategy_runtime_t *rt, const filler_st
                         if (rt->learned_gate_gain_gps_per_pct < secant) {
                             rt->learned_gate_gain_gps_per_pct =
                                 clampf_local(secant, CASC_GATE_GAIN_MIN, CASC_GATE_GAIN_MAX);
-                            rt->learned_gain_b = clampf_local(
-                                rt->gain_hi_rate_gps - rt->learned_gate_gain_gps_per_pct * rt->gain_hi_gate_pct,
-                                CASC_GAIN_B_MIN, CASC_GAIN_B_MAX);
                         }
+                        // Learn the flow-onset gate ("dead angle") from this
+                        // flowing point: onset = gate - rate/K. Slow EWMA (it is a
+                        // near-constant), then anchor the affine offset to it so b
+                        // stays physical instead of swinging with the two-point
+                        // fit. A no-flow steady point (rate~0) at a gate below the
+                        // current onset nudges the onset up to at least that gate.
+                        float k_now = rt->learned_gate_gain_gps_per_pct;
+                        if (rate_ss > CASC_FLOW_EPS_GPS && k_now > CASC_GATE_GAIN_MIN) {
+                            float onset_est = clampf_local(gate - rate_ss / k_now,
+                                                           CASC_ONSET_MIN_PCT, CASC_ONSET_MAX_PCT);
+                            rt->learned_flow_onset_gate_pct =
+                                ewma(rt->learned_flow_onset_gate_pct, onset_est, CASC_ONSET_LIVE_ALPHA);
+                        } else if (rate_ss <= CASC_FLOW_EPS_GPS && gate > rt->learned_flow_onset_gate_pct) {
+                            rt->learned_flow_onset_gate_pct =
+                                ewma(rt->learned_flow_onset_gate_pct, gate, CASC_ONSET_LIVE_ALPHA);
+                        }
+                        rt->learned_flow_onset_gate_pct = clampf_local(rt->learned_flow_onset_gate_pct,
+                                                                       CASC_ONSET_MIN_PCT, CASC_ONSET_MAX_PCT);
+                        rt->learned_gain_b = clampf_local(
+                            -rt->learned_gate_gain_gps_per_pct * rt->learned_flow_onset_gate_pct,
+                            CASC_GAIN_B_MIN, CASC_GAIN_B_MAX);
                         if (rt->gate_gain_count < 65535) rt->gate_gain_count++;
                     }
                 }
@@ -610,9 +662,9 @@ static void update_rate_estimates(filler_strategy_runtime_t *rt, const filler_st
         ESP_LOGI(TAG, "detected dead time: %.3f s", (double)rt->measured_dead_time_s);
     }
 
-    // Windowed (smoothed) flow rate for the control feedback.
-    push_rate_hist(rt, tick->latest->ts_us, rel_g);
-    rt->control_rate_gps = windowed_rate_gps(rt);
+    // Drip-averaged flow rate for the control feedback.
+    ctrl_rate_push(tick->latest->ts_us, rel_g);
+    rt->control_rate_gps = ctrl_rate_gps();
 
     rt->last_rel_g = rel_g;
     rt->last_rate_ts_us = tick->latest->ts_us;
@@ -750,6 +802,18 @@ static void cascade_run_controller(filler_strategy_runtime_t *rt, const filler_s
     float step = clampf_local(next_gate - rt->control_gate_cmd_pct, -CASC_STEP_MAX_DOWN_PCT, CASC_STEP_MAX_PCT);
     next_gate = clampf_local(rt->control_gate_cmd_pct + step, 0.0f, gate_cap);
 
+    // Minimum-flow floor: while the controller still needs flow (it always does
+    // -- the full close is a separate FSM step), never command below the learned
+    // flow-onset gate + margin. A transient over-reaction otherwise dips the gate
+    // into the no-flow region, the flow stalls, error grows, and the loop lurches
+    // back open -- the stall/burst limit cycle. Never floor above the feedforward
+    // point, so this only clips downward overshoot, never forces extra flow.
+    float gate_min_flow = fminf(rt->learned_flow_onset_gate_pct + CASC_ONSET_MARGIN_PCT, gate_ff);
+    if (next_gate < gate_min_flow) {
+        next_gate = gate_min_flow;
+        if (s_integ_pct < 0.0f) s_integ_pct = 0.0f;   // don't wind negative against the floor
+    }
+
     if (fabsf(next_gate - rt->control_gate_cmd_pct) < 0.05f) return;
     ESP_LOGD(TAG, "ctrl phase=%s mstar=%.1f err=%.1f gate %.1f->%.1f ff=%.1f integ=%.1f",
              phase_name(runtime_phase(rt)), (double)rt->control_target_rate_gps, (double)error,
@@ -868,8 +932,12 @@ static void publish_summary_and_learn(filler_strategy_runtime_t *rt, const fille
                                                       LEARN_ALPHA_GATE_GAIN, obs);
             entry->gate_gain_gps_per_pct = clampf_local(entry->gate_gain_gps_per_pct,
                                                         CASC_GATE_GAIN_MIN, CASC_GATE_GAIN_MAX);
-            entry->gain_b = learn_ewma(entry->gain_b, rt->learned_gain_b, LEARN_ALPHA_GATE_GAIN, obs);
-            entry->gain_b = clampf_local(entry->gain_b, CASC_GAIN_B_MIN, CASC_GAIN_B_MAX);
+            entry->onset_gate_pct = learn_ewma(entry->onset_gate_pct, rt->learned_flow_onset_gate_pct,
+                                               LEARN_ALPHA_ONSET, obs);
+            entry->onset_gate_pct = clampf_local(entry->onset_gate_pct, CASC_ONSET_MIN_PCT, CASC_ONSET_MAX_PCT);
+            // Keep the persisted offset consistent with the physical onset.
+            entry->gain_b = clampf_local(-entry->gate_gain_gps_per_pct * entry->onset_gate_pct,
+                                         CASC_GAIN_B_MIN, CASC_GAIN_B_MAX);
         }
         // finish_trim is signed: plain EWMA (no warmup, no prev<=0 shortcut).
         // A miss gets a much larger corrective alpha than steady-state tuning.
@@ -950,6 +1018,7 @@ static void cascade_on_enter(filler_strategy_runtime_t *rt, filler_state_t state
             rt->learned_slow_rate_gps = entry->slow_rate_gps;
             rt->learned_gate_gain_gps_per_pct = entry->gate_gain_gps_per_pct;
             rt->learned_gain_b = entry->gain_b;
+            rt->learned_flow_onset_gate_pct = entry->onset_gate_pct;
             // Seed the two live operating points from the persisted affine model
             // so the in-fill refit starts consistent and only nudges from here.
             rt->gain_hi_gate_pct = 60.0f;

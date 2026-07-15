@@ -71,6 +71,7 @@ typedef struct {
     // (high/low gate) that the deceleration profile provides.
     float learned_gate_gain_gps_per_pct;   // slope K
     float learned_gain_b;                  // offset b
+    float learned_flow_onset_gate_pct;     // flow-onset gate ("dead angle"); b = -K*onset
     float gain_hi_gate_pct;                // EWMA high-gate operating point (gate, rate)
     float gain_hi_rate_gps;
     float gain_lo_gate_pct;                // EWMA low-gate operating point (gate, rate)
