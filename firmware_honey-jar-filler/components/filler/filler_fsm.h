@@ -67,7 +67,16 @@ typedef struct {
     float model_rate_gps;          // ŷ  delay-free model rate
     float model_delayed_gps;       // ŷ_d model rate through the dead time
     float control_integ_pct;       // PI integrator state
-    float gate_gain_gps_per_pct;   // K̂  identified plant gain
+    float gate_gain_gps_per_pct;   // K̂  affine slope K
+    // Affine plant-model identification detail (cascade), so the fit can be
+    // verified from the logs: offset b and the two operating points the slope
+    // is fitted through, plus the smoothed rate the controller regulates on.
+    float gain_offset_b_gps;       // b  affine offset [g/s]
+    float gain_hi_gate_pct;        // high-gate operating point (gate, rate)
+    float gain_hi_rate_gps;
+    float gain_lo_gate_pct;        // low-gate operating point (gate, rate)
+    float gain_lo_rate_gps;
+    float control_rate_gps;        // windowed rate used as the control feedback
     uint32_t refill_count;
 } filler_strategy_sample_telemetry_t;
 

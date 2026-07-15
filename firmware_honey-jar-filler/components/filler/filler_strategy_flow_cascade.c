@@ -96,6 +96,12 @@
 #define CASC_KP_PCT_PER_GPS 1.2f
 #define CASC_KI_PCT_PER_GPS_S 0.40f
 #define CASC_STEP_MAX_PCT 6.0f
+// Closing is rate-limited less aggressively than opening: when the actual rate
+// is well above the setpoint the gate should back off decisively (over-dosing
+// is the failure that ruins a jar), while opening stays gentle so the loop does
+// not surge into an overshoot. Asymmetric slew = "the more it is above, the
+// more it closes" without letting it lunge open by the same amount.
+#define CASC_STEP_MAX_DOWN_PCT 15.0f
 #define CASC_INTEG_LIMIT_PCT 35.0f
 #define CASC_DEADBAND_GPS 0.6f
 #define CASC_HOLDOFF_MIN_MS 300.0f
@@ -112,10 +118,30 @@
 #define CASC_RATE_MIN_FLOOR_GPS 3.0f
 #define CASC_TERMINAL_RATE_FRAC 0.25f
 
+// Bulk-phase setpoint (the profile's fast rate) is a CHOSEN, controllable
+// trajectory derived from the jar size, NOT the learned achievable rate. Using
+// the learned/measured rate as the setpoint creates a positive-feedback loop
+// on a thin medium: the plant can flow far faster than intended, that high rate
+// gets learned as "fast_rate", the profile then targets it, the feedforward
+// opens the gate wider, an even higher rate is measured, and so on -- the
+// setpoint and start gate diverge upward across fills until it overfills. The
+// setpoint must instead be an independent reference the loop regulates TO. Size
+// it so the bulk phase fills in ~this many seconds (the decel/close phase adds
+// a few more), e.g. a 500 g jar at 16 s -> ~31 g/s. This is the primary knob
+// for "how fast / how visibly controlled" a fill runs.
+#define CASC_FAST_FILL_S 16.0f
+#define CASC_FAST_RATE_MIN_GPS 8.0f
+#define CASC_FAST_RATE_MAX_GPS 60.0f
+
 // Affine plant model  rate = K*gate + b.  K [g/s per %] bounds, offset b [g/s]
 // bounds (negative for the flow-onset threshold), and the minimum gate
 // separation between the two operating points needed to trust a fresh slope.
-#define CASC_GATE_GAIN_MIN 0.02f
+// The K floor is deliberately not tiny: an extremely small slope means the
+// two-point fit has collapsed (the gate hunted and the operating points
+// scrambled), and it makes the feedforward gate = (rate-b)/K blow up and pin
+// to the ceiling. 0.10 = 100 %% gate still gives >=10 g/s, below any real
+// medium here, so it never wrongly saturates the feedforward.
+#define CASC_GATE_GAIN_MIN 0.10f
 #define CASC_GATE_GAIN_MAX 3.00f
 #define CASC_GAIN_B_MIN -60.0f
 #define CASC_GAIN_B_MAX 15.0f
@@ -123,8 +149,15 @@
 // Live plant-gain identification: only sample once the gate has been held
 // longer than the dead time (plus a settle margin), so the measured rate
 // reflects the current gate rather than the one commanded a dead time ago.
-#define CASC_GAIN_SETTLE_MARGIN_S 0.5f
+#define CASC_GAIN_SETTLE_MARGIN_S 0.25f
 #define CASC_GAIN_LIVE_ALPHA 0.15f
+// Drip-robust gain identification: a thin/sticky medium releases in discrete
+// drops at low gate, so no instantaneous rate is meaningful. Only measure a
+// gate's flow once it has been HELD constant past the dead time, then as the
+// delivered-mass average over the whole steady dwell (>= CASC_GAIN_MIN_WINDOW_S)
+// -- 5 drops in 10 s and a constant trickle over 10 s then give the same rate.
+#define CASC_GAIN_DWELL_TOL_PCT 1.0f
+#define CASC_GAIN_MIN_WINDOW_S 1.5f
 
 // Smith predictor model.
 #define CASC_MODEL_TAU_S 0.60f
@@ -168,6 +201,13 @@ static uint16_t s_model_head;
 static uint16_t s_model_count;
 static float s_integ_pct;            // PI integrator (gate %)
 
+// Drip-robust gain-ID dwell tracking (one fill at a time -> file-scope).
+static float s_gain_dwell_gate_pct;  // gate the current steady dwell is held at
+static int64_t s_gain_dwell_start_us;// when that gate was last (re)commanded
+static int64_t s_gain_anchor_us;     // mass/time anchor set once dead time elapsed
+static float s_gain_anchor_rel_g;
+static bool s_gain_anchor_valid;
+
 static float clampf_local(float v, float lo, float hi)
 {
     if (v < lo) return lo;
@@ -204,6 +244,12 @@ static void cascade_model_reset(void)
     s_model_head = 0;
     s_model_count = 0;
     memset(s_model_hist, 0, sizeof(s_model_hist));
+    // Force the first sample to (re)start a dwell.
+    s_gain_dwell_gate_pct = -1.0f;
+    s_gain_dwell_start_us = 0;
+    s_gain_anchor_us = 0;
+    s_gain_anchor_rel_g = 0.0f;
+    s_gain_anchor_valid = false;
 }
 
 static bool stable_above(float value, float threshold, uint8_t *count, uint8_t required)
@@ -252,6 +298,16 @@ static void cascade_reset_counters(filler_strategy_runtime_t *rt)
     rt->sample_count = 0;
     rt->safe_reduce_ts_us = 0;
     rt->safe_reduce_last_action_us = 0;
+}
+
+// Chosen bulk-phase setpoint (the profile's fast rate). Independent of any
+// learned/measured rate -- see CASC_FAST_FILL_S -- so the setpoint stays a
+// stable reference the loop regulates to, instead of chasing (and amplifying)
+// whatever the plant happened to flow last time.
+static float desired_fast_rate_gps(const app_params_t *params)
+{
+    float target_g = params ? (float)params->target_grams : 500.0f;
+    return clampf_local(target_g / CASC_FAST_FILL_S, CASC_FAST_RATE_MIN_GPS, CASC_FAST_RATE_MAX_GPS);
 }
 
 // Un-learned seed rates (only used before a preset's first fill; afterwards
@@ -414,6 +470,44 @@ static void cascade_update_model(filler_strategy_runtime_t *rt, float dt_s)
     }
 }
 
+// Least-squares slope of rel_g over the recent sample window. A far smoother
+// flow-rate estimate than the per-sample difference, whose ±sample noise on a
+// splashing thin medium (weight jumps 0,+21,0,+15,...) is what makes the inner
+// loop oscillate. The safe-rate limiter keeps the fast EWMA rate for spike
+// detection; only the control feedback uses this smoothed rate.
+#define CASC_CTRL_RATE_WINDOW 5
+static void push_rate_hist(filler_strategy_runtime_t *rt, int64_t ts_us, float rel_g)
+{
+    int n = rt->rate_hist_count;
+    if (n >= CASC_CTRL_RATE_WINDOW) {
+        for (int i = 1; i < CASC_CTRL_RATE_WINDOW; i++) {
+            rt->rate_hist_ts_us[i - 1] = rt->rate_hist_ts_us[i];
+            rt->rate_hist_rel_g[i - 1] = rt->rate_hist_rel_g[i];
+        }
+        n = CASC_CTRL_RATE_WINDOW - 1;
+    }
+    rt->rate_hist_ts_us[n] = ts_us;
+    rt->rate_hist_rel_g[n] = rel_g;
+    rt->rate_hist_count = (uint8_t)(n + 1);
+}
+
+static float windowed_rate_gps(const filler_strategy_runtime_t *rt)
+{
+    int n = rt->rate_hist_count;
+    if (n < 2) return 0.0f;
+    double t0 = (double)rt->rate_hist_ts_us[0];
+    double sx = 0, sy = 0, sxx = 0, sxy = 0;
+    for (int i = 0; i < n; i++) {
+        double x = ((double)rt->rate_hist_ts_us[i] - t0) / 1e6;
+        double y = (double)rt->rate_hist_rel_g[i];
+        sx += x; sy += y; sxx += x * x; sxy += x * y;
+    }
+    double denom = (double)n * sxx - sx * sx;
+    if (denom <= 1e-9) return 0.0f;
+    double slope = ((double)n * sxy - sx * sy) / denom;   // g per s
+    return slope > 0.0 ? (float)slope : 0.0f;
+}
+
 static void update_rate_estimates(filler_strategy_runtime_t *rt, const filler_strategy_tick_t *tick)
 {
     if (!rt || !tick || !tick->new_sample || !tick->latest) return;
@@ -447,30 +541,61 @@ static void update_rate_estimates(filler_strategy_runtime_t *rt, const filler_st
                 rt->slow_rate_count++;
             }
 
-            // Live, dead-time-aware plant-gain identification. Sampling only in
-            // steady state (gate held longer than the dead time) captures the
-            // local nonlinear gain at the current operating point and updates
-            // K̂ within the fill, so the feedforward and Smith model track as
-            // the controller sweeps fast -> slow.
-            float gate_stable_s = (rt->control_last_update_us > 0)
-                ? (float)(tick->latest->ts_us - rt->control_last_update_us) / 1000000.0f : 0.0f;
-            if (rt->filtered_rate_gps > 1.0f && rt->control_gate_cmd_pct > 5.0f &&
-                gate_stable_s > (rt->learned_dead_time_s + CASC_GAIN_SETTLE_MARGIN_S)) {
-                // Feed this steady-state (gate, rate) sample into the high- or
-                // low-gate operating point (the fast phase runs at a higher gate,
-                // the slow/terminal phase at a lower one), then refit the affine
-                // model K,b from the two points. This continuously tracks the
-                // plant (incl. the offset / flow onset) as it drifts, without
-                // needing a full gate sweep.
-                if (runtime_phase(rt) != CASC_PHASE_SLOW) {
-                    rt->gain_hi_gate_pct = ewma(rt->gain_hi_gate_pct, rt->control_gate_cmd_pct, CASC_GAIN_LIVE_ALPHA);
-                    rt->gain_hi_rate_gps = ewma(rt->gain_hi_rate_gps, rt->filtered_rate_gps, CASC_GAIN_LIVE_ALPHA);
-                } else {
-                    rt->gain_lo_gate_pct = ewma(rt->gain_lo_gate_pct, rt->control_gate_cmd_pct, CASC_GAIN_LIVE_ALPHA);
-                    rt->gain_lo_rate_gps = ewma(rt->gain_lo_rate_gps, rt->filtered_rate_gps, CASC_GAIN_LIVE_ALPHA);
+            // Drip-robust plant-gain identification. A thin/sticky medium
+            // releases in discrete drops at low gate, so an instantaneous rate
+            // is meaningless (5 drops in 10 s vs a constant trickle look totally
+            // different sample-to-sample but carry the same mass). So only
+            // measure a gate once it has been HELD constant past the dead time,
+            // and then as the delivered-mass AVERAGE over the whole steady dwell.
+            float gate = rt->control_gate_cmd_pct;
+            if (fabsf(gate - s_gain_dwell_gate_pct) > CASC_GAIN_DWELL_TOL_PCT) {
+                // Gate moved: restart the dwell, invalidate the mass anchor.
+                s_gain_dwell_gate_pct = gate;
+                s_gain_dwell_start_us = tick->latest->ts_us;
+                s_gain_anchor_valid = false;
+            } else {
+                float dwell_s = (float)(tick->latest->ts_us - s_gain_dwell_start_us) / 1000000.0f;
+                if (!s_gain_anchor_valid && dwell_s >= rt->learned_dead_time_s) {
+                    // Dead time elapsed: mass delivered from here on reflects THIS
+                    // gate. Anchor the average window.
+                    s_gain_anchor_valid = true;
+                    s_gain_anchor_us = tick->latest->ts_us;
+                    s_gain_anchor_rel_g = rel_g;
+                } else if (s_gain_anchor_valid && gate > 5.0f) {
+                    float win_s = (float)(tick->latest->ts_us - s_gain_anchor_us) / 1000000.0f;
+                    if (win_s >= CASC_GAIN_MIN_WINDOW_S) {
+                        float rate_ss = (rel_g - s_gain_anchor_rel_g) / win_s;   // drip-averaged
+                        if (rate_ss < 0.0f) rate_ss = 0.0f;
+                        // Bin by gate LEVEL (not FSM phase): a continuous-profile
+                        // fill is almost all "fast_control", so phase binning
+                        // starved the low-gate point and the slope froze at the
+                        // floor. Level binning fills both points from whatever
+                        // gate range the controller visits.
+                        float mid_gate = 0.5f * (rt->gain_hi_gate_pct + rt->gain_lo_gate_pct);
+                        if (gate >= mid_gate) {
+                            rt->gain_hi_gate_pct = ewma(rt->gain_hi_gate_pct, gate, CASC_GAIN_LIVE_ALPHA);
+                            rt->gain_hi_rate_gps = ewma(rt->gain_hi_rate_gps, rate_ss, CASC_GAIN_LIVE_ALPHA);
+                        } else {
+                            rt->gain_lo_gate_pct = ewma(rt->gain_lo_gate_pct, gate, CASC_GAIN_LIVE_ALPHA);
+                            rt->gain_lo_rate_gps = ewma(rt->gain_lo_rate_gps, rate_ss, CASC_GAIN_LIVE_ALPHA);
+                        }
+                        cascade_refit_gain(rt);
+                        // Physical sanity floor on K: flow starts at a positive
+                        // gate (onset), so the affine offset b <= 0, hence
+                        // K >= rate/gate for ANY steady observation. This single
+                        // guard prevents the pathological collapse to the K floor
+                        // while flow is clearly happening.
+                        float secant = rate_ss / gate;
+                        if (rt->learned_gate_gain_gps_per_pct < secant) {
+                            rt->learned_gate_gain_gps_per_pct =
+                                clampf_local(secant, CASC_GATE_GAIN_MIN, CASC_GATE_GAIN_MAX);
+                            rt->learned_gain_b = clampf_local(
+                                rt->gain_hi_rate_gps - rt->learned_gate_gain_gps_per_pct * rt->gain_hi_gate_pct,
+                                CASC_GAIN_B_MIN, CASC_GAIN_B_MAX);
+                        }
+                        if (rt->gate_gain_count < 65535) rt->gate_gain_count++;
+                    }
                 }
-                cascade_refit_gain(rt);
-                if (rt->gate_gain_count < 65535) rt->gate_gain_count++;
             }
 
             if (!rt->first_close_seen) cascade_update_model(rt, dt_s);
@@ -484,6 +609,10 @@ static void update_rate_estimates(filler_strategy_runtime_t *rt, const filler_st
                                                 DEAD_TIME_MIN_S, DEAD_TIME_MAX_S);
         ESP_LOGI(TAG, "detected dead time: %.3f s", (double)rt->measured_dead_time_s);
     }
+
+    // Windowed (smoothed) flow rate for the control feedback.
+    push_rate_hist(rt, tick->latest->ts_us, rel_g);
+    rt->control_rate_gps = windowed_rate_gps(rt);
 
     rt->last_rel_g = rel_g;
     rt->last_rate_ts_us = tick->latest->ts_us;
@@ -547,7 +676,9 @@ static float control_holdoff_ms(const filler_strategy_runtime_t *rt)
 static float profile_target_rate_gps(const filler_strategy_runtime_t *rt, const filler_strategy_tick_t *tick,
                                      float remaining_g)
 {
-    float fast = (rt->learned_fast_rate_gps > 1.0f) ? rt->learned_fast_rate_gps : fallback_fast_rate_gps(tick->params);
+    // Setpoint = chosen controllable trajectory, decoupled from the learned
+    // achievable rate (which would otherwise diverge on a thin medium).
+    float fast = desired_fast_rate_gps(tick->params);
     // Terminal (approach) rate: a genuine slow phase for a controllable close,
     // as a fixed fraction of the fast rate. Using the learned slow rate here
     // does not work with a continuous profile - without a distinct slow phase
@@ -571,9 +702,12 @@ static void update_control_targets(filler_strategy_runtime_t *rt, const filler_s
 {
     if (!rt || !tick) return;
     rt->control_target_rate_gps = profile_target_rate_gps(rt, tick, remaining_g);
+    // Feedback uses the smoothed windowed rate (not the jumpy per-sample EWMA)
+    // so the inner loop does not oscillate on the noisy thin-medium signal.
+    float meas = rt->control_rate_gps;
     float fb = model_is_usable(rt)
-        ? (s_model_rate_gps + (rt->filtered_rate_gps - s_model_delayed_gps))  // Smith prediction
-        : rt->filtered_rate_gps;
+        ? (s_model_rate_gps + (meas - s_model_delayed_gps))  // Smith prediction
+        : meas;
     rt->control_rate_error_gps = rt->control_target_rate_gps - fb;
 }
 
@@ -611,8 +745,9 @@ static void cascade_run_controller(filler_strategy_runtime_t *rt, const filler_s
     // Anti-windup: on saturation, unwind the integrator by the clipped amount.
     if (raw_gate != next_gate) s_integ_pct += (next_gate - raw_gate);
 
-    // Rate-limit the actuator step for smoothness.
-    float step = clampf_local(next_gate - rt->control_gate_cmd_pct, -CASC_STEP_MAX_PCT, CASC_STEP_MAX_PCT);
+    // Rate-limit the actuator step for smoothness; allow faster closing than
+    // opening (see CASC_STEP_MAX_DOWN_PCT).
+    float step = clampf_local(next_gate - rt->control_gate_cmd_pct, -CASC_STEP_MAX_DOWN_PCT, CASC_STEP_MAX_PCT);
     next_gate = clampf_local(rt->control_gate_cmd_pct + step, 0.0f, gate_cap);
 
     if (fabsf(next_gate - rt->control_gate_cmd_pct) < 0.05f) return;
@@ -672,6 +807,12 @@ static void publish_runtime_snapshot(filler_strategy_runtime_t *rt, const filler
         .model_delayed_gps = s_model_delayed_gps,
         .control_integ_pct = s_integ_pct,
         .gate_gain_gps_per_pct = rt->learned_gate_gain_gps_per_pct,
+        .gain_offset_b_gps = rt->learned_gain_b,
+        .gain_hi_gate_pct = rt->gain_hi_gate_pct,
+        .gain_hi_rate_gps = rt->gain_hi_rate_gps,
+        .gain_lo_gate_pct = rt->gain_lo_gate_pct,
+        .gain_lo_rate_gps = rt->gain_lo_rate_gps,
+        .control_rate_gps = rt->control_rate_gps,
         .refill_count = rt->refill_count,
     };
     snprintf(s.strategy_name, sizeof(s.strategy_name), "%s", tick->strategy_name ? tick->strategy_name : "?");
@@ -821,10 +962,11 @@ static void cascade_on_enter(filler_strategy_runtime_t *rt, filler_state_t state
             }
             rt->adapted_drip_wait_ms = entry->drip_wait_ms;
             rt->gate_ceiling_pct = gate_ceiling_for_entry(entry, tick->params);
-            // Start at the feedforward gate for the initial fast setpoint
-            // (invert the learned affine model).
+            // Start at the feedforward gate for the initial (decoupled) fast
+            // setpoint by inverting the learned affine model.
             rt->control_gate_cmd_pct = clampf_local(
-                gate_of_rate(rt->learned_gate_gain_gps_per_pct, rt->learned_gain_b, entry->fast_rate_gps),
+                gate_of_rate(rt->learned_gate_gain_gps_per_pct, rt->learned_gain_b,
+                             desired_fast_rate_gps(tick->params)),
                 0.0f, rt->gate_ceiling_pct);
             log_learned_entry("starting cascade fill with", tick->preset_index, entry);
             ESP_LOGI(TAG, "gate ceiling=%.1f%% (preset max=%u%%, successful_fills=%lu)",

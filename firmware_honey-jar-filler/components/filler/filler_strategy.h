@@ -90,6 +90,7 @@ typedef struct {
     bool measured_near_close_valid;
     float target_g;
     float control_gate_cmd_pct;
+    float control_rate_gps;        // windowed (smoothed) rate used as control feedback
     float gate_ceiling_pct;
     float gate_at_slow_entry_pct;
     float gate_at_close_pct;

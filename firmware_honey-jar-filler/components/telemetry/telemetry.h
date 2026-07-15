@@ -79,6 +79,12 @@ typedef struct {
     float model_delayed_gps;
     float control_integ_pct;
     float gate_gain_gps_per_pct;
+    float gain_offset_b_gps;
+    float gain_hi_gate_pct;
+    float gain_hi_rate_gps;
+    float gain_lo_gate_pct;
+    float gain_lo_rate_gps;
+    float control_rate_gps;
     float next_drip_wait_ms;
     float fill_error_g;
     float measured_post_close_gain_g;
