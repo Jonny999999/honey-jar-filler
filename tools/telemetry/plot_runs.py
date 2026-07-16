@@ -135,6 +135,13 @@ SESSION_LINE_COLORS = {
 }
 
 
+# Optional seam for drawing an extra layer on a finished fill figure, called
+# just before the figure is saved with (fig, ax, rate_ax, fill_run, records).
+# annotate_ch07.py installs the thesis ch. 07 annotation layer here; nothing in
+# the normal plotting path sets it, so plot_runs.py on its own is unaffected.
+ANNOTATION_HOOK: Any = None
+
+
 def _parse_fill_selection(value: str) -> list[int]:
     selected: list[int] = []
     for part in value.split(","):
@@ -1673,6 +1680,9 @@ def _render_fill_variant(
 
     if debug and meta_ax is not None:
         _draw_debug_metadata(meta_ax, session_dir, fill_run, base_weight_g, records, command_text)
+
+    if ANNOTATION_HOOK is not None:
+        ANNOTATION_HOOK(fig=fig, ax=ax, rate_ax=rate_ax, fill_run=fill_run, records=records)
 
     exported: list[Path] = []
     output_dir.mkdir(parents=True, exist_ok=True)

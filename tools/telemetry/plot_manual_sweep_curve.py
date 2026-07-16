@@ -337,8 +337,26 @@ def _plot_curve(
             color = cmap(index % 10)
             x = [point.gate_pct for point in sweep_points]
             y = [point.rate_gps for point in sweep_points]
-            ax.plot(x, y, color=color, linewidth=1.0, alpha=0.35, zorder=2)
-            ax.scatter(x, y, color=color, s=36, alpha=0.92, label=f"Sweep {sweep_id}", zorder=3)
+            # Subtle direction arrows between consecutive points show the temporal
+            # recording order, not a continuous interpolation. Kept faint so the
+            # dots and the linear fit stay the primary information.
+            for i in range(len(x) - 1):
+                ax.annotate(
+                    "",
+                    xy=(x[i + 1], y[i + 1]),
+                    xytext=(x[i], y[i]),
+                    arrowprops={
+                        "arrowstyle": "-|>",
+                        "color": color,
+                        "alpha": 0.30,
+                        "linewidth": 0.9,
+                        "mutation_scale": 8,
+                        "shrinkA": 3.0,
+                        "shrinkB": 3.0,
+                    },
+                    zorder=2,
+                )
+            ax.scatter(x, y, color=color, s=36, alpha=0.92, label=f"Durchlauf {sweep_id}", zorder=3)
 
         unique_gate_count = len({round(point.gate_pct, 6) for point in points})
         if fit_enabled and unique_gate_count >= 2 and len(points) >= 2:
@@ -359,7 +377,38 @@ def _plot_curve(
                 label="Linearer Fit",
                 zorder=4,
             )
-            equation = f"v = {slope:.3f} (g/s)/% · alpha {intercept:+.2f} g/s"
+            # Mark where the linear fit crosses the x-axis: the gate opening below
+            # which the fit predicts no flow (referenced in the thesis as the
+            # approximate onset threshold of the honey flow).
+            if slope > 0.0:
+                x0 = -intercept / slope
+                if 0.0 <= x0 <= 100.0:
+                    ax.scatter(
+                        [x0], [0.0],
+                        s=90, facecolors="none", edgecolors="#111827",
+                        linewidths=1.7, zorder=6, clip_on=False,
+                    )
+                    ax.annotate(
+                        rf"$\approx {x0:.0f}\,\%$",
+                        xy=(x0, 0.0),
+                        xytext=(0, -15),
+                        textcoords="offset points",
+                        ha="center", va="top",
+                        fontsize=9.0, color="#111827", zorder=6,
+                        annotation_clip=False,
+                    )
+            slope_s = f"{slope:.2f}".replace(".", "{,}")
+            intercept_s = f"{abs(intercept):.1f}".replace(".", "{,}")
+            sign = "-" if intercept < 0 else "+"
+            equation = (
+                r"$\dot{m} \approx "
+                + slope_s
+                + r"\,\frac{\mathrm{g/s}}{\%}\cdot\alpha\ "
+                + sign
+                + r"\ "
+                + intercept_s
+                + r"\,\frac{\mathrm{g}}{\mathrm{s}}$"
+            )
             ax.text(
                 0.985,
                 0.04,
@@ -367,7 +416,7 @@ def _plot_curve(
                 transform=ax.transAxes,
                 ha="right",
                 va="bottom",
-                fontsize=8.8,
+                fontsize=12.5,
                 color="#0f172a",
                 bbox={"boxstyle": "round,pad=0.22", "facecolor": "white", "edgecolor": "#cbd5e1", "alpha": 0.92},
                 zorder=5,
@@ -392,7 +441,7 @@ def _plot_curve(
         ax.set_axisbelow(True)
         ax.set_xlim(left=max(0.0, min(point.gate_pct for point in points) - 2.0), right=min(102.0, max(point.gate_pct for point in points) + 2.0))
         ax.set_ylim(bottom=0.0)
-        ax.legend(frameon=False, loc="upper left", ncol=min(4, max(1, len(sweep_ids) + (1 if fit_enabled else 0))))
+        ax.legend(frameon=False, loc="upper left", ncol=min(3, max(1, len(sweep_ids) + (1 if fit_enabled else 0))))
         fig.tight_layout(rect=(0.035, 0.035, 0.985, (0.92 if debug else 0.985)), pad=0.35, w_pad=0.55, h_pad=0.5)
 
         output_dir.mkdir(parents=True, exist_ok=True)
