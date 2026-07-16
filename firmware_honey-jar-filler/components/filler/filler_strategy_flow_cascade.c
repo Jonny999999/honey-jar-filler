@@ -160,7 +160,13 @@
 // delivered-mass average over the whole steady dwell (>= CASC_GAIN_MIN_WINDOW_S)
 // -- 5 drops in 10 s and a constant trickle over 10 s then give the same rate.
 #define CASC_GAIN_DWELL_TOL_PCT 1.0f
-#define CASC_GAIN_MIN_WINDOW_S 1.5f
+// Minimum post-dead-time window for one observation. This is a bias/variance
+// trade: shorter than the drip period (~1 s) makes a single observation noisy,
+// but requiring more than the loop ever holds still rejects every high-flow
+// dwell and biases the fit (see cascade_gain_track_dwell). Keep it below the
+// dwells the controller actually produces and let the fit average the noise
+// across many observations instead.
+#define CASC_GAIN_MIN_WINDOW_S 0.8f
 
 // Flow-onset gate ("dead angle"): the gate % that must be opened before the
 // gaskets clear and ANY flow starts. It is a mechanical near-constant of the
@@ -542,6 +548,89 @@ static float ctrl_rate_gps(void)
     return slope > 0.0 ? (float)slope : 0.0f;
 }
 
+// Consume ONE steady-state (gate, drip-averaged rate) observation into the
+// plant model.
+static void cascade_gain_observe(filler_strategy_runtime_t *rt, float gate, float rate_ss)
+{
+    if (!rt) return;
+    // Bin by gate LEVEL: a continuous-profile fill is almost all "fast_control",
+    // so binning by FSM phase starved the low-gate point.
+    float mid_gate = 0.5f * (rt->gain_hi_gate_pct + rt->gain_lo_gate_pct);
+    if (gate >= mid_gate) {
+        rt->gain_hi_gate_pct = ewma(rt->gain_hi_gate_pct, gate, CASC_GAIN_LIVE_ALPHA);
+        rt->gain_hi_rate_gps = ewma(rt->gain_hi_rate_gps, rate_ss, CASC_GAIN_LIVE_ALPHA);
+    } else {
+        rt->gain_lo_gate_pct = ewma(rt->gain_lo_gate_pct, gate, CASC_GAIN_LIVE_ALPHA);
+        rt->gain_lo_rate_gps = ewma(rt->gain_lo_rate_gps, rate_ss, CASC_GAIN_LIVE_ALPHA);
+    }
+    cascade_refit_gain(rt);
+    // Physical sanity floor on K: flow starts at a positive gate (onset), so
+    // b <= 0, hence K >= rate/gate for ANY steady observation.
+    float secant = (gate > 0.0f) ? (rate_ss / gate) : 0.0f;
+    if (rt->learned_gate_gain_gps_per_pct < secant) {
+        rt->learned_gate_gain_gps_per_pct = clampf_local(secant, CASC_GATE_GAIN_MIN, CASC_GATE_GAIN_MAX);
+    }
+    // Flow-onset gate ("dead angle"): onset = gate - rate/K, slow EWMA, then
+    // anchor the affine offset to it so b stays physical.
+    float k_now = rt->learned_gate_gain_gps_per_pct;
+    if (rate_ss > CASC_FLOW_EPS_GPS && k_now > CASC_GATE_GAIN_MIN) {
+        float onset_est = clampf_local(gate - rate_ss / k_now, CASC_ONSET_MIN_PCT, CASC_ONSET_MAX_PCT);
+        rt->learned_flow_onset_gate_pct = ewma(rt->learned_flow_onset_gate_pct, onset_est, CASC_ONSET_LIVE_ALPHA);
+    } else if (rate_ss <= CASC_FLOW_EPS_GPS && gate > rt->learned_flow_onset_gate_pct) {
+        rt->learned_flow_onset_gate_pct = ewma(rt->learned_flow_onset_gate_pct, gate, CASC_ONSET_LIVE_ALPHA);
+    }
+    rt->learned_flow_onset_gate_pct = clampf_local(rt->learned_flow_onset_gate_pct,
+                                                   CASC_ONSET_MIN_PCT, CASC_ONSET_MAX_PCT);
+    rt->learned_gain_b = clampf_local(-rt->learned_gate_gain_gps_per_pct * rt->learned_flow_onset_gate_pct,
+                                      CASC_GAIN_B_MIN, CASC_GAIN_B_MAX);
+    if (rt->gate_gain_count < 65535) rt->gate_gain_count++;
+}
+
+// Steady-dwell tracker. A gate is only informative once it has been HELD past
+// the dead time (before that the arriving mass still belongs to the previous
+// gate). The measurement is then delivered-mass / dwell-time, which is immune to
+// a sticky medium's drip bursts.
+//
+// The observation is harvested exactly ONCE, when the dwell ENDS, over the whole
+// post-dead-time window. Previously it fired on every sample once the window
+// exceeded a fixed length, which (a) hammered the EWMA many times per dwell with
+// correlated estimates from the same anchor, and (b) required the gate to sit
+// still for dead_time + 1.5 s before yielding anything at all. Measured on the
+// 2026-07-15 test4 run that threshold was met 0-1 times per FILL, and the dwells
+// that did qualify were exclusively the low-gate/low-flow ones (the gate only
+// holds still when the loop is quiet, which is when little is flowing) -- so K
+// was fitted from the flattest part of the curve and came out ~2.7x too small.
+// Harvesting at dwell end lets every sufficiently long dwell contribute one
+// observation, including the short high-flow ones.
+static void cascade_gain_track_dwell(filler_strategy_runtime_t *rt, float gate, float rel_g, int64_t now_us)
+{
+    if (!rt) return;
+    if (fabsf(gate - s_gain_dwell_gate_pct) > CASC_GAIN_DWELL_TOL_PCT) {
+        // Dwell ended: harvest the dwell that just finished, then restart.
+        if (s_gain_anchor_valid && s_gain_dwell_gate_pct > 5.0f) {
+            float win_s = (float)(now_us - s_gain_anchor_us) / 1000000.0f;
+            if (win_s >= CASC_GAIN_MIN_WINDOW_S) {
+                float rate_ss = (rel_g - s_gain_anchor_rel_g) / win_s;
+                if (rate_ss < 0.0f) rate_ss = 0.0f;
+                cascade_gain_observe(rt, s_gain_dwell_gate_pct, rate_ss);
+            }
+        }
+        s_gain_dwell_gate_pct = gate;
+        s_gain_dwell_start_us = now_us;
+        s_gain_anchor_valid = false;
+        return;
+    }
+    if (!s_gain_anchor_valid) {
+        float dwell_s = (float)(now_us - s_gain_dwell_start_us) / 1000000.0f;
+        if (dwell_s >= rt->learned_dead_time_s) {
+            // Dead time elapsed: mass from here on reflects THIS gate.
+            s_gain_anchor_valid = true;
+            s_gain_anchor_us = now_us;
+            s_gain_anchor_rel_g = rel_g;
+        }
+    }
+}
+
 static void update_rate_estimates(filler_strategy_runtime_t *rt, const filler_strategy_tick_t *tick)
 {
     if (!rt || !tick || !tick->new_sample || !tick->latest) return;
@@ -575,80 +664,10 @@ static void update_rate_estimates(filler_strategy_runtime_t *rt, const filler_st
                 rt->slow_rate_count++;
             }
 
-            // Drip-robust plant-gain identification. A thin/sticky medium
-            // releases in discrete drops at low gate, so an instantaneous rate
-            // is meaningless (5 drops in 10 s vs a constant trickle look totally
-            // different sample-to-sample but carry the same mass). So only
-            // measure a gate once it has been HELD constant past the dead time,
-            // and then as the delivered-mass AVERAGE over the whole steady dwell.
-            float gate = rt->control_gate_cmd_pct;
-            if (fabsf(gate - s_gain_dwell_gate_pct) > CASC_GAIN_DWELL_TOL_PCT) {
-                // Gate moved: restart the dwell, invalidate the mass anchor.
-                s_gain_dwell_gate_pct = gate;
-                s_gain_dwell_start_us = tick->latest->ts_us;
-                s_gain_anchor_valid = false;
-            } else {
-                float dwell_s = (float)(tick->latest->ts_us - s_gain_dwell_start_us) / 1000000.0f;
-                if (!s_gain_anchor_valid && dwell_s >= rt->learned_dead_time_s) {
-                    // Dead time elapsed: mass delivered from here on reflects THIS
-                    // gate. Anchor the average window.
-                    s_gain_anchor_valid = true;
-                    s_gain_anchor_us = tick->latest->ts_us;
-                    s_gain_anchor_rel_g = rel_g;
-                } else if (s_gain_anchor_valid && gate > 5.0f) {
-                    float win_s = (float)(tick->latest->ts_us - s_gain_anchor_us) / 1000000.0f;
-                    if (win_s >= CASC_GAIN_MIN_WINDOW_S) {
-                        float rate_ss = (rel_g - s_gain_anchor_rel_g) / win_s;   // drip-averaged
-                        if (rate_ss < 0.0f) rate_ss = 0.0f;
-                        // Bin by gate LEVEL (not FSM phase): a continuous-profile
-                        // fill is almost all "fast_control", so phase binning
-                        // starved the low-gate point and the slope froze at the
-                        // floor. Level binning fills both points from whatever
-                        // gate range the controller visits.
-                        float mid_gate = 0.5f * (rt->gain_hi_gate_pct + rt->gain_lo_gate_pct);
-                        if (gate >= mid_gate) {
-                            rt->gain_hi_gate_pct = ewma(rt->gain_hi_gate_pct, gate, CASC_GAIN_LIVE_ALPHA);
-                            rt->gain_hi_rate_gps = ewma(rt->gain_hi_rate_gps, rate_ss, CASC_GAIN_LIVE_ALPHA);
-                        } else {
-                            rt->gain_lo_gate_pct = ewma(rt->gain_lo_gate_pct, gate, CASC_GAIN_LIVE_ALPHA);
-                            rt->gain_lo_rate_gps = ewma(rt->gain_lo_rate_gps, rate_ss, CASC_GAIN_LIVE_ALPHA);
-                        }
-                        cascade_refit_gain(rt);
-                        // Physical sanity floor on K: flow starts at a positive
-                        // gate (onset), so the affine offset b <= 0, hence
-                        // K >= rate/gate for ANY steady observation. This single
-                        // guard prevents the pathological collapse to the K floor
-                        // while flow is clearly happening.
-                        float secant = rate_ss / gate;
-                        if (rt->learned_gate_gain_gps_per_pct < secant) {
-                            rt->learned_gate_gain_gps_per_pct =
-                                clampf_local(secant, CASC_GATE_GAIN_MIN, CASC_GATE_GAIN_MAX);
-                        }
-                        // Learn the flow-onset gate ("dead angle") from this
-                        // flowing point: onset = gate - rate/K. Slow EWMA (it is a
-                        // near-constant), then anchor the affine offset to it so b
-                        // stays physical instead of swinging with the two-point
-                        // fit. A no-flow steady point (rate~0) at a gate below the
-                        // current onset nudges the onset up to at least that gate.
-                        float k_now = rt->learned_gate_gain_gps_per_pct;
-                        if (rate_ss > CASC_FLOW_EPS_GPS && k_now > CASC_GATE_GAIN_MIN) {
-                            float onset_est = clampf_local(gate - rate_ss / k_now,
-                                                           CASC_ONSET_MIN_PCT, CASC_ONSET_MAX_PCT);
-                            rt->learned_flow_onset_gate_pct =
-                                ewma(rt->learned_flow_onset_gate_pct, onset_est, CASC_ONSET_LIVE_ALPHA);
-                        } else if (rate_ss <= CASC_FLOW_EPS_GPS && gate > rt->learned_flow_onset_gate_pct) {
-                            rt->learned_flow_onset_gate_pct =
-                                ewma(rt->learned_flow_onset_gate_pct, gate, CASC_ONSET_LIVE_ALPHA);
-                        }
-                        rt->learned_flow_onset_gate_pct = clampf_local(rt->learned_flow_onset_gate_pct,
-                                                                       CASC_ONSET_MIN_PCT, CASC_ONSET_MAX_PCT);
-                        rt->learned_gain_b = clampf_local(
-                            -rt->learned_gate_gain_gps_per_pct * rt->learned_flow_onset_gate_pct,
-                            CASC_GAIN_B_MIN, CASC_GAIN_B_MAX);
-                        if (rt->gate_gain_count < 65535) rt->gate_gain_count++;
-                    }
-                }
-            }
+            // Drip-robust plant-gain identification: track the steady dwell here,
+            // harvest exactly ONE observation from it when it ends (see
+            // cascade_gain_track_dwell).
+            cascade_gain_track_dwell(rt, rt->control_gate_cmd_pct, rel_g, tick->latest->ts_us);
 
             if (!rt->first_close_seen) cascade_update_model(rt, dt_s);
         }
