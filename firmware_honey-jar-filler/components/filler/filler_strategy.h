@@ -67,8 +67,8 @@ typedef struct {
     float learned_slow_rate_gps;
     // Cascade affine plant model  rate = K*gate + b  (learned_gate_gain = slope
     // K [g/s per %], learned_gain_b = offset [g/s], typically <0 for the flow
-    // onset). K,b are fit continuously from two EWMA operating points
-    // (high/low gate) that the deceleration profile provides.
+    // onset). K,b are identified online by RLS over the steady (gate, rate)
+    // observations the controller happens to produce.
     float learned_gate_gain_gps_per_pct;   // slope K
     float learned_gain_b;                  // offset b
     float learned_flow_onset_gate_pct;     // flow-onset gate ("dead angle"); b = -K*onset
@@ -82,6 +82,7 @@ typedef struct {
     float rls_p22;
     float gain_obs_gate_pct;               // last steady observation fed to the fit
     float gain_obs_rate_gps;
+    float learned_model_tau_s;             // FOPDT lag behind the dead time
     float learned_finish_trim_g;
     float learned_fast_start_gate_pct;
     float learned_slow_start_gate_pct;
@@ -146,6 +147,17 @@ typedef struct {
     float next_near_close_g;
     float next_close_early_g;
     float next_drip_wait_ms;
+    // Cascade identified plant model: what this fill RAN with vs what the next
+    // fill will use. The summary previously carried no cascade model state at
+    // all, so the cross-run parameter-evolution charts had nothing to plot.
+    float used_gate_gain_gps_per_pct;
+    float used_gain_b_gps;
+    float used_onset_gate_pct;
+    float used_model_tau_s;
+    float next_gate_gain_gps_per_pct;
+    float next_gain_b_gps;
+    float next_onset_gate_pct;
+    float next_model_tau_s;
     char reason[24];
 } filler_strategy_fill_summary_t;
 

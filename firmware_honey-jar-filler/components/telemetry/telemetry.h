@@ -84,8 +84,17 @@ typedef struct {
     float gain_obs_gate_pct;
     float gain_obs_rate_gps;
     float gain_rls_p_k;
+    float model_tau_s;
     float control_rate_gps;
     float next_drip_wait_ms;
+    float used_gate_gain_gps_per_pct;
+    float used_gain_b_gps;
+    float used_onset_gate_pct;
+    float used_model_tau_s;
+    float next_gate_gain_gps_per_pct;
+    float next_gain_b_gps;
+    float next_onset_gate_pct;
+    float next_model_tau_s;
     float fill_error_g;
     float measured_post_close_gain_g;
     float measured_near_close_gain_g;

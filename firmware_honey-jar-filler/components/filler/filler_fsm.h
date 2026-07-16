@@ -76,6 +76,7 @@ typedef struct {
     float gain_obs_gate_pct;       // last steady observation (gate, rate) fed to RLS
     float gain_obs_rate_gps;       // 0 between observations; scatter these vs the fit
     float gain_rls_p_k;            // RLS slope variance (shrinks as K is pinned down)
+    float model_tau_s;             // learned FOPDT lag used by the Smith model
     float control_rate_gps;        // windowed rate used as the control feedback
     uint32_t refill_count;
 } filler_strategy_sample_telemetry_t;

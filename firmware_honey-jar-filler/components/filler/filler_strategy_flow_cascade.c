@@ -204,8 +204,31 @@
 #define CASC_ONSET_MARGIN_PCT 2.0f
 #define CASC_FLOW_EPS_GPS 1.0f
 
-// Smith predictor model.
+// Smith predictor model: first-order lag tau [s] behind the dead time (FOPDT).
+// tau is a real, medium-dependent plant property (a viscous medium accelerates
+// into a new gate more slowly), so it is LEARNED per preset; CASC_MODEL_TAU_S is
+// only the cold-start seed.
+//
+// tau is not cosmetic. A steady-dwell observation averages mass from the instant
+// the dead time elapses -- which is exactly when the plant STARTS responding --
+// so the window average is a blend of the previous steady rate and the new one:
+//     avg = r_new*(1-B) + r_old*B,   B = (tau/T)*(1 - exp(-T/tau))
+// At tau=0.6 s a T=1.0 s window reads only 51 % of the true new rate. Without
+// the correction every short dwell under-reports its rate, which flattens the
+// identified slope. The learned tau is what makes the correction possible.
 #define CASC_MODEL_TAU_S 0.60f
+#define CASC_TAU_MIN_S 0.05f
+#define CASC_TAU_MAX_S 3.00f
+// tau is estimated from the fill's OPENING dwell (the one step where the rate
+// provably starts from zero): compare the whole-window average against the rate
+// over the settled tail, tau ~ (1 - avg/r_tail)*T. Needs a tail that is actually
+// settled, hence a minimum window.
+#define CASC_TAU_TAIL_S 1.00f
+#define CASC_TAU_MIN_WINDOW_S 1.40f
+#define LEARN_ALPHA_TAU 0.30f
+// Reject an observation whose window is too short relative to tau: the de-bias
+// divides by (1-B), so a large B amplifies measurement noise without limit.
+#define CASC_OBS_BETA_MAX 0.70f
 #define SMITH_DELAY_MAX 256
 
 #define DELTA_RATE_MAX_DT_S 0.80f
@@ -229,6 +252,7 @@ typedef struct {
     float rls_p11;
     float rls_p12;
     float rls_p22;
+    float model_tau_s;             // FOPDT lag behind the dead time
     float finish_trim_g;
     float drip_wait_ms;
 } cascade_learned_entry_t;
@@ -258,6 +282,10 @@ static int64_t s_gain_dwell_start_us;// when that gate was last (re)commanded
 static int64_t s_gain_anchor_us;     // mass/time anchor set once dead time elapsed
 static float s_gain_anchor_rel_g;
 static bool s_gain_anchor_valid;
+static int64_t s_gain_tail_us;       // marker CASC_TAU_TAIL_S after the anchor
+static float s_gain_tail_rel_g;      //   -> rate over the settled tail, for tau
+static bool s_gain_tail_valid;
+static float s_gain_prev_rate_gps;   // steady rate BEFORE this dwell (0 at fill start)
 
 static float clampf_local(float v, float lo, float hi)
 {
@@ -303,6 +331,10 @@ static void cascade_model_reset(void)
     s_gain_anchor_us = 0;
     s_gain_anchor_rel_g = 0.0f;
     s_gain_anchor_valid = false;
+    s_gain_tail_valid = false;
+    s_gain_tail_us = 0;
+    s_gain_tail_rel_g = 0.0f;
+    s_gain_prev_rate_gps = 0.0f;   // nothing is flowing when a fill opens
     ctrl_rate_reset();
 }
 
@@ -413,6 +445,7 @@ static void cascade_defaults_from_params(cascade_learned_entry_t *entry, const a
     entry->rls_p11 = CASC_RLS_P0_K;
     entry->rls_p12 = 0.0f;
     entry->rls_p22 = CASC_RLS_P0_C;
+    entry->model_tau_s = CASC_MODEL_TAU_S;
     entry->finish_trim_g = 0.0f;
     entry->drip_wait_ms = clampf_local((float)params->drip_delay_ms, DRIP_WAIT_MIN_MS, DRIP_WAIT_MAX_MS);
 }
@@ -558,7 +591,8 @@ static void cascade_update_model(filler_strategy_runtime_t *rt, float dt_s)
     if (!rt || dt_s <= 0.0f) return;
     // Steady-state model rate from the learned affine model  rate = K*gate + b.
     float ss = rate_of_gate(rt->learned_gate_gain_gps_per_pct, rt->learned_gain_b, rt->control_gate_cmd_pct);
-    float a = clampf_local(dt_s / CASC_MODEL_TAU_S, 0.0f, 1.0f);
+    float tau = (rt->learned_model_tau_s > CASC_TAU_MIN_S) ? rt->learned_model_tau_s : CASC_MODEL_TAU_S;
+    float a = clampf_local(dt_s / tau, 0.0f, 1.0f);
     s_model_rate_gps += a * (ss - s_model_rate_gps);
 
     s_model_hist[s_model_head] = s_model_rate_gps;
@@ -641,14 +675,53 @@ static float ctrl_rate_gps(void)
 // therefore only a "is this point on the linear branch" filter now, NOT a
 // control decision -- it no longer pushes the onset around, so a very viscous
 // medium legitimately trickling near the onset can no longer corrupt it.
-static void cascade_gain_observe(filler_strategy_runtime_t *rt, float gate, float rate_ss)
+static void cascade_gain_observe(filler_strategy_runtime_t *rt, float gate, float avg_rate,
+                                 float win_s, float prev_rate)
 {
     if (!rt) return;
+    if (avg_rate <= CASC_FLOW_EPS_GPS) return;
+
+    // De-bias the window average into a true steady rate. The window opens the
+    // instant the dead time elapses, i.e. exactly when the plant starts moving
+    // from its previous rate toward the new one, so
+    //     avg = r_new*(1-B) + r_old*B,   B = (tau/T)*(1 - exp(-T/tau))
+    // Solving for r_new removes the systematic under-report of short dwells
+    // (at tau=0.6 s a 1.0 s window reads only ~51 % of the true rate when
+    // opening from zero flow -- which is exactly the fill's highest-gate dwell,
+    // so leaving it uncorrected flattens the identified slope).
+    float tau = rt->learned_model_tau_s;
+    float rate_ss = avg_rate;
+    if (tau > CASC_TAU_MIN_S && win_s > 0.01f) {
+        float beta = (tau / win_s) * (1.0f - expf(-win_s / tau));
+        if (beta > CASC_OBS_BETA_MAX) return;   // window too short vs tau: correction ill-conditioned
+        rate_ss = (avg_rate - prev_rate * beta) / (1.0f - beta);
+    }
+    if (rate_ss <= CASC_FLOW_EPS_GPS) return;
+
+    // Log exactly what the fit consumed, so the offline scatter matches the fit.
     rt->gain_obs_gate_pct = gate;
     rt->gain_obs_rate_gps = rate_ss;
-    if (rate_ss <= CASC_FLOW_EPS_GPS) return;
     cascade_rls_update(rt, gate, rate_ss);
     if (rt->gate_gain_count < 65535) rt->gate_gain_count++;
+}
+
+// Estimate the FOPDT lag tau from the fill's OPENING dwell -- the one step where
+// the rate provably starts from zero, so the rise is unambiguous. Compare the
+// whole-window average against the settled tail:
+//     avg = r_ss*(1-B),  B ~ tau/T for T >> tau   =>   tau ~ (1 - avg/r_tail)*T
+static void cascade_learn_tau(filler_strategy_runtime_t *rt, float rel_g, int64_t now_us,
+                              float avg_rate, float win_s)
+{
+    if (!rt || !s_gain_tail_valid) return;
+    if (s_gain_prev_rate_gps > CASC_FLOW_EPS_GPS) return;   // not an opening step
+    if (win_s < CASC_TAU_MIN_WINDOW_S) return;
+    float tail_s = (float)(now_us - s_gain_tail_us) / 1000000.0f;
+    if (tail_s < 0.3f) return;
+    float r_tail = (rel_g - s_gain_tail_rel_g) / tail_s;
+    if (r_tail <= CASC_FLOW_EPS_GPS || avg_rate >= r_tail) return;
+    float tau_est = clampf_local((1.0f - avg_rate / r_tail) * win_s, CASC_TAU_MIN_S, CASC_TAU_MAX_S);
+    rt->learned_model_tau_s = ewma(rt->learned_model_tau_s, tau_est, LEARN_ALPHA_TAU);
+    rt->learned_model_tau_s = clampf_local(rt->learned_model_tau_s, CASC_TAU_MIN_S, CASC_TAU_MAX_S);
 }
 
 // Steady-dwell tracker. A gate is only informative once it has been HELD past
@@ -675,14 +748,25 @@ static void cascade_gain_track_dwell(filler_strategy_runtime_t *rt, float gate, 
         if (s_gain_anchor_valid && s_gain_dwell_gate_pct > 5.0f) {
             float win_s = (float)(now_us - s_gain_anchor_us) / 1000000.0f;
             if (win_s >= CASC_GAIN_MIN_WINDOW_S) {
-                float rate_ss = (rel_g - s_gain_anchor_rel_g) / win_s;
-                if (rate_ss < 0.0f) rate_ss = 0.0f;
-                cascade_gain_observe(rt, s_gain_dwell_gate_pct, rate_ss);
+                float avg_rate = (rel_g - s_gain_anchor_rel_g) / win_s;
+                if (avg_rate < 0.0f) avg_rate = 0.0f;
+                // tau first: cascade_gain_observe needs it to de-bias, and the
+                // opening dwell is the only clean rise to measure it from.
+                cascade_learn_tau(rt, rel_g, now_us, avg_rate, win_s);
+                cascade_gain_observe(rt, s_gain_dwell_gate_pct, avg_rate, win_s, s_gain_prev_rate_gps);
             }
+        }
+        // The rate the NEXT dwell starts from is the steady rate of the gate that
+        // just ended (per the model). Only meaningful once that gate actually ran
+        // long enough to have settled.
+        if (s_gain_anchor_valid && s_gain_dwell_gate_pct > 5.0f) {
+            s_gain_prev_rate_gps = rate_of_gate(rt->learned_gate_gain_gps_per_pct,
+                                                rt->learned_gain_b, s_gain_dwell_gate_pct);
         }
         s_gain_dwell_gate_pct = gate;
         s_gain_dwell_start_us = now_us;
         s_gain_anchor_valid = false;
+        s_gain_tail_valid = false;
         return;
     }
     if (!s_gain_anchor_valid) {
@@ -692,6 +776,14 @@ static void cascade_gain_track_dwell(filler_strategy_runtime_t *rt, float gate, 
             s_gain_anchor_valid = true;
             s_gain_anchor_us = now_us;
             s_gain_anchor_rel_g = rel_g;
+        }
+    } else if (!s_gain_tail_valid) {
+        // Mark where the response should be settled, so the tail rate can be
+        // compared against the whole-window average to recover tau.
+        if ((float)(now_us - s_gain_anchor_us) / 1000000.0f >= CASC_TAU_TAIL_S) {
+            s_gain_tail_valid = true;
+            s_gain_tail_us = now_us;
+            s_gain_tail_rel_g = rel_g;
         }
     }
 }
@@ -960,6 +1052,7 @@ static void publish_runtime_snapshot(filler_strategy_runtime_t *rt, const filler
         .gain_obs_gate_pct = rt->gain_obs_gate_pct,
         .gain_obs_rate_gps = rt->gain_obs_rate_gps,
         .gain_rls_p_k = rt->rls_p11,
+        .model_tau_s = rt->learned_model_tau_s,
         .control_rate_gps = rt->control_rate_gps,
         .refill_count = rt->refill_count,
     };
@@ -1024,6 +1117,7 @@ static void publish_summary_and_learn(filler_strategy_runtime_t *rt, const fille
             entry->rls_p12 = rt->rls_p12;
             entry->rls_p22 = rt->rls_p22;
         }
+        entry->model_tau_s = clampf_local(rt->learned_model_tau_s, CASC_TAU_MIN_S, CASC_TAU_MAX_S);
         // finish_trim is signed: plain EWMA (no warmup, no prev<=0 shortcut).
         // A miss gets a much larger corrective alpha than steady-state tuning.
         float trim_sample = clampf_local(-fill_error_g, FINISH_TRIM_MIN_G, FINISH_TRIM_MAX_G);
@@ -1077,6 +1171,16 @@ static void publish_summary_and_learn(filler_strategy_runtime_t *rt, const fille
         .next_slow_rate_gps = entry->slow_rate_gps,
         .next_close_early_g = rt->adapted_close_early_g,
         .next_drip_wait_ms = entry->drip_wait_ms,
+        // "used" = the model this fill actually ran with (captured before the
+        // end-of-fill learning), "next" = what the next fill will start from.
+        .used_gate_gain_gps_per_pct = before.gate_gain_gps_per_pct,
+        .used_gain_b_gps = before.gain_b,
+        .used_onset_gate_pct = before.onset_gate_pct,
+        .used_model_tau_s = before.model_tau_s,
+        .next_gate_gain_gps_per_pct = entry->gate_gain_gps_per_pct,
+        .next_gain_b_gps = entry->gain_b,
+        .next_onset_gate_pct = entry->onset_gate_pct,
+        .next_model_tau_s = entry->model_tau_s,
     };
     snprintf(summary.reason, sizeof(summary.reason), "%s", reason ? reason : (success ? "ok" : "fault"));
     env->publish_fill_summary(tick->run_id, tick->slot_idx, tick->preset_name, tick->strategy_name, tick->params, &summary);
@@ -1110,6 +1214,8 @@ static void cascade_on_enter(filler_strategy_runtime_t *rt, filler_state_t state
             rt->rls_p12 = entry->rls_p12;
             rt->rls_p22 = entry->rls_p22;
             if (rt->rls_p11 <= 0.0f || rt->rls_p22 <= 0.0f) cascade_rls_reset_cov(rt);
+            rt->learned_model_tau_s = (entry->model_tau_s > CASC_TAU_MIN_S)
+                                          ? entry->model_tau_s : CASC_MODEL_TAU_S;
             rt->learned_finish_trim_g = entry->finish_trim_g;
             if (!env->jar_tare_get || !env->jar_tare_get(&rt->run_base_weight_g)) {
                 rt->run_base_weight_g = tick->latest ? tick->latest->grams : 0.0f;

@@ -5,16 +5,24 @@ Reusable across tuning iterations so a session (Claude or human) does not have
 to re-derive the analysis each time. Reads a session's telemetry.ndjson, splits
 it into fill segments (state==FILL), and prints:
 
-  * a per-fill summary table (duration, start gate, final/max mass, learned K,
-    affine offset b, the two gain operating points + their separation, and the
-    implied flow-onset gate = -b/K), and
+  * a per-fill summary table (duration, start gate, final/max mass, the
+    identified affine model K/b/onset, the learned FOPDT lag tau, and -- most
+    diagnostic of all -- how many steady observations the RLS fit actually got
+    and over what gate span, plus the resulting slope variance P_k), and
   * an optional per-sample trace of one fill (--fill N) showing gate, the
     smoothed control rate vs the fast filtered rate, target rate, model rate,
     onset and K -- the view used to diagnose the drip/oscillation behaviour.
 
+Read the observation count/span first: K is only identifiable if the fit is fed
+several observations spanning a decent gate range. Few observations, or all at
+one gate, means no estimator can recover the plant -- that is an excitation
+problem, not a tuning problem.
+
 The telemetry field names are the cascade sample fields emitted by
 components/telemetry/telemetry.c (rate_filtered_gps, control_rate_gps,
-gate_gain_gps_per_pct, gain_offset_b_gps, gain_hi/lo_gate/rate_*, ...).
+gate_gain_gps_per_pct, gain_offset_b_gps, flow_onset_gate_pct, gain_obs_*,
+gain_rls_p_k, model_tau_s, ...). Sessions captured before the RLS rework lack
+the obs/onset/tau fields; the onset is then derived from -b/K.
 
 Usage:
   python3 tools/telemetry/cascade_analyze.py <session_dir_or_ndjson>
@@ -81,7 +89,7 @@ def observations(segment: list[dict[str, Any]]) -> list[tuple[float, float]]:
 def print_summary(segments: list[list[dict[str, Any]]]) -> None:
     hdr = (
         f"{'fill':>4}{'dur_s':>7}{'startg':>7}{'final':>7}{'max':>7}"
-        f"{'K_end':>7}{'b_end':>7}{'onset':>7}{'n_obs':>6}"
+        f"{'K_end':>7}{'b_end':>7}{'onset':>7}{'tau':>6}{'n_obs':>6}"
         f"{'obs_gate_span':>15}{'P_k':>8}"
     )
     print(hdr)
@@ -97,6 +105,7 @@ def print_summary(segments: list[list[dict[str, Any]]]) -> None:
             f"{max(x.get('relative_fill_g', 0) for x in s):>7.1f}"
             f"{e.get('gate_gain_gps_per_pct', 0):>7.2f}"
             f"{e.get('gain_offset_b_gps', 0):>7.1f}{onset_pct(e):>7.1f}"
+            f"{e.get('model_tau_s', 0):>6.2f}"
             f"{len(obs):>6}{span:>15}{e.get('gain_rls_p_k', 0):>8.4f}"
         )
     # The observations ARE the identification evidence: too few, or all at one
