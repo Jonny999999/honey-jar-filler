@@ -80,10 +80,10 @@ typedef struct {
     float control_integ_pct;
     float gate_gain_gps_per_pct;
     float gain_offset_b_gps;
-    float gain_hi_gate_pct;
-    float gain_hi_rate_gps;
-    float gain_lo_gate_pct;
-    float gain_lo_rate_gps;
+    float flow_onset_gate_pct;
+    float gain_obs_gate_pct;
+    float gain_obs_rate_gps;
+    float gain_rls_p_k;
     float control_rate_gps;
     float next_drip_wait_ms;
     float fill_error_g;

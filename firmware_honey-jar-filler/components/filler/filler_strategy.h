@@ -72,10 +72,16 @@ typedef struct {
     float learned_gate_gain_gps_per_pct;   // slope K
     float learned_gain_b;                  // offset b
     float learned_flow_onset_gate_pct;     // flow-onset gate ("dead angle"); b = -K*onset
-    float gain_hi_gate_pct;                // EWMA high-gate operating point (gate, rate)
-    float gain_hi_rate_gps;
-    float gain_lo_gate_pct;                // EWMA low-gate operating point (gate, rate)
-    float gain_lo_rate_gps;
+    // Recursive-least-squares state for the affine fit. Regressed in centered
+    // form  rate = K*(gate - REF) + c  (decorrelates slope/intercept and keeps
+    // the 2x2 covariance well conditioned); b = c - K*REF. P is the symmetric
+    // parameter covariance [p11 p12; p12 p22] over (K, c) -- p11 doubles as the
+    // slope-confidence signal in telemetry.
+    float rls_p11;
+    float rls_p12;
+    float rls_p22;
+    float gain_obs_gate_pct;               // last steady observation fed to the fit
+    float gain_obs_rate_gps;
     float learned_finish_trim_g;
     float learned_fast_start_gate_pct;
     float learned_slow_start_gate_pct;

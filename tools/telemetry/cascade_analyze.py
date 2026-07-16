@@ -54,33 +54,60 @@ def split_fills(samples: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
 
 
 def onset_pct(r: dict[str, Any]) -> float:
-    """Flow-onset gate implied by the affine model: gate where rate crosses 0."""
+    """Flow-onset gate ("dead angle"). Logged directly since the RLS rework;
+    older sessions only carry K and b, so derive it there (gate where rate
+    crosses 0)."""
+    direct = r.get("flow_onset_gate_pct")
+    if direct is not None:
+        return direct
     k = r.get("gate_gain_gps_per_pct", 0.0)
     b = r.get("gain_offset_b_gps", 0.0)
     return (-b / k) if k > 0.01 else 0.0
 
 
+def observations(segment: list[dict[str, Any]]) -> list[tuple[float, float]]:
+    """The (gate, rate) steady observations the RLS fit consumed in this fill.
+
+    The firmware logs each one as a single-sample impulse and clears it, so a
+    non-zero gain_obs_rate_gps is exactly one observation.
+    """
+    return [
+        (r.get("gain_obs_gate_pct", 0.0), r.get("gain_obs_rate_gps", 0.0))
+        for r in segment
+        if r.get("gain_obs_rate_gps", 0.0) > 0.0
+    ]
+
+
 def print_summary(segments: list[list[dict[str, Any]]]) -> None:
     hdr = (
         f"{'fill':>4}{'dur_s':>7}{'startg':>7}{'final':>7}{'max':>7}"
-        f"{'K_end':>7}{'b_end':>7}{'onset':>7}{'hi_g':>6}{'hi_r':>6}"
-        f"{'lo_g':>6}{'lo_r':>6}{'sep':>5}"
+        f"{'K_end':>7}{'b_end':>7}{'onset':>7}{'n_obs':>6}"
+        f"{'obs_gate_span':>15}{'P_k':>8}"
     )
     print(hdr)
     print("-" * len(hdr))
     for i, s in enumerate(segments):
         e = s[-1]
         dur = (e["ts_us"] - s[0]["ts_us"]) / 1e6
-        hi_g = e.get("gain_hi_gate_pct", 0.0)
-        lo_g = e.get("gain_lo_gate_pct", 0.0)
+        obs = observations(s)
+        span = f"{min(g for g, _ in obs):.1f}-{max(g for g, _ in obs):.1f}" if obs else "-"
         print(
             f"{i:>4}{dur:>7.1f}{s[0].get('gate_pct', 0):>7.1f}"
             f"{e.get('relative_fill_g', 0):>7.1f}"
             f"{max(x.get('relative_fill_g', 0) for x in s):>7.1f}"
             f"{e.get('gate_gain_gps_per_pct', 0):>7.2f}"
             f"{e.get('gain_offset_b_gps', 0):>7.1f}{onset_pct(e):>7.1f}"
-            f"{hi_g:>6.1f}{e.get('gain_hi_rate_gps', 0):>6.1f}"
-            f"{lo_g:>6.1f}{e.get('gain_lo_rate_gps', 0):>6.1f}{hi_g - lo_g:>5.1f}"
+            f"{len(obs):>6}{span:>15}{e.get('gain_rls_p_k', 0):>8.4f}"
+        )
+    # The observations ARE the identification evidence: too few, or all at one
+    # gate, means K is not identifiable no matter how good the estimator is.
+    allobs = [o for s in segments for o in observations(s)]
+    if allobs:
+        gates = [g for g, _ in allobs]
+        print(
+            f"\n{len(allobs)} observations total, gate span "
+            f"{min(gates):.1f}-{max(gates):.1f} % "
+            f"({max(gates) - min(gates):.1f} % of excitation)"
         )
 
 

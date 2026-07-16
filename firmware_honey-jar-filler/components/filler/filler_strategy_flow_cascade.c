@@ -25,7 +25,6 @@
 #define LEARN_ALPHA_DEAD_TIME 0.35f
 #define LEARN_ALPHA_POST_CLOSE 0.65f
 #define LEARN_ALPHA_RATE 0.20f
-#define LEARN_ALPHA_GATE_GAIN 0.20f
 #define LEARN_ALPHA_DRIP_WAIT 0.35f
 #define LEARN_ALPHA_FINISH_TRIM 0.18f
 // An overweight verify failure means the post-close gain was underestimated
@@ -136,24 +135,48 @@
 #define CASC_FAST_RATE_MIN_GPS 8.0f
 #define CASC_FAST_RATE_MAX_GPS 60.0f
 
-// Affine plant model  rate = K*gate + b.  K [g/s per %] bounds, offset b [g/s]
-// bounds (negative for the flow-onset threshold), and the minimum gate
-// separation between the two operating points needed to trust a fresh slope.
-// The K floor is deliberately not tiny: an extremely small slope means the
-// two-point fit has collapsed (the gate hunted and the operating points
-// scrambled), and it makes the feedforward gate = (rate-b)/K blow up and pin
-// to the ceiling. 0.10 = 100 %% gate still gives >=10 g/s, below any real
-// medium here, so it never wrongly saturates the feedforward.
-#define CASC_GATE_GAIN_MIN 0.10f
+// Affine plant model  rate = K*gate + b.  K [g/s per %] and offset b [g/s]
+// bounds (b negative for the flow-onset threshold). These are outer sanity
+// rails only -- the fit itself is the RLS below.
+// The K floor must stay physically permissive: a very viscous medium legitimately
+// has a small slope (e.g. 6 g/s at 100 %% gate over an onset of 15 %% => K ~ 0.07),
+// so a floor tuned to the thin test medium would clamp a REAL K and make the
+// feedforward gate = (rate-b)/K under-open. Guard the degenerate case with the
+// physics (b <= 0, bounded onset) rather than with a tight floor.
+#define CASC_GATE_GAIN_MIN 0.03f
 #define CASC_GATE_GAIN_MAX 3.00f
 #define CASC_GAIN_B_MIN -60.0f
 #define CASC_GAIN_B_MAX 15.0f
-#define CASC_GAIN_MIN_GATE_SEP_PCT 8.0f
 // Live plant-gain identification: only sample once the gate has been held
 // longer than the dead time (plus a settle margin), so the measured rate
 // reflects the current gate rather than the one commanded a dead time ago.
 #define CASC_GAIN_SETTLE_MARGIN_S 0.25f
-#define CASC_GAIN_LIVE_ALPHA 0.15f
+
+// Recursive least squares (RLS) identification of the affine model.
+// Regressed in CENTERED form  rate = K*(gate - CASC_RLS_GATE_REF) + c  so the
+// slope and intercept are near-orthogonal and the 2x2 covariance stays well
+// conditioned; b = c - K*REF, onset = -b/K.
+//
+// This replaces a two-point fit through a "high" and a "low" gate operating
+// point. That fit was structurally broken: the high point was seeded at 60 %
+// gate, the controller only ever visits ~12-37 %, and the bin boundary was the
+// midpoint of the two points (=45 %), so EVERY observation fell in the low bin
+// and the high point never left its seed. At the fixed point the algebra
+// collapsed to K = rate_lo/(gate_lo - onset) with onset itself derived from the
+// same single point -- two unknowns from one equation. The pair simply drifted
+// along the under-determined manifold (measured: onset 9.2 -> 20.4 while K
+// 0.41 -> 0.54 across one session) and K settled ~2.7x below the true value.
+// RLS uses every observation over whatever gate range the controller actually
+// visits, which is sufficient: an offline fit over the same session's 11 steady
+// dwells (gates 21-33 %) recovers K = 1.42, onset = 19.5 %.
+//
+// LAMBDA < 1 lets the fit track real drift (falling bucket head). P is bounded
+// at its initial value so the unexcited direction cannot blow up when the gate
+// sits in a narrow band.
+#define CASC_RLS_LAMBDA 0.99f
+#define CASC_RLS_GATE_REF 30.0f
+#define CASC_RLS_P0_K 1.0f      // initial slope variance   ((g/s)/%)^2
+#define CASC_RLS_P0_C 25.0f     // initial intercept variance  (g/s)^2
 // Drip-robust gain identification: a thin/sticky medium releases in discrete
 // drops at low gate, so no instantaneous rate is meaningful. Only measure a
 // gate's flow once it has been HELD constant past the dead time, then as the
@@ -179,8 +202,6 @@
 #define CASC_ONSET_MIN_PCT 2.0f
 #define CASC_ONSET_MAX_PCT 40.0f
 #define CASC_ONSET_MARGIN_PCT 2.0f
-#define CASC_ONSET_LIVE_ALPHA 0.10f
-#define LEARN_ALPHA_ONSET 0.30f
 #define CASC_FLOW_EPS_GPS 1.0f
 
 // Smith predictor model.
@@ -203,6 +224,11 @@ typedef struct {
     float gate_gain_gps_per_pct;   // affine slope K [g/s per %]
     float gain_b;                  // affine offset b [g/s] (flow onset, usually <0)
     float onset_gate_pct;          // flow-onset gate ("dead angle"); b = -K*onset
+    // RLS covariance, carried across fills so the estimator keeps accumulating
+    // confidence instead of restarting maximally uncertain on every jar.
+    float rls_p11;
+    float rls_p12;
+    float rls_p22;
     float finish_trim_g;
     float drip_wait_ms;
 } cascade_learned_entry_t;
@@ -382,6 +408,11 @@ static void cascade_defaults_from_params(cascade_learned_entry_t *entry, const a
     entry->onset_gate_pct = CASC_ONSET_SEED_PCT;
     entry->gain_b = clampf_local(-entry->gate_gain_gps_per_pct * entry->onset_gate_pct,
                                  CASC_GAIN_B_MIN, CASC_GAIN_B_MAX);
+    // Maximally uncertain: the seed is a guess, so the first real observations
+    // should dominate it.
+    entry->rls_p11 = CASC_RLS_P0_K;
+    entry->rls_p12 = 0.0f;
+    entry->rls_p22 = CASC_RLS_P0_C;
     entry->finish_trim_g = 0.0f;
     entry->drip_wait_ms = clampf_local((float)params->drip_delay_ms, DRIP_WAIT_MIN_MS, DRIP_WAIT_MAX_MS);
 }
@@ -442,24 +473,74 @@ static float gate_of_rate(float k, float b, float target_rate)
     return clampf_local((target_rate - b) / k, 0.0f, 100.0f);
 }
 
-// Refit the affine model from the two learned operating points (high/low gate).
-// Needs enough gate separation to trust a fresh slope; otherwise keep the slope
-// and just re-center the offset on the (still updating) high-gate point.
-static void cascade_refit_gain(filler_strategy_runtime_t *rt)
+// Seed the RLS covariance to its initial (maximally uncertain) value. The
+// off-diagonal starts at 0: in centered form the slope and intercept are
+// initially uncorrelated.
+static void cascade_rls_reset_cov(filler_strategy_runtime_t *rt)
 {
     if (!rt) return;
-    float da = rt->gain_hi_gate_pct - rt->gain_lo_gate_pct;
-    if (da >= CASC_GAIN_MIN_GATE_SEP_PCT) {
-        float k = (rt->gain_hi_rate_gps - rt->gain_lo_rate_gps) / da;
-        k = clampf_local(k, CASC_GATE_GAIN_MIN, CASC_GATE_GAIN_MAX);
-        rt->learned_gate_gain_gps_per_pct = k;
-        rt->learned_gain_b = clampf_local(rt->gain_hi_rate_gps - k * rt->gain_hi_gate_pct,
-                                          CASC_GAIN_B_MIN, CASC_GAIN_B_MAX);
-    } else {
-        float k = rt->learned_gate_gain_gps_per_pct;
-        rt->learned_gain_b = clampf_local(rt->gain_hi_rate_gps - k * rt->gain_hi_gate_pct,
-                                          CASC_GAIN_B_MIN, CASC_GAIN_B_MAX);
-    }
+    rt->rls_p11 = CASC_RLS_P0_K;
+    rt->rls_p12 = 0.0f;
+    rt->rls_p22 = CASC_RLS_P0_C;
+}
+
+// Project the model onto the physically admissible set and keep the RLS state
+// consistent with what the controller actually uses (clamped-RLS with state
+// projection). Flow starts at a positive gate, so b <= 0 and the onset is
+// bounded; anything outside that is a fit artefact, not a plant.
+static void cascade_rls_project(filler_strategy_runtime_t *rt, float k, float c)
+{
+    if (!rt) return;
+    k = clampf_local(k, CASC_GATE_GAIN_MIN, CASC_GATE_GAIN_MAX);
+    float b = c - k * CASC_RLS_GATE_REF;
+    float onset = (k > 0.0f) ? (-b / k) : CASC_ONSET_SEED_PCT;
+    onset = clampf_local(onset, CASC_ONSET_MIN_PCT, CASC_ONSET_MAX_PCT);
+    rt->learned_gate_gain_gps_per_pct = k;
+    rt->learned_flow_onset_gate_pct = onset;
+    rt->learned_gain_b = clampf_local(-k * onset, CASC_GAIN_B_MIN, CASC_GAIN_B_MAX);
+}
+
+// One RLS update from a steady observation (gate, rate).
+//   phi = [gate - REF, 1]^T,  theta = [K, c]^T,  y = rate
+//   L     = P phi / (lambda + phi^T P phi)
+//   theta = theta + L (y - phi^T theta)
+//   P     = (P - L phi^T P) / lambda      (bounded, see below)
+static void cascade_rls_update(filler_strategy_runtime_t *rt, float gate, float rate)
+{
+    if (!rt) return;
+    float k = rt->learned_gate_gain_gps_per_pct;
+    float c = k * CASC_RLS_GATE_REF + rt->learned_gain_b;   // intercept at REF
+    float phi0 = gate - CASC_RLS_GATE_REF;
+    float phi1 = 1.0f;
+
+    // P*phi
+    float pp0 = rt->rls_p11 * phi0 + rt->rls_p12 * phi1;
+    float pp1 = rt->rls_p12 * phi0 + rt->rls_p22 * phi1;
+    float denom = CASC_RLS_LAMBDA + phi0 * pp0 + phi1 * pp1;
+    if (denom < 1e-6f) return;
+
+    float l0 = pp0 / denom;
+    float l1 = pp1 / denom;
+    float err = rate - (k * phi0 + c);
+
+    k += l0 * err;
+    c += l1 * err;
+
+    // P <- (P - L (P phi)^T) / lambda, using symmetry.
+    float p11 = (rt->rls_p11 - l0 * pp0) / CASC_RLS_LAMBDA;
+    float p12 = (rt->rls_p12 - l0 * pp1) / CASC_RLS_LAMBDA;
+    float p22 = (rt->rls_p22 - l1 * pp1) / CASC_RLS_LAMBDA;
+
+    // Bound the covariance: with the gate confined to a narrow band the
+    // unexcited direction would otherwise wind up under forgetting until a
+    // single noisy observation could throw the parameters. Never let it exceed
+    // the initial uncertainty, and keep it positive definite.
+    rt->rls_p11 = clampf_local(p11, 1e-6f, CASC_RLS_P0_K);
+    rt->rls_p22 = clampf_local(p22, 1e-6f, CASC_RLS_P0_C);
+    float p12_max = 0.99f * sqrtf(rt->rls_p11 * rt->rls_p22);
+    rt->rls_p12 = clampf_local(p12, -p12_max, p12_max);
+
+    cascade_rls_project(rt, k, c);
 }
 
 static bool model_is_usable(const filler_strategy_runtime_t *rt)
@@ -549,40 +630,24 @@ static float ctrl_rate_gps(void)
 }
 
 // Consume ONE steady-state (gate, drip-averaged rate) observation into the
-// plant model.
+// plant model via RLS. Both K and the onset now come out of the same fit
+// (onset = -b/K), so there is no separate onset estimator to go circular
+// against the slope.
+//
+// Only points with real flow are fitted: the affine model describes the flowing
+// branch, and reality clamps at zero below the onset, so feeding no-flow points
+// into a linear fit is censored data that would bias the slope. Discarding them
+// is harmless (the onset falls out of the intercept). CASC_FLOW_EPS_GPS is
+// therefore only a "is this point on the linear branch" filter now, NOT a
+// control decision -- it no longer pushes the onset around, so a very viscous
+// medium legitimately trickling near the onset can no longer corrupt it.
 static void cascade_gain_observe(filler_strategy_runtime_t *rt, float gate, float rate_ss)
 {
     if (!rt) return;
-    // Bin by gate LEVEL: a continuous-profile fill is almost all "fast_control",
-    // so binning by FSM phase starved the low-gate point.
-    float mid_gate = 0.5f * (rt->gain_hi_gate_pct + rt->gain_lo_gate_pct);
-    if (gate >= mid_gate) {
-        rt->gain_hi_gate_pct = ewma(rt->gain_hi_gate_pct, gate, CASC_GAIN_LIVE_ALPHA);
-        rt->gain_hi_rate_gps = ewma(rt->gain_hi_rate_gps, rate_ss, CASC_GAIN_LIVE_ALPHA);
-    } else {
-        rt->gain_lo_gate_pct = ewma(rt->gain_lo_gate_pct, gate, CASC_GAIN_LIVE_ALPHA);
-        rt->gain_lo_rate_gps = ewma(rt->gain_lo_rate_gps, rate_ss, CASC_GAIN_LIVE_ALPHA);
-    }
-    cascade_refit_gain(rt);
-    // Physical sanity floor on K: flow starts at a positive gate (onset), so
-    // b <= 0, hence K >= rate/gate for ANY steady observation.
-    float secant = (gate > 0.0f) ? (rate_ss / gate) : 0.0f;
-    if (rt->learned_gate_gain_gps_per_pct < secant) {
-        rt->learned_gate_gain_gps_per_pct = clampf_local(secant, CASC_GATE_GAIN_MIN, CASC_GATE_GAIN_MAX);
-    }
-    // Flow-onset gate ("dead angle"): onset = gate - rate/K, slow EWMA, then
-    // anchor the affine offset to it so b stays physical.
-    float k_now = rt->learned_gate_gain_gps_per_pct;
-    if (rate_ss > CASC_FLOW_EPS_GPS && k_now > CASC_GATE_GAIN_MIN) {
-        float onset_est = clampf_local(gate - rate_ss / k_now, CASC_ONSET_MIN_PCT, CASC_ONSET_MAX_PCT);
-        rt->learned_flow_onset_gate_pct = ewma(rt->learned_flow_onset_gate_pct, onset_est, CASC_ONSET_LIVE_ALPHA);
-    } else if (rate_ss <= CASC_FLOW_EPS_GPS && gate > rt->learned_flow_onset_gate_pct) {
-        rt->learned_flow_onset_gate_pct = ewma(rt->learned_flow_onset_gate_pct, gate, CASC_ONSET_LIVE_ALPHA);
-    }
-    rt->learned_flow_onset_gate_pct = clampf_local(rt->learned_flow_onset_gate_pct,
-                                                   CASC_ONSET_MIN_PCT, CASC_ONSET_MAX_PCT);
-    rt->learned_gain_b = clampf_local(-rt->learned_gate_gain_gps_per_pct * rt->learned_flow_onset_gate_pct,
-                                      CASC_GAIN_B_MIN, CASC_GAIN_B_MAX);
+    rt->gain_obs_gate_pct = gate;
+    rt->gain_obs_rate_gps = rate_ss;
+    if (rate_ss <= CASC_FLOW_EPS_GPS) return;
+    cascade_rls_update(rt, gate, rate_ss);
     if (rt->gate_gain_count < 65535) rt->gate_gain_count++;
 }
 
@@ -891,16 +956,20 @@ static void publish_runtime_snapshot(filler_strategy_runtime_t *rt, const filler
         .control_integ_pct = s_integ_pct,
         .gate_gain_gps_per_pct = rt->learned_gate_gain_gps_per_pct,
         .gain_offset_b_gps = rt->learned_gain_b,
-        .gain_hi_gate_pct = rt->gain_hi_gate_pct,
-        .gain_hi_rate_gps = rt->gain_hi_rate_gps,
-        .gain_lo_gate_pct = rt->gain_lo_gate_pct,
-        .gain_lo_rate_gps = rt->gain_lo_rate_gps,
+        .flow_onset_gate_pct = rt->learned_flow_onset_gate_pct,
+        .gain_obs_gate_pct = rt->gain_obs_gate_pct,
+        .gain_obs_rate_gps = rt->gain_obs_rate_gps,
+        .gain_rls_p_k = rt->rls_p11,
         .control_rate_gps = rt->control_rate_gps,
         .refill_count = rt->refill_count,
     };
     snprintf(s.strategy_name, sizeof(s.strategy_name), "%s", tick->strategy_name ? tick->strategy_name : "?");
     snprintf(s.gate_phase, sizeof(s.gate_phase), "%s", phase_name(runtime_phase(rt)));
     env->set_sample_telemetry(&s);
+    // The RLS observation is an impulse: clear it once logged so each input
+    // appears exactly once and can be scattered against the fitted line offline.
+    rt->gain_obs_gate_pct = 0.0f;
+    rt->gain_obs_rate_gps = 0.0f;
 }
 
 static void publish_summary_and_learn(filler_strategy_runtime_t *rt, const filler_strategy_env_t *env,
@@ -943,20 +1012,17 @@ static void publish_summary_and_learn(filler_strategy_runtime_t *rt, const fille
         entry->post_close_gain_g = learn_ewma(entry->post_close_gain_g, rt->measured_post_close_gain_g, LEARN_ALPHA_POST_CLOSE, obs);
         entry->fast_rate_gps = learn_ewma(entry->fast_rate_gps, fast_avg, LEARN_ALPHA_RATE, obs);
         if (slow_avg > 0.0f) entry->slow_rate_gps = learn_ewma(entry->slow_rate_gps, slow_avg, LEARN_ALPHA_RATE, obs);
-        // Persist the live-refined affine model (slope K + offset b) that the
-        // in-fill two-point fit converged to this run.
+        // Persist the RLS estimator (parameters AND covariance) verbatim. No
+        // EWMA on top: RLS already IS the recursive average, weighting each new
+        // observation by the confidence it has accumulated so far. Smoothing its
+        // output again would double-filter the estimate and stall convergence.
         if (rt->gate_gain_count > 0) {
-            entry->gate_gain_gps_per_pct = learn_ewma(entry->gate_gain_gps_per_pct,
-                                                      rt->learned_gate_gain_gps_per_pct,
-                                                      LEARN_ALPHA_GATE_GAIN, obs);
-            entry->gate_gain_gps_per_pct = clampf_local(entry->gate_gain_gps_per_pct,
-                                                        CASC_GATE_GAIN_MIN, CASC_GATE_GAIN_MAX);
-            entry->onset_gate_pct = learn_ewma(entry->onset_gate_pct, rt->learned_flow_onset_gate_pct,
-                                               LEARN_ALPHA_ONSET, obs);
-            entry->onset_gate_pct = clampf_local(entry->onset_gate_pct, CASC_ONSET_MIN_PCT, CASC_ONSET_MAX_PCT);
-            // Keep the persisted offset consistent with the physical onset.
-            entry->gain_b = clampf_local(-entry->gate_gain_gps_per_pct * entry->onset_gate_pct,
-                                         CASC_GAIN_B_MIN, CASC_GAIN_B_MAX);
+            entry->gate_gain_gps_per_pct = rt->learned_gate_gain_gps_per_pct;
+            entry->onset_gate_pct = rt->learned_flow_onset_gate_pct;
+            entry->gain_b = rt->learned_gain_b;
+            entry->rls_p11 = rt->rls_p11;
+            entry->rls_p12 = rt->rls_p12;
+            entry->rls_p22 = rt->rls_p22;
         }
         // finish_trim is signed: plain EWMA (no warmup, no prev<=0 shortcut).
         // A miss gets a much larger corrective alpha than steady-state tuning.
@@ -1038,12 +1104,12 @@ static void cascade_on_enter(filler_strategy_runtime_t *rt, filler_state_t state
             rt->learned_gate_gain_gps_per_pct = entry->gate_gain_gps_per_pct;
             rt->learned_gain_b = entry->gain_b;
             rt->learned_flow_onset_gate_pct = entry->onset_gate_pct;
-            // Seed the two live operating points from the persisted affine model
-            // so the in-fill refit starts consistent and only nudges from here.
-            rt->gain_hi_gate_pct = 60.0f;
-            rt->gain_hi_rate_gps = rate_of_gate(entry->gate_gain_gps_per_pct, entry->gain_b, 60.0f);
-            rt->gain_lo_gate_pct = 30.0f;
-            rt->gain_lo_rate_gps = rate_of_gate(entry->gate_gain_gps_per_pct, entry->gain_b, 30.0f);
+            // Restore the RLS covariance so identification CONTINUES across
+            // fills rather than restarting maximally uncertain on every jar.
+            rt->rls_p11 = entry->rls_p11;
+            rt->rls_p12 = entry->rls_p12;
+            rt->rls_p22 = entry->rls_p22;
+            if (rt->rls_p11 <= 0.0f || rt->rls_p22 <= 0.0f) cascade_rls_reset_cov(rt);
             rt->learned_finish_trim_g = entry->finish_trim_g;
             if (!env->jar_tare_get || !env->jar_tare_get(&rt->run_base_weight_g)) {
                 rt->run_base_weight_g = tick->latest ? tick->latest->grams : 0.0f;

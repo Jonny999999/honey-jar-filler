@@ -68,14 +68,14 @@ typedef struct {
     float model_delayed_gps;       // ŷ_d model rate through the dead time
     float control_integ_pct;       // PI integrator state
     float gate_gain_gps_per_pct;   // K̂  affine slope K
-    // Affine plant-model identification detail (cascade), so the fit can be
-    // verified from the logs: offset b and the two operating points the slope
-    // is fitted through, plus the smoothed rate the controller regulates on.
+    // Affine plant-model identification detail (cascade), so the RLS fit can be
+    // verified and replayed offline: the offset, the flow-onset gate, the raw
+    // steady observation the fit last consumed, and the slope confidence.
     float gain_offset_b_gps;       // b  affine offset [g/s]
-    float gain_hi_gate_pct;        // high-gate operating point (gate, rate)
-    float gain_hi_rate_gps;
-    float gain_lo_gate_pct;        // low-gate operating point (gate, rate)
-    float gain_lo_rate_gps;
+    float flow_onset_gate_pct;     // onset = -b/K  ("dead angle")
+    float gain_obs_gate_pct;       // last steady observation (gate, rate) fed to RLS
+    float gain_obs_rate_gps;       // 0 between observations; scatter these vs the fit
+    float gain_rls_p_k;            // RLS slope variance (shrinks as K is pinned down)
     float control_rate_gps;        // windowed rate used as the control feedback
     uint32_t refill_count;
 } filler_strategy_sample_telemetry_t;
