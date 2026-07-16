@@ -86,23 +86,39 @@ that's what `b` captures, usually negative). Feedforward inverts it:
 `gate = (ṁ*−b)/K̂`. Don't reintroduce a gate-sweep / per-percent schedule — it
 can't be trained by this controller.
 
-**Thin/sticky-medium tuning (branch `testing`, 2026-07-15, UNTESTED past commit
-`ea2f569`).** Hardware runs with water-thin fake honey exposed several issues the
-medium-honey tests never hit; fixes so far, all in `filler_strategy_flow_cascade.c`:
+**K̂,b are identified by RLS** (commit `6215bef`), not a two-point fit. The
+two-point version was structurally broken and its failure is worth not repeating:
+the "high" point was seeded at 60 % gate, the controller only visits ~12–37 %, and
+the bin boundary was the midpoint of the two points (45 %) → every observation
+fell in the low bin and the high point never left its seed. At the fixed point the
+algebra collapses to `K = rate_lo/(gate_lo − onset)` with `onset = gate − rate/K`
+from that *same* point: **two unknowns, one equation**, so the pair just drifted
+along the under-determined manifold. Now: RLS over every steady observation,
+regressed centered (`rate = K·(gate−REF) + c`) for conditioning, parameters **and
+covariance** persisted per preset (identification continues across fills), clamped
+with state projection to keep `b ≤ 0` / onset bounded, and `P` bounded so a narrow
+gate band can't wind up the unexcited direction. **Don't EWMA the RLS output** —
+RLS already *is* the recursive average.
+
+**Thin/sticky-medium tuning (branch `testing`).** Hardware runs with water-thin
+fake honey exposed several issues the medium-honey tests never hit. Fixes, all in
+`filler_strategy_flow_cascade.c`:
 - **Setpoint must be decoupled from the learned rate.** The outer profile's fast
   target is now `target_g / CASC_FAST_FILL_S` (a chosen ~16 s trajectory), NOT
   `learned_fast_rate`. Using the measured rate as the setpoint was a positive-
   feedback loop (thin medium flows fast → learned as fast_rate → targeted → gate
   opens wider → …), diverging start gate 35→100 % and overfilling to 180 g. Only
   the *plant model* (K,b,L,post-close) is learned; the setpoint is a fixed ref.
-- **K identification: gain-ID by drip-averaged steady dwell, not instantaneous
-  rate.** A sticky medium drips in ~1 s bursts, so any short-window rate is noise
-  and the old two-point fit collapsed K to its floor. Now: only measure a gate
-  once HELD constant past dead-time, as delivered-mass ÷ dwell-time over the whole
-  steady window (≥1.5 s); bin the two operating points by gate **level** (not FSM
-  phase — a continuous fill is almost all "fast", which starved the low point).
-  Physical sanity floor: flow onset ⇒ `b ≤ 0` ⇒ `K ≥ rate/gate` for any steady
-  point. Confirmed working: K settles ~0.5, b<0, jars land ±5 g (run `22:39`).
+- **K identification: drip-averaged steady dwell, not instantaneous rate.** A
+  sticky medium drips in ~1 s bursts, so any short-window rate is noise. Only
+  measure a gate once HELD constant past dead-time, as delivered-mass ÷ dwell-time.
+  **One observation is harvested per dwell, at dwell END** (`6680bc0`) — the old
+  "fire every sample once the window ≥1.5 s" needed `dead_time + 1.5 s` of a still
+  gate, which the `23:10` run met **0–1× per fill**, and only ever on low-gate/
+  low-flow dwells (the gate only holds still when little is flowing) → K fitted
+  from the flattest part of the curve. ⚠️ The earlier claim "K settles ~0.5 ⇒
+  confirmed working" was **wrong**: an offline fit over that session gives
+  **K=1.42, b=−27.6, onset=19.5** — the firmware's K was **2.7× too low**.
 - **Flow-onset gate ("dead angle") is now a first-class learned near-constant.**
   It's the % the gaskets must clear before any flow (mechanical, ~viscosity-
   independent). Learned as `onset = gate − rate/K̂` (slow EWMA, per-preset), and
@@ -112,9 +128,23 @@ medium-honey tests never hit; fixes so far, all in `filler_strategy_flow_cascade
 - **Control feedback = LS slope over ~1.5 s (drip period)** not 0.5 s, + deadband
   0.6→1.5 g/s, so the loop sees the mean flow and holds the gate steady instead of
   chasing each drip burst (the flow↔no-flow limit cycle).
-- Telemetry now logs `gain_offset_b_gps`, both gain operating points, and
-  `control_rate_gps`; onset is derivable offline as `−b/K̂`. Analyse a session with
-  `tools/telemetry/cascade_analyze.py <session> [--fill N]`.
+- **`tau` (FOPDT lag) is learned, and is NOT cosmetic** (`ef28112`). A steady-dwell
+  window opens exactly when the plant *starts* responding, so the average is a
+  blend: `avg = r_new·(1−B) + r_old·B`, `B = (τ/T)(1−e^{−T/τ})`. At τ=0.6 s a 1.0 s
+  window reads only **51 %** of the true rate — and the fill's opening dwell (highest
+  gate, `r_old=0`) is the most biased, which flattens the fit. So τ is learned from
+  the opening dwell (`τ ≈ (1 − avg/r_tail)·T`) and used to invert the blend before
+  feeding RLS; it also drives the Smith lag. Windows too short vs τ are rejected,
+  not corrected (the de-bias divides by `1−B`).
+- Telemetry logs `gain_offset_b_gps`, `flow_onset_gate_pct`, `model_tau_s`,
+  `gain_obs_gate_pct`/`gain_obs_rate_gps` (each RLS input as a one-sample impulse →
+  scatter them against the fitted line), `gain_rls_p_k` (slope variance =
+  convergence signal), and `control_rate_gps`. The per-fill summary now carries
+  `used_/next_` for K, b, onset, τ (it previously carried **no** cascade model
+  state — cross-run trend charts had nothing to plot). Analyse with
+  `tools/telemetry/cascade_analyze.py <session> [--fill N]` — **read `n_obs` and
+  `obs_gate_span` first**: too few observations or all at one gate = an excitation
+  problem, not a tuning problem.
 
 **Thesis illustration toggle:** `ADAPT_LEARN_SLOW` (compile-time, default 0) in
 the adaptive strategy. Set 1 to disable warmup + scale alphas ×0.35 so the
@@ -155,32 +185,50 @@ learned/measured dead_time/post_close/rates, adapted close/near thresholds, and
 `used_*`/`next_*` for the learning-trend plots.
 
 ## Known limitations / to validate on hardware
-- flow-cascade `testing`-branch retest pending (commit `ea2f569`). Watch with
-  `cascade_analyze.py`: gate should stop the flow↔no-flow oscillation (control
-  window now ~1.5 s), `onset` (−b/K̂) should settle to a plausible dead angle and
-  the min-flow floor keep the gate above it, K̂ stay realistic (~0.5 for the thin
-  dummy), jars land within tol. Prior runs: `21:36` (pre-decouple, diverged/
-  overfilled), `22:08` (decoupled, no overfill but K collapsed), `22:39` (K fixed,
-  lands ±5 g, but still drip-oscillates — the target this branch addresses).
-- **The high-gate operating point is never visited** in the thin/low-target
-  regime (the fill runs at ~20–35 % gate), so `gain_hi_*` stays at its seed and K̂
-  is really anchored by the seed at the top + one measured low point. Works, but
-  if K̂ looks wrong for a very different medium this is why. A proper fix is
-  recursive least-squares (RLS) over all (gate_delayed, rate) pairs — noted as the
-  next step if the current two-point + onset-anchored fit isn't enough.
+- **flow-cascade retest pending** after the identification rework (`6680bc0`,
+  `6215bef`, `ef28112`) — builds clean, NOT yet on hardware. Watch with
+  `cascade_analyze.py`, in this order:
+  1. `n_obs` / `obs_gate_span` — the fit needs several observations over a decent
+     gate span. Few, or all at one gate, = an **excitation** problem no estimator
+     can fix (consider a deliberate gate step early in the fill).
+  2. `K̂` should land near the offline truth for the thin dummy (**~1.4**, NOT the
+     old ~0.5), `onset` ~19–20 %, `P_k` shrinking across fills.
+  3. `tau` should settle to something plausible (thin dummy reacts fast, so
+     expect well under the 0.6 s seed) and the plotted model curve should track
+     the measured rate far more closely.
+  4. Only then judge the gate oscillation: it was a *symptom* of K̂ being 2.7×
+     low (feedforward opened to 37.7 % for a 9.4 g/s setpoint while the plant
+     actually delivered ~31 g/s there).
+- **Jar accuracy is currently NOT evidence the cascade works.** In the `23:10`
+  run all 7 fills landed −2.4…+0.7 g of 150 g *while* the rate loop was running a
+  2.7×-wrong model, overshooting its setpoint 3.3× and oscillating. The accuracy
+  came from the close threshold + `post_close_gain`/drip learning (the shared
+  adaptive substrate), not from the Regelung. **Don't claim cascade performance
+  from final mass alone** — check the rate tracking. (Matters for the thesis.)
+- **Medium-specific constants are where dummy-honey trimming hides.** Anything in
+  **g/s or gain units** doesn't scale with the medium: `CASC_FAST_FILL_S`,
+  `CASC_DEADBAND_GPS` (1.5 g/s is ~50 % of the 3 g/s terminal setpoint — the
+  terminal approach is effectively unregulated), `CASC_FLOW_EPS_GPS`,
+  `CASC_GATE_GAIN_MIN`. Constants in **% of gate** (onset, margins) are geometry
+  and are naturally medium-independent. Smell-test new constants this way.
+- **Thick-honey risk in the decoupled setpoint (untested):** `fast = target/16 s`
+  may be **unachievable** for real honey (a 500 g jar demands 31 g/s). The gate
+  then pins at the ceiling and the profile tapers from an unachievable rate, so no
+  real deceleration happens until very late → abrupt close. Non-circular fix if
+  seen: `fast = min(target/T, K̂·(ceiling − onset))` — clamps to the model's
+  achievable max at a *fixed* gate, so it reintroduces no positive feedback.
 - Dead time is measured once at fill start and held constant — the within-fill
   decrease (falling head height) is NOT compensated (documented limitation;
   `finish_trim` + Smith correction absorb the bias to first order).
-- `K̂,b` is a linearized (affine) model; gate→flow is genuinely nonlinear, so K̂ is
-  a local secant. `b`/onset is now anchored to the learned flow-onset gate rather
-  than a free two-point intercept.
-- Dead time is measured once at fill start and held constant — the within-fill
-  decrease (falling head height) is NOT compensated (documented limitation;
-  `finish_trim` + Smith correction absorb the bias to first order).
-- `K̂,b` is a linearized (affine) model; sampled only in steady state (gate held
-  > dead time). Gate→flow is genuinely nonlinear, so K̂ is a local secant, not a
-  true tangent — good enough between the two operating points, extrapolate with
-  care.
+- `K̂,b` is a linearized (affine) model sampled only in steady state; gate→flow is
+  genuinely nonlinear, so K̂ is a local secant, not a true tangent — good between
+  the visited operating points, extrapolate with care.
+- The dead-time-paced holdoff partly **duplicates** the Smith predictor's job (a
+  good predictor is what lets you run the loop fast). It's justified here by model
+  uncertainty, a noisy differentiated rate, and the fact that the gain-ID needs
+  steady dwells — but it is a trade-off, not the optimum. Holdoff saturates at
+  `CASC_HOLDOFF_MAX_MS` (2.5 s), so thick honey (L≈10 s) already updates at ~L/4
+  and thus *already* leans on the predictor.
 
 ## Pitfalls already hit (don't rediscover these)
 - **Syncthing must NOT sync `.git`** — it copies the object store file-by-file,
@@ -222,19 +270,29 @@ extend it rather than writing throwaway scripts.
 ## Current state / next
 All strategies build clean. **Active work is on branch `testing`** — a scratch
 branch for iterative hardware tuning of the cascade, one small commit per test
-iteration, to be squash/merged to `dev` manually later. Latest: `ea2f569`
-(cascade thin-medium: decoupled setpoint, drip-robust K̂, learned flow-onset +
-min-flow floor, ~1.5 s control window). Build clean, **flash + retest pending**.
+iteration, to be squash/merged to `dev` manually later.
+
+Latest (`ef28112`): the cascade **plant identification was reworked** after the
+`23:10` run was analysed and found to be fitting a 2.7×-wrong K̂ —
+`6680bc0` (harvest one observation per steady dwell, at dwell end),
+`6215bef` (RLS replaces the seed-anchored two-point fit; K floor relaxed),
+`ef28112` (learn τ, use it to de-bias observations, log the full learned model).
+Builds clean, **flash + retest pending**.
 
 **Next:**
-- Flash `ea2f569`, rerun the thin dummy-honey cascade fill, analyse with
-  `cascade_analyze.py`. Check the flow↔no-flow oscillation is gone and onset/K̂
-  look physical (see "Known limitations"). Iterate on `testing`.
-- If K̂ still looks off for a very different medium: recursive least-squares
-  (RLS) identification over dead-time-aligned (gate, rate) pairs is the planned
-  upgrade (also a good thesis "rekursive Parameterschätzung" story).
-- Once cascade is solid: collect representative thesis charts (esp. the adaptive
-  learning trend), and fill in thesis skeletons `10_regelungsbasierter` /
+- Flash `ef28112`, rerun the thin dummy cascade fill, analyse with
+  `cascade_analyze.py` following the ordered checklist in "Known limitations"
+  (`n_obs`/`obs_gate_span` first, then K̂≈1.4 / onset≈19–20 % / `P_k` shrinking,
+  then τ, then the oscillation). Iterate on `testing`.
+- If `n_obs` is still small or `obs_gate_span` narrow, the blocker is
+  **excitation**, not the estimator: consider a short deliberate gate step early
+  in the fill (textbook step-response ID, and a good thesis story alongside the
+  RLS "rekursive Parameterschätzung" angle).
+- Re-tune the symptom-fighting constants (deadband 1.5, asymmetric slew 15/6)
+  once K̂ is right — they were tuned against a broken model.
+- Then: collect representative thesis charts (esp. the adaptive learning trend and
+  now the cascade parameter-evolution trends from the new `used_/next_` summary
+  fields), and fill in thesis skeletons `10_regelungsbasierter` /
   `11_strategievergleich` + LaTeX control equations to match the drawio diagrams.
 
 **Uncommitted (host side, was noted earlier):** `plot_runs.py` `_plot_control_panel`
