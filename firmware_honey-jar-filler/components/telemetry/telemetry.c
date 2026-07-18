@@ -318,7 +318,7 @@ static void telemetry_emit_record(const telemetry_record_t *rec)
                    ",\"control_integ_pct\":%.3f,\"gate_gain_gps_per_pct\":%.4f"
                    ",\"gain_offset_b_gps\":%.3f,\"flow_onset_gate_pct\":%.3f"
                    ",\"gain_obs_gate_pct\":%.3f,\"gain_obs_rate_gps\":%.3f"
-                   ",\"gain_rls_p_k\":%.5f,\"model_tau_s\":%.3f"
+                   ",\"gain_obs_count\":%.0f,\"model_tau_s\":%.3f"
                    ",\"control_rate_gps\":%.3f"
                    ",\"refill_count\":%" PRIu32,
                    strategy_escaped,
@@ -351,7 +351,7 @@ static void telemetry_emit_record(const telemetry_record_t *rec)
                    (double)rec->flow_onset_gate_pct,
                    (double)rec->gain_obs_gate_pct,
                    (double)rec->gain_obs_rate_gps,
-                   (double)rec->gain_rls_p_k,
+                   (double)rec->gain_obs_count,
                    (double)rec->model_tau_s,
                    (double)rec->control_rate_gps,
                    rec->refill_count);

@@ -83,7 +83,7 @@ typedef struct {
     float flow_onset_gate_pct;
     float gain_obs_gate_pct;
     float gain_obs_rate_gps;
-    float gain_rls_p_k;
+    float gain_obs_count;
     float model_tau_s;
     float control_rate_gps;
     float next_drip_wait_ms;

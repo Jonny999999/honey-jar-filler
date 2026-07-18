@@ -5,10 +5,9 @@ Reusable across tuning iterations so a session (Claude or human) does not have
 to re-derive the analysis each time. Reads a session's telemetry.ndjson, splits
 it into fill segments (state==FILL), and prints:
 
-  * a per-fill summary table (duration, start gate, final/max mass, the
-    identified affine model K/b/onset, the learned FOPDT lag tau, and -- most
-    diagnostic of all -- how many steady observations the RLS fit actually got
-    and over what gate span, plus the resulting slope variance P_k), and
+  * a per-fill summary table: the firmware's believed model K/onset/tau beside
+    an offline ground-truth affine fit over that fill's reconstructed steady
+    observations, so a diverged on-board estimate is obvious at a glance, and
   * an optional per-sample trace of one fill (--fill N) showing gate, the
     smoothed control rate vs the fast filtered rate, target rate, model rate,
     onset and K -- the view used to diagnose the drip/oscillation behaviour.
@@ -21,7 +20,7 @@ problem, not a tuning problem.
 The telemetry field names are the cascade sample fields emitted by
 components/telemetry/telemetry.c (rate_filtered_gps, control_rate_gps,
 gate_gain_gps_per_pct, gain_offset_b_gps, flow_onset_gate_pct, gain_obs_*,
-gain_rls_p_k, model_tau_s, ...). Sessions captured before the RLS rework lack
+gain_obs_count, model_tau_s, ...). Sessions captured before this rework lack
 the obs/onset/tau fields; the onset is then derived from -b/K.
 
 Usage:

@@ -152,31 +152,32 @@
 // reflects the current gate rather than the one commanded a dead time ago.
 #define CASC_GAIN_SETTLE_MARGIN_S 0.25f
 
-// Recursive least squares (RLS) identification of the affine model.
-// Regressed in CENTERED form  rate = K*(gate - CASC_RLS_GATE_REF) + c  so the
-// slope and intercept are near-orthogonal and the 2x2 covariance stays well
-// conditioned; b = c - K*REF, onset = -b/K.
+// Plant-gain identification: a SINGLE local gain, learned by EWMA.
 //
-// This replaces a two-point fit through a "high" and a "low" gate operating
-// point. That fit was structurally broken: the high point was seeded at 60 %
-// gate, the controller only ever visits ~12-37 %, and the bin boundary was the
-// midpoint of the two points (=45 %), so EVERY observation fell in the low bin
-// and the high point never left its seed. At the fixed point the algebra
-// collapsed to K = rate_lo/(gate_lo - onset) with onset itself derived from the
-// same single point -- two unknowns from one equation. The pair simply drifted
-// along the under-determined manifold (measured: onset 9.2 -> 20.4 while K
-// 0.41 -> 0.54 across one session) and K settled ~2.7x below the true value.
-// RLS uses every observation over whatever gate range the controller actually
-// visits, which is sufficient: an offline fit over the same session's 11 steady
-// dwells (gates 21-33 %) recovers K = 1.42, onset = 19.5 %.
+// History (do not re-litigate): a scalar-through-origin, a 6-point breakpoint
+// schedule, a seed-anchored two-point fit, and full 2-parameter RLS were all
+// tried and all failed. The RLS failure is the instructive one: it tries to fit
+// ONE global affine line rate = K*gate + b across the whole gate range, but the
+// real plant is both nonlinear (rate saturates at high gate) and non-stationary
+// (the bucket head falls as it drains), so the gate->rate cloud is not even
+// monotonic over a session -- an offline global fit on the 2026-07-18 run gives
+// K = -0.13. Asked to fit a line to that, RLS swings K to its rails (measured:
+// pinned <=0.03 or >=3.0 in ~half of all samples), which makes the feedforward
+// gate = (mstar - b)/K garbage, which slams the gate to 0/100 %, which wrecks
+// the next observation -- a divergent loop.
 //
-// LAMBDA < 1 lets the fit track real drift (falling bucket head). P is bounded
-// at its initial value so the unexcited direction cannot blow up when the gate
-// sits in a narrow band.
-#define CASC_RLS_LAMBDA 0.99f
-#define CASC_RLS_GATE_REF 30.0f
-#define CASC_RLS_P0_K 1.0f      // initial slope variance   ((g/s)/%)^2
-#define CASC_RLS_P0_C 25.0f     // initial intercept variance  (g/s)^2
+// The controller does not need a global map. It needs the LOCAL gain near its
+// current operating point. So: hold the flow-onset gate as a slow near-constant
+// (it is mechanical -- the gate % before the gaskets clear -- so ~viscosity
+// independent), and learn the one remaining number
+//     K = EWMA( rate / (gate - onset) )
+// from each steady observation, with b = -K*onset. One bounded parameter fed by
+// one bounded ratio: it CANNOT diverge, it tracks the falling-head drift, and
+// each observation's contribution (rate/(gate-onset)) is trivially verifiable
+// from the telemetry. Timescale separation (K fast, onset slow) is what keeps
+// the pair from going circular the way the old joint two-point fit did.
+#define CASC_GAIN_K_ALPHA 0.30f       // per-observation EWMA for K
+#define CASC_ONSET_K_ALPHA 0.06f      // much slower: onset is a near-constant
 // Drip-robust gain identification: a thin/sticky medium releases in discrete
 // drops at low gate, so no instantaneous rate is meaningful. Only measure a
 // gate's flow once it has been HELD constant past the dead time, then as the
@@ -247,11 +248,6 @@ typedef struct {
     float gate_gain_gps_per_pct;   // affine slope K [g/s per %]
     float gain_b;                  // affine offset b [g/s] (flow onset, usually <0)
     float onset_gate_pct;          // flow-onset gate ("dead angle"); b = -K*onset
-    // RLS covariance, carried across fills so the estimator keeps accumulating
-    // confidence instead of restarting maximally uncertain on every jar.
-    float rls_p11;
-    float rls_p12;
-    float rls_p22;
     float model_tau_s;             // FOPDT lag behind the dead time
     float finish_trim_g;
     float drip_wait_ms;
@@ -440,11 +436,6 @@ static void cascade_defaults_from_params(cascade_learned_entry_t *entry, const a
     entry->onset_gate_pct = CASC_ONSET_SEED_PCT;
     entry->gain_b = clampf_local(-entry->gate_gain_gps_per_pct * entry->onset_gate_pct,
                                  CASC_GAIN_B_MIN, CASC_GAIN_B_MAX);
-    // Maximally uncertain: the seed is a guess, so the first real observations
-    // should dominate it.
-    entry->rls_p11 = CASC_RLS_P0_K;
-    entry->rls_p12 = 0.0f;
-    entry->rls_p22 = CASC_RLS_P0_C;
     entry->model_tau_s = CASC_MODEL_TAU_S;
     entry->finish_trim_g = 0.0f;
     entry->drip_wait_ms = clampf_local((float)params->drip_delay_ms, DRIP_WAIT_MIN_MS, DRIP_WAIT_MAX_MS);
@@ -506,74 +497,32 @@ static float gate_of_rate(float k, float b, float target_rate)
     return clampf_local((target_rate - b) / k, 0.0f, 100.0f);
 }
 
-// Seed the RLS covariance to its initial (maximally uncertain) value. The
-// off-diagonal starts at 0: in centered form the slope and intercept are
-// initially uncorrelated.
-static void cascade_rls_reset_cov(filler_strategy_runtime_t *rt)
+// One local-gain update from a steady observation (gate, rate). Given the
+// current onset, the observation determines K directly: K_obs = rate/(gate-onset)
+// (a single bounded number, so the EWMA of it cannot diverge). The onset is then
+// nudged on a much slower timescale from the same point (onset = gate - rate/K),
+// so over the fast K-timescale it is effectively constant and the pair does not
+// go circular. b = -K*onset keeps the affine form the feedforward/Smith use.
+static void cascade_gain_update(filler_strategy_runtime_t *rt, float gate, float rate)
 {
     if (!rt) return;
-    rt->rls_p11 = CASC_RLS_P0_K;
-    rt->rls_p12 = 0.0f;
-    rt->rls_p22 = CASC_RLS_P0_C;
-}
+    float onset = rt->learned_flow_onset_gate_pct;
+    float span = gate - onset;
+    if (span < CASC_ONSET_MARGIN_PCT) return;   // too close to onset: K ill-conditioned
 
-// Project the model onto the physically admissible set and keep the RLS state
-// consistent with what the controller actually uses (clamped-RLS with state
-// projection). Flow starts at a positive gate, so b <= 0 and the onset is
-// bounded; anything outside that is a fit artefact, not a plant.
-static void cascade_rls_project(filler_strategy_runtime_t *rt, float k, float c)
-{
-    if (!rt) return;
-    k = clampf_local(k, CASC_GATE_GAIN_MIN, CASC_GATE_GAIN_MAX);
-    float b = c - k * CASC_RLS_GATE_REF;
-    float onset = (k > 0.0f) ? (-b / k) : CASC_ONSET_SEED_PCT;
-    onset = clampf_local(onset, CASC_ONSET_MIN_PCT, CASC_ONSET_MAX_PCT);
-    rt->learned_gate_gain_gps_per_pct = k;
-    rt->learned_flow_onset_gate_pct = onset;
-    rt->learned_gain_b = clampf_local(-k * onset, CASC_GAIN_B_MIN, CASC_GAIN_B_MAX);
-}
+    float k_obs = clampf_local(rate / span, CASC_GATE_GAIN_MIN, CASC_GATE_GAIN_MAX);
+    rt->learned_gate_gain_gps_per_pct =
+        ewma(rt->learned_gate_gain_gps_per_pct, k_obs, CASC_GAIN_K_ALPHA);
 
-// One RLS update from a steady observation (gate, rate).
-//   phi = [gate - REF, 1]^T,  theta = [K, c]^T,  y = rate
-//   L     = P phi / (lambda + phi^T P phi)
-//   theta = theta + L (y - phi^T theta)
-//   P     = (P - L phi^T P) / lambda      (bounded, see below)
-static void cascade_rls_update(filler_strategy_runtime_t *rt, float gate, float rate)
-{
-    if (!rt) return;
-    float k = rt->learned_gate_gain_gps_per_pct;
-    float c = k * CASC_RLS_GATE_REF + rt->learned_gain_b;   // intercept at REF
-    float phi0 = gate - CASC_RLS_GATE_REF;
-    float phi1 = 1.0f;
-
-    // P*phi
-    float pp0 = rt->rls_p11 * phi0 + rt->rls_p12 * phi1;
-    float pp1 = rt->rls_p12 * phi0 + rt->rls_p22 * phi1;
-    float denom = CASC_RLS_LAMBDA + phi0 * pp0 + phi1 * pp1;
-    if (denom < 1e-6f) return;
-
-    float l0 = pp0 / denom;
-    float l1 = pp1 / denom;
-    float err = rate - (k * phi0 + c);
-
-    k += l0 * err;
-    c += l1 * err;
-
-    // P <- (P - L (P phi)^T) / lambda, using symmetry.
-    float p11 = (rt->rls_p11 - l0 * pp0) / CASC_RLS_LAMBDA;
-    float p12 = (rt->rls_p12 - l0 * pp1) / CASC_RLS_LAMBDA;
-    float p22 = (rt->rls_p22 - l1 * pp1) / CASC_RLS_LAMBDA;
-
-    // Bound the covariance: with the gate confined to a narrow band the
-    // unexcited direction would otherwise wind up under forgetting until a
-    // single noisy observation could throw the parameters. Never let it exceed
-    // the initial uncertainty, and keep it positive definite.
-    rt->rls_p11 = clampf_local(p11, 1e-6f, CASC_RLS_P0_K);
-    rt->rls_p22 = clampf_local(p22, 1e-6f, CASC_RLS_P0_C);
-    float p12_max = 0.99f * sqrtf(rt->rls_p11 * rt->rls_p22);
-    rt->rls_p12 = clampf_local(p12, -p12_max, p12_max);
-
-    cascade_rls_project(rt, k, c);
+    // Slow onset refinement, only from points with good lever (well above onset)
+    // so a near-onset point's noise does not swing it.
+    float k_now = rt->learned_gate_gain_gps_per_pct;
+    if (k_now > CASC_GATE_GAIN_MIN && span > 2.0f * CASC_ONSET_MARGIN_PCT) {
+        float onset_obs = clampf_local(gate - rate / k_now, CASC_ONSET_MIN_PCT, CASC_ONSET_MAX_PCT);
+        rt->learned_flow_onset_gate_pct = ewma(rt->learned_flow_onset_gate_pct, onset_obs, CASC_ONSET_K_ALPHA);
+    }
+    rt->learned_gain_b = clampf_local(-k_now * rt->learned_flow_onset_gate_pct,
+                                      CASC_GAIN_B_MIN, CASC_GAIN_B_MAX);
 }
 
 static bool model_is_usable(const filler_strategy_runtime_t *rt)
@@ -698,10 +647,13 @@ static void cascade_gain_observe(filler_strategy_runtime_t *rt, float gate, floa
     }
     if (rate_ss <= CASC_FLOW_EPS_GPS) return;
 
-    // Log exactly what the fit consumed, so the offline scatter matches the fit.
+    // Latch the observation the estimator consumed. It is NOT cleared after
+    // logging (the previous impulse-then-clear was almost never caught by the
+    // telemetry sampler); instead gate_gain_count increments per observation, so
+    // offline a change in the count marks a new distinct observation.
     rt->gain_obs_gate_pct = gate;
     rt->gain_obs_rate_gps = rate_ss;
-    cascade_rls_update(rt, gate, rate_ss);
+    cascade_gain_update(rt, gate, rate_ss);
     if (rt->gate_gain_count < 65535) rt->gate_gain_count++;
 }
 
@@ -1051,7 +1003,7 @@ static void publish_runtime_snapshot(filler_strategy_runtime_t *rt, const filler
         .flow_onset_gate_pct = rt->learned_flow_onset_gate_pct,
         .gain_obs_gate_pct = rt->gain_obs_gate_pct,
         .gain_obs_rate_gps = rt->gain_obs_rate_gps,
-        .gain_rls_p_k = rt->rls_p11,
+        .gain_obs_count = (float)rt->gate_gain_count,
         .model_tau_s = rt->learned_model_tau_s,
         .control_rate_gps = rt->control_rate_gps,
         .refill_count = rt->refill_count,
@@ -1059,10 +1011,6 @@ static void publish_runtime_snapshot(filler_strategy_runtime_t *rt, const filler
     snprintf(s.strategy_name, sizeof(s.strategy_name), "%s", tick->strategy_name ? tick->strategy_name : "?");
     snprintf(s.gate_phase, sizeof(s.gate_phase), "%s", phase_name(runtime_phase(rt)));
     env->set_sample_telemetry(&s);
-    // The RLS observation is an impulse: clear it once logged so each input
-    // appears exactly once and can be scattered against the fitted line offline.
-    rt->gain_obs_gate_pct = 0.0f;
-    rt->gain_obs_rate_gps = 0.0f;
 }
 
 static void publish_summary_and_learn(filler_strategy_runtime_t *rt, const filler_strategy_env_t *env,
@@ -1113,9 +1061,6 @@ static void publish_summary_and_learn(filler_strategy_runtime_t *rt, const fille
             entry->gate_gain_gps_per_pct = rt->learned_gate_gain_gps_per_pct;
             entry->onset_gate_pct = rt->learned_flow_onset_gate_pct;
             entry->gain_b = rt->learned_gain_b;
-            entry->rls_p11 = rt->rls_p11;
-            entry->rls_p12 = rt->rls_p12;
-            entry->rls_p22 = rt->rls_p22;
         }
         entry->model_tau_s = clampf_local(rt->learned_model_tau_s, CASC_TAU_MIN_S, CASC_TAU_MAX_S);
         // finish_trim is signed: plain EWMA (no warmup, no prev<=0 shortcut).
@@ -1208,12 +1153,6 @@ static void cascade_on_enter(filler_strategy_runtime_t *rt, filler_state_t state
             rt->learned_gate_gain_gps_per_pct = entry->gate_gain_gps_per_pct;
             rt->learned_gain_b = entry->gain_b;
             rt->learned_flow_onset_gate_pct = entry->onset_gate_pct;
-            // Restore the RLS covariance so identification CONTINUES across
-            // fills rather than restarting maximally uncertain on every jar.
-            rt->rls_p11 = entry->rls_p11;
-            rt->rls_p12 = entry->rls_p12;
-            rt->rls_p22 = entry->rls_p22;
-            if (rt->rls_p11 <= 0.0f || rt->rls_p22 <= 0.0f) cascade_rls_reset_cov(rt);
             rt->learned_model_tau_s = (entry->model_tau_s > CASC_TAU_MIN_S)
                                           ? entry->model_tau_s : CASC_MODEL_TAU_S;
             rt->learned_finish_trim_g = entry->finish_trim_g;

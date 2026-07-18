@@ -67,20 +67,12 @@ typedef struct {
     float learned_slow_rate_gps;
     // Cascade affine plant model  rate = K*gate + b  (learned_gate_gain = slope
     // K [g/s per %], learned_gain_b = offset [g/s], typically <0 for the flow
-    // onset). K,b are identified online by RLS over the steady (gate, rate)
-    // observations the controller happens to produce.
+    // onset). K is a single LOCAL gain learned by EWMA of rate/(gate-onset) over
+    // steady observations; onset is a slow near-constant; b = -K*onset.
     float learned_gate_gain_gps_per_pct;   // slope K
     float learned_gain_b;                  // offset b
     float learned_flow_onset_gate_pct;     // flow-onset gate ("dead angle"); b = -K*onset
-    // Recursive-least-squares state for the affine fit. Regressed in centered
-    // form  rate = K*(gate - REF) + c  (decorrelates slope/intercept and keeps
-    // the 2x2 covariance well conditioned); b = c - K*REF. P is the symmetric
-    // parameter covariance [p11 p12; p12 p22] over (K, c) -- p11 doubles as the
-    // slope-confidence signal in telemetry.
-    float rls_p11;
-    float rls_p12;
-    float rls_p22;
-    float gain_obs_gate_pct;               // last steady observation fed to the fit
+    float gain_obs_gate_pct;               // last steady observation fed to the estimator
     float gain_obs_rate_gps;
     float learned_model_tau_s;             // FOPDT lag behind the dead time
     float learned_finish_trim_g;

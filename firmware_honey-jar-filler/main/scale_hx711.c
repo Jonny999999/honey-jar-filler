@@ -433,7 +433,7 @@ static bool scale_publish_telemetry_sample(int64_t ts_us, float weight_g)
         rec.flow_onset_gate_pct = strategy_sample.flow_onset_gate_pct;
         rec.gain_obs_gate_pct = strategy_sample.gain_obs_gate_pct;
         rec.gain_obs_rate_gps = strategy_sample.gain_obs_rate_gps;
-        rec.gain_rls_p_k = strategy_sample.gain_rls_p_k;
+        rec.gain_obs_count = strategy_sample.gain_obs_count;
         rec.model_tau_s = strategy_sample.model_tau_s;
         rec.control_rate_gps = strategy_sample.control_rate_gps;
         rec.refill_count = strategy_sample.refill_count;
