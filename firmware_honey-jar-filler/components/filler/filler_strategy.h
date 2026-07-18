@@ -75,6 +75,12 @@ typedef struct {
     float gain_obs_gate_pct;               // last steady observation fed to the estimator
     float gain_obs_rate_gps;
     float learned_model_tau_s;             // FOPDT lag behind the dead time
+    // Identification probe: a deliberate constant-gate hold to guarantee one
+    // clean steady observation when the loop never settles on its own.
+    bool probe_pending;                    // this fill should probe once flow starts
+    bool probe_active;                     // currently holding the probe gate
+    int64_t probe_end_us;
+    float probe_gate_pct;
     float learned_finish_trim_g;
     float learned_fast_start_gate_pct;
     float learned_slow_start_gate_pct;

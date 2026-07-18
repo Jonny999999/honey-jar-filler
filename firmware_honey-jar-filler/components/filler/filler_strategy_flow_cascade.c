@@ -192,6 +192,24 @@
 // across many observations instead.
 #define CASC_GAIN_MIN_WINDOW_S 0.8f
 
+// Identification probe ("Beharrungsversuch"). Passively waiting for a steady
+// dwell does not work: in a hunting loop the gate rarely holds still for
+// dead_time + a window (the 2026-07-18 run produced 3 observations in 17 fills),
+// so K/onset/tau never leave their seeds. Instead, DELIBERATELY hold the gate
+// constant at a safe level for long enough to harvest one clean observation,
+// with the rate controller frozen -- only the hard-rate safety limiter and the
+// close decision stay active. The existing dwell harvester then fires when the
+// hold releases. Runs on a preset's first fill (no data yet) and again after a
+// run of fills that failed to observe anything, so a settled controller pays no
+// probe cost.
+#define CASC_PROBE_GATE_FRAC 0.45f     // probe gate as a fraction of the ceiling
+#define CASC_PROBE_GATE_MIN_PCT 25.0f  // absolute safety clamp on the probe gate
+#define CASC_PROBE_GATE_MAX_PCT 55.0f
+#define CASC_PROBE_EXTRA_S 1.2f        // hold = dead_time + min window + this margin
+#define CASC_PROBE_MAX_S 4.0f
+#define CASC_PROBE_MIN_REMAINING_FRAC 0.45f  // only probe while >= this fraction of target remains
+#define CASC_PROBE_RETRY_FILLS 3u      // re-probe after this many fills with no observation
+
 // Flow-onset gate ("dead angle"): the gate % that must be opened before the
 // gaskets clear and ANY flow starts. It is a mechanical near-constant of the
 // valve (viscosity changes the slope K, not where flow begins), so learn it
@@ -249,6 +267,7 @@ typedef struct {
     float gain_b;                  // affine offset b [g/s] (flow onset, usually <0)
     float onset_gate_pct;          // flow-onset gate ("dead angle"); b = -K*onset
     float model_tau_s;             // FOPDT lag behind the dead time
+    uint16_t fills_without_obs;    // consecutive fills that harvested no observation
     float finish_trim_g;
     float drip_wait_ms;
 } cascade_learned_entry_t;
@@ -891,6 +910,58 @@ static void update_control_targets(filler_strategy_runtime_t *rt, const filler_s
     rt->control_rate_error_gps = rt->control_target_rate_gps - fb;
 }
 
+// Identification probe: hold the gate constant so the dwell harvester can take a
+// clean observation. Returns true while it is driving the gate (the caller then
+// skips the normal rate controller). Safety (hard-rate limiter, hard overfill)
+// and the close decision are handled BEFORE this in the FILL step, so freezing
+// the controller here cannot overfill.
+static bool cascade_identification_probe(filler_strategy_runtime_t *rt, const filler_strategy_env_t *env,
+                                         const filler_strategy_tick_t *tick, float remaining_g)
+{
+    if (!rt || !env || !tick) return false;
+    if (!rt->probe_pending && !rt->probe_active) return false;
+    if (rt->first_close_seen) { rt->probe_pending = false; rt->probe_active = false; return false; }
+    // Give up on the probe once too little mass remains for a safe fixed-gate
+    // hold (the fill is nearly done; let the controller finish it).
+    float min_remaining = (float)tick->params->target_grams * CASC_PROBE_MIN_REMAINING_FRAC;
+    if (remaining_g < min_remaining) {
+        rt->probe_pending = false;
+        rt->probe_active = false;
+        return false;
+    }
+    // Flow not established yet: keep the probe armed and let the normal opening
+    // gate get the medium moving first.
+    if (!rt->response_detected) return false;
+
+    if (!rt->probe_active) {
+        float ceil = clampf_local(rt->gate_ceiling_pct, 5.0f, 100.0f);
+        rt->probe_gate_pct = clampf_local(ceil * CASC_PROBE_GATE_FRAC,
+                                          CASC_PROBE_GATE_MIN_PCT, CASC_PROBE_GATE_MAX_PCT);
+        float hold_s = clampf_local(rt->learned_dead_time_s + CASC_GAIN_MIN_WINDOW_S + CASC_PROBE_EXTRA_S,
+                                    1.5f, CASC_PROBE_MAX_S);
+        rt->probe_active = true;
+        rt->probe_pending = false;
+        rt->probe_end_us = tick->now_us + (int64_t)(hold_s * 1000000.0f);
+        s_integ_pct = 0.0f;
+        cascade_command_gate(rt, env, rt->probe_gate_pct, "id_probe", tick->now_us, true);
+        ESP_LOGI(TAG, "identification probe: hold gate=%.1f%% for %.1f s (remaining=%.1f g)",
+                 (double)rt->probe_gate_pct, (double)hold_s, (double)remaining_g);
+        return true;
+    }
+
+    if (tick->now_us >= rt->probe_end_us) {
+        // Release: the dwell harvester takes the observation when the gate next
+        // moves (the controller resumes on the following tick).
+        rt->probe_active = false;
+        ESP_LOGI(TAG, "identification probe done: K=%.3f onset=%.1f%% (obs this fill=%u)",
+                 (double)rt->learned_gate_gain_gps_per_pct, (double)rt->learned_flow_onset_gate_pct,
+                 (unsigned)rt->gate_gain_count);
+        return false;
+    }
+    // Hold: gate already commanded, keep the controller off this tick.
+    return true;
+}
+
 // Inner loop: PI on the rate error with feedforward gate and anti-windup.
 static void cascade_run_controller(filler_strategy_runtime_t *rt, const filler_strategy_env_t *env,
                                    const filler_strategy_tick_t *tick, float remaining_g)
@@ -1053,10 +1124,8 @@ static void publish_summary_and_learn(filler_strategy_runtime_t *rt, const fille
         entry->post_close_gain_g = learn_ewma(entry->post_close_gain_g, rt->measured_post_close_gain_g, LEARN_ALPHA_POST_CLOSE, obs);
         entry->fast_rate_gps = learn_ewma(entry->fast_rate_gps, fast_avg, LEARN_ALPHA_RATE, obs);
         if (slow_avg > 0.0f) entry->slow_rate_gps = learn_ewma(entry->slow_rate_gps, slow_avg, LEARN_ALPHA_RATE, obs);
-        // Persist the RLS estimator (parameters AND covariance) verbatim. No
-        // EWMA on top: RLS already IS the recursive average, weighting each new
-        // observation by the confidence it has accumulated so far. Smoothing its
-        // output again would double-filter the estimate and stall convergence.
+        // Persist the local-gain estimate verbatim (the EWMA already IS the
+        // recursive average across observations; no second smoothing here).
         if (rt->gate_gain_count > 0) {
             entry->gate_gain_gps_per_pct = rt->learned_gate_gain_gps_per_pct;
             entry->onset_gate_pct = rt->learned_flow_onset_gate_pct;
@@ -1091,6 +1160,12 @@ static void publish_summary_and_learn(filler_strategy_runtime_t *rt, const fille
                  reason ? reason : "fault", success ? 1 : 0,
                  (double)rt->measured_dead_time_s, (double)rt->measured_post_close_gain_g, (double)fast_avg);
     }
+
+    // Track the observation drought that arms the identification probe: reset on
+    // any fill that harvested a steady observation, otherwise count up. Runs
+    // regardless of learning plausibility (an aborted fill still failed to ID).
+    if (rt->gate_gain_count > 0) entry->fills_without_obs = 0;
+    else if (entry->fills_without_obs < 65535) entry->fills_without_obs++;
 
     filler_strategy_fill_summary_t summary = {
         .valid = true,
@@ -1156,6 +1231,14 @@ static void cascade_on_enter(filler_strategy_runtime_t *rt, filler_state_t state
             rt->learned_model_tau_s = (entry->model_tau_s > CASC_TAU_MIN_S)
                                           ? entry->model_tau_s : CASC_MODEL_TAU_S;
             rt->learned_finish_trim_g = entry->finish_trim_g;
+            // Arm the identification probe when there is no data yet (first fill
+            // of this preset) or when several fills in a row failed to observe
+            // anything (a persistently hunting loop that never settles).
+            rt->probe_pending = (entry->gate_gain_gps_per_pct <= 0.0f) ||
+                                (rt->learned_gate_gain_gps_per_pct <= 0.0f) ||
+                                (entry->successful_fills == 0u) ||
+                                (entry->fills_without_obs >= CASC_PROBE_RETRY_FILLS);
+            rt->probe_active = false;
             if (!env->jar_tare_get || !env->jar_tare_get(&rt->run_base_weight_g)) {
                 rt->run_base_weight_g = tick->latest ? tick->latest->grams : 0.0f;
             }
@@ -1347,7 +1430,11 @@ static filler_state_t cascade_step(filler_strategy_runtime_t *rt, filler_state_t
             rt->gate_at_slow_entry_pct = rt->control_gate_cmd_pct;
         }
 
-        cascade_run_controller(rt, env, tick, remaining_g);
+        // Deliberate identification hold takes precedence over the rate loop
+        // (only when it is pending/active); otherwise run the normal controller.
+        if (!cascade_identification_probe(rt, env, tick, remaining_g)) {
+            cascade_run_controller(rt, env, tick, remaining_g);
+        }
         publish_runtime_snapshot(rt, env, tick);
         return state;
     }
