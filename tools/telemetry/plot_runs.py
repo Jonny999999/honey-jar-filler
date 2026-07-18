@@ -72,7 +72,7 @@ FIGURE_PROFILES = {
     "default": (8.67, 5.0),
     "narrow": (6.8, 4.65),
 }
-SESSION_SUMMARY_GROUP_ORDER = ["overview", "adaptive", "compare"]
+SESSION_SUMMARY_GROUP_ORDER = ["overview", "adaptive", "compare", "cascade"]
 PLAIN_PROFILE_SUFFIX = {
     "default": "wide",
     "narrow": "narrow",
@@ -132,7 +132,30 @@ SESSION_LINE_COLORS = {
     "next_fast_rate_gps": "#1e40af",
     "measured_slow_rate_gps": "#14b8a6",
     "next_slow_rate_gps": "#0f766e",
+    "used_gate_gain_gps_per_pct": "#b45309",
+    "next_gate_gain_gps_per_pct": "#f59e0b",
+    "used_onset_gate_pct": "#6d28d9",
+    "next_onset_gate_pct": "#a78bfa",
+    "used_model_tau_s": "#0e7490",
+    "next_model_tau_s": "#22d3ee",
 }
+
+# Cascade plant-model parameters for the per-fill (cross-run) learning chart.
+# "used_" is the value the fill actually ran with, "next_" the value learned by
+# the end of that fill -- the gap between them is the update that fill applied,
+# and the "next_" line across fills is the learning trend.
+CASCADE_SUMMARY_METRICS = [
+    ("used_gate_gain_gps_per_pct", "next_gate_gain_gps_per_pct",
+     "K [g/s pro %]", "Streckenverstärkung K̂ (lokal, EWMA)"),
+    ("used_onset_gate_pct", "next_onset_gate_pct",
+     "Totwinkel [%]", "Fluss-Einsatzpunkt (onset)"),
+    ("used_model_tau_s", "next_model_tau_s",
+     "tau [s]", "Zeitkonstante τ (FOPDT)"),
+    ("used_dead_time_s", "next_dead_time_s",
+     "Totzeit L [s]", "Totzeit L"),
+    ("used_post_close_gain_g", "next_post_close_gain_g",
+     "Nachlauf [g]", "Nachlaufmasse (post-close)"),
+]
 
 
 # Optional seam for drawing an extra layer on a finished fill figure, called
@@ -2098,6 +2121,163 @@ def _plot_session_compare(
     )
 
 
+def _plot_session_cascade_trend(
+    session_dir: Path,
+    entries: list[dict[str, Any]],
+    output_dir: Path,
+    formats: list[str],
+) -> list[Path]:
+    """Cross-run learning trend of the cascade plant-model parameters: one panel
+    per parameter, each showing the value the fill ran with ("used", solid) and
+    the value learned by the end of that fill ("next", dashed). This is the
+    "do the parameters actually converge across fills?" chart for the thesis."""
+    available = [
+        m for m in CASCADE_SUMMARY_METRICS
+        if _summary_series(entries, m[0])[0] or _summary_series(entries, m[1])[0]
+    ]
+    if not available:
+        return []
+
+    x_ticks = [int(entry["fill_id"]) for entry in entries]
+    fig, axes = plt.subplots(len(available), 1, sharex=True, figsize=(8.67, 2.05 * len(available) + 1.0))
+    axes_list = [axes] if len(available) == 1 else list(axes)
+    fig.suptitle("Sitzungsübersicht: gelernte Streckenparameter (Kaskade)", x=0.08, y=0.985,
+                 ha="left", fontsize=13, color="#0f172a")
+    fig.text(0.08, 0.955, _session_summary_subtitle(session_dir, entries), ha="left", va="top",
+             fontsize=9.2, color="#475569")
+
+    for ax, (used_field, next_field, ylabel, title) in zip(axes_list, available, strict=True):
+        _plot_compare_series(
+            ax, entries,
+            left_field=used_field, left_label="verwendet (used)",
+            left_color=SESSION_LINE_COLORS.get(used_field, "#b45309"),
+            right_field=next_field, right_label="gelernt (next)",
+            right_color=SESSION_LINE_COLORS.get(next_field, "#f59e0b"),
+            ylabel=ylabel, title=title,
+        )
+
+    _setup_session_axes(axes_list, x_ticks)
+    fig.tight_layout(rect=(0.06, 0.06, 0.98, 0.93))
+    return _export_session_figure(fig, output_dir, session_dir=session_dir,
+                                  suffix="session-cascade-params", formats=formats)
+
+
+def _plot_session_cascade_timeline(
+    session_dir: Path,
+    fill_runs: list[FillRun],
+    fill_records: dict[int, list[dict[str, Any]]],
+    output_dir: Path,
+    formats: list[str],
+) -> list[Path]:
+    """Continuous within-session timeline of the cascade parameters at per-sample
+    (sub-fill) resolution: shows the model adapting WITHIN each fill and across
+    fills, with fill boundaries marked and each steady observation flagged. This
+    is what reveals whether the estimator is actually being fed (observation
+    ticks) and how K/onset move when it is."""
+    ordered = sorted(fill_runs, key=lambda fr: fr.fill_id)
+    t: list[float] = []
+    K: list[float | None] = []
+    onset: list[float | None] = []
+    tau: list[float | None] = []
+    meas: list[float | None] = []
+    model: list[float | None] = []
+    target: list[float | None] = []
+    boundaries: list[tuple[float, int]] = []
+    obs_t: list[float] = []
+    obs_gate: list[float] = []
+    obs_rate: list[float] = []
+
+    clock = 0.0
+    t0_us: int | None = None
+    prev_obs_count: float | None = None
+    for fr in ordered:
+        samples = _sample_events(fill_records.get(fr.fill_id, []))
+        if not samples:
+            continue
+        if t0_us is None:
+            t0_us = _ts_us(samples[0])
+        start = (_ts_us(samples[0]) - t0_us) / 1e6
+        boundaries.append((start, fr.fill_id))
+        for rec in samples:
+            ts = (_ts_us(rec) - t0_us) / 1e6
+            t.append(ts)
+            K.append(_float_value(rec, "gate_gain_gps_per_pct"))
+            onset.append(_float_value(rec, "flow_onset_gate_pct"))
+            tau.append(_float_value(rec, "model_tau_s"))
+            meas.append(_float_value(rec, "control_rate_gps"))
+            model.append(_float_value(rec, "model_rate_gps"))
+            target.append(_float_value(rec, "target_rate_gps"))
+            count = _float_value(rec, "gain_obs_count")
+            g = _float_value(rec, "gain_obs_gate_pct")
+            r = _float_value(rec, "gain_obs_rate_gps")
+            if count is not None and prev_obs_count is not None and count > prev_obs_count and g and r:
+                obs_t.append(ts)
+                obs_gate.append(g)
+                obs_rate.append(r)
+            if count is not None:
+                prev_obs_count = count
+        clock = t[-1] if t else clock
+
+    if not t or all(v is None for v in K):
+        return []
+
+    fig, (axK, axT, axR) = plt.subplots(3, 1, sharex=True, figsize=(10.5, 7.4))
+    fig.suptitle("Sitzungsverlauf: Streckenmodell über die Zeit (Kaskade)", x=0.06, y=0.985,
+                 ha="left", fontsize=13, color="#0f172a")
+    fig.text(0.06, 0.955, f"Sitzung: {session_dir.name}", ha="left", va="top", fontsize=9.2, color="#475569")
+
+    def _mark_fills(ax: Any) -> None:
+        for bx, fid in boundaries:
+            ax.axvline(bx, color="#cbd5e1", linewidth=0.8, zorder=0)
+        top = ax.get_ylim()[1]
+        for bx, fid in boundaries:
+            ax.annotate(f"#{fid}", xy=(bx, top), xytext=(2, -2), textcoords="offset points",
+                        fontsize=7, color="#94a3b8", va="top")
+
+    # Panel 1: K on the left axis, onset on a twin axis, observation ticks.
+    axK.plot(t, K, color="#b45309", linewidth=1.7, label="K̂ [g/s pro %]")
+    axK.set_ylabel("K̂ [g/s pro %]", color="#b45309")
+    axK.tick_params(axis="y", labelcolor="#b45309")
+    axK_o = axK.twinx()
+    axK_o.plot(t, onset, color="#6d28d9", linewidth=1.4, linestyle="--", label="onset [%]")
+    axK_o.set_ylabel("Totwinkel onset [%]", color="#6d28d9")
+    axK_o.tick_params(axis="y", labelcolor="#6d28d9")
+    if obs_t:
+        axK.plot(obs_t, [K[min(range(len(t)), key=lambda i: abs(t[i] - ot))] for ot in obs_t],
+                 linestyle="none", marker="v", markersize=6, color="#dc2626",
+                 label=f"Beobachtung ({len(obs_t)})", zorder=5)
+    axK.set_title("Verstärkung K̂ und Totwinkel (Beobachtungen = rote Marker)", loc="left",
+                  fontsize=10.5, color="#0f172a")
+    _mark_fills(axK)
+    h1, l1 = axK.get_legend_handles_labels()
+    h2, l2 = axK_o.get_legend_handles_labels()
+    axK.legend(h1 + h2, l1 + l2, frameon=False, loc="upper right", ncol=3, fontsize=8)
+
+    # Panel 2: tau.
+    axT.plot(t, tau, color="#0e7490", linewidth=1.7)
+    axT.set_ylabel("τ [s]")
+    axT.set_title("Zeitkonstante τ (FOPDT)", loc="left", fontsize=10.5, color="#0f172a")
+    _mark_fills(axT)
+
+    # Panel 3: measured control rate vs model prediction vs target.
+    axR.plot(t, meas, color="#0f172a", linewidth=1.3, label="gemessen (control_rate)")
+    axR.plot(t, model, color="#2563eb", linewidth=1.3, linestyle="--", label="Modell ŷ")
+    axR.plot(t, target, color="#16a34a", linewidth=1.1, linestyle=":", label="Sollrate ṁ*")
+    axR.set_ylabel("Rate [g/s]")
+    axR.set_xlabel("Zeit in der Sitzung [s]")
+    axR.set_title("Ratenverfolgung: Modell ŷ vs. gemessen vs. Sollwert", loc="left",
+                  fontsize=10.5, color="#0f172a")
+    axR.legend(frameon=False, loc="upper right", ncol=3, fontsize=8)
+    _mark_fills(axR)
+
+    for ax in (axK, axT, axR):
+        ax.grid(True, axis="both", color="#e2e8f0", linewidth=0.6, alpha=0.6)
+        ax.set_axisbelow(True)
+    fig.tight_layout(rect=(0.04, 0.04, 0.98, 0.93))
+    return _export_session_figure(fig, output_dir, session_dir=session_dir,
+                                  suffix="session-cascade-timeline", formats=formats)
+
+
 def _plot_session_summaries(
     session_dir: Path,
     fill_runs: list[FillRun],
@@ -2119,6 +2299,9 @@ def _plot_session_summaries(
         exported.extend(_plot_session_adaptive(session_dir, entries, output_dir, formats))
     if "compare" in groups:
         exported.extend(_plot_session_compare(session_dir, entries, output_dir, formats))
+    if "cascade" in groups:
+        exported.extend(_plot_session_cascade_trend(session_dir, entries, output_dir, formats))
+        exported.extend(_plot_session_cascade_timeline(session_dir, fill_runs, fill_records, output_dir, formats))
     return exported, entries
 
 
