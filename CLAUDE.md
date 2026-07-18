@@ -86,19 +86,9 @@ that's what `b` captures, usually negative). Feedforward inverts it:
 `gate = (ṁ*−b)/K̂`. Don't reintroduce a gate-sweep / per-percent schedule — it
 can't be trained by this controller.
 
-**K̂,b are identified by RLS** (commit `6215bef`), not a two-point fit. The
-two-point version was structurally broken and its failure is worth not repeating:
-the "high" point was seeded at 60 % gate, the controller only visits ~12–37 %, and
-the bin boundary was the midpoint of the two points (45 %) → every observation
-fell in the low bin and the high point never left its seed. At the fixed point the
-algebra collapses to `K = rate_lo/(gate_lo − onset)` with `onset = gate − rate/K`
-from that *same* point: **two unknowns, one equation**, so the pair just drifted
-along the under-determined manifold. Now: RLS over every steady observation,
-regressed centered (`rate = K·(gate−REF) + c`) for conditioning, parameters **and
-covariance** persisted per preset (identification continues across fills), clamped
-with state projection to keep `b ≤ 0` / onset bounded, and `P` bounded so a narrow
-gate band can't wind up the unexcited direction. **Don't EWMA the RLS output** —
-RLS already *is* the recursive average.
+See the "Thin/sticky-medium tuning" block below for how K̂,b are identified now
+(a single local gain by EWMA, fed by a deliberate identification probe) and the
+full history of estimator models that were tried and reverted.
 
 **Thin/sticky-medium tuning (branch `testing`).** Hardware runs with water-thin
 fake honey exposed several issues the medium-honey tests never hit. Fixes, all in
@@ -109,16 +99,32 @@ fake honey exposed several issues the medium-honey tests never hit. Fixes, all i
   feedback loop (thin medium flows fast → learned as fast_rate → targeted → gate
   opens wider → …), diverging start gate 35→100 % and overfilling to 180 g. Only
   the *plant model* (K,b,L,post-close) is learned; the setpoint is a fixed ref.
-- **K identification: drip-averaged steady dwell, not instantaneous rate.** A
-  sticky medium drips in ~1 s bursts, so any short-window rate is noise. Only
-  measure a gate once HELD constant past dead-time, as delivered-mass ÷ dwell-time.
-  **One observation is harvested per dwell, at dwell END** (`6680bc0`) — the old
-  "fire every sample once the window ≥1.5 s" needed `dead_time + 1.5 s` of a still
-  gate, which the `23:10` run met **0–1× per fill**, and only ever on low-gate/
-  low-flow dwells (the gate only holds still when little is flowing) → K fitted
-  from the flattest part of the curve. ⚠️ The earlier claim "K settles ~0.5 ⇒
-  confirmed working" was **wrong**: an offline fit over that session gives
-  **K=1.42, b=−27.6, onset=19.5** — the firmware's K was **2.7× too low**.
+- **K identification is now a SINGLE LOCAL GAIN, learned by EWMA** (`0f8a623`),
+  not RLS. Full chain of failed models, do not reopen: scalar-through-origin →
+  6-point schedule → seed-anchored two-point → RLS. RLS diverged (`23:10`/`16:00`
+  runs: K pinned to a rail ≤0.03/≥3.0 in ~½ of samples) because it fits ONE
+  global affine line, but the plant is **nonlinear (rate saturates at high gate)
+  AND non-stationary (bucket head falls as it drains)** — an offline global fit
+  gives K=−0.13 (non-monotonic). The controller never needed a global map, only
+  the local gain: `K = EWMA(rate/(gate−onset))`, `b = −K·onset`, onset a slow
+  near-constant (timescale separation stops the pair going circular). One bounded
+  parameter from one bounded ratio → cannot diverge, tracks the falling-head
+  drift, each observation trivially verifiable. Offline replay glides 1.6→0.05,
+  no rails. Observations are still **drip-averaged over a steady dwell** (mass ÷
+  dwell time, harvested at dwell END).
+- **Identification probe (`8ff038f`) — the estimator was starved, not broken.**
+  In a hunting loop the gate rarely holds still for `dead_time + window`, so
+  `test2` got **3 observations in 17 fills** and K/onset/τ never left their seeds
+  (the accurate jars were ALL the close/drip heuristic). Fix = deliberate
+  excitation: once flow starts and while ≥45 % of target remains, **hold the gate
+  at a safe fixed level (0.45·ceiling, 25–55 %) for `dead_time+window+margin` with
+  the rate controller frozen** (safety limiter + close still run before it, so no
+  overfill). The existing dwell harvester then takes one clean observation on
+  release. Armed on a preset's first fill and re-armed after
+  `CASC_PROBE_RETRY_FILLS` (3) consecutive fills with no observation
+  (`entry.fills_without_obs`). Textbook Beharrungsversuch; also the thesis's
+  "excitation for identification" story. ⚠️ The old "K settles ~0.5 ⇒ working"
+  claim was **wrong** — offline truth for the thin dummy is **K≈1.4, onset≈19 %**.
 - **Flow-onset gate ("dead angle") is now a first-class learned near-constant.**
   It's the % the gaskets must clear before any flow (mechanical, ~viscosity-
   independent). Learned as `onset = gate − rate/K̂` (slow EWMA, per-preset), and
@@ -272,28 +278,33 @@ All strategies build clean. **Active work is on branch `testing`** — a scratch
 branch for iterative hardware tuning of the cascade, one small commit per test
 iteration, to be squash/merged to `dev` manually later.
 
-Latest (`ef28112`): the cascade **plant identification was reworked** after the
-`23:10` run was analysed and found to be fitting a 2.7×-wrong K̂ —
-`6680bc0` (harvest one observation per steady dwell, at dwell end),
-`6215bef` (RLS replaces the seed-anchored two-point fit; K floor relaxed),
-`ef28112` (learn τ, use it to de-bias observations, log the full learned model).
-Builds clean, **flash + retest pending**.
+Latest arc (all on `testing`, thin dummy medium): RLS identification was found to
+**diverge** (`16:00` run: K on a rail ~½ of samples) → replaced with a **single
+local gain** `K=EWMA(rate/(gate−onset))` (`0f8a623`). That was stable but
+**starved** (`20:23` test2: 3 observations in 17 fills, K/onset/τ frozen at seeds,
+jars accurate only via the close/drip heuristic) → added a deliberate
+**identification probe** (`8ff038f`, a fixed-gate hold to force a clean
+observation). Chart tool gained a **`cascade` session-summary group** (`plot_runs.py`
+`--session-summary-groups cascade`): cross-run `used_/next_` param trends +
+a within-session per-sample timeline with observation markers. Builds clean,
+**probe flash + retest pending**.
 
 **Next:**
-- Flash `ef28112`, rerun the thin dummy cascade fill, analyse with
-  `cascade_analyze.py` following the ordered checklist in "Known limitations"
-  (`n_obs`/`obs_gate_span` first, then K̂≈1.4 / onset≈19–20 % / `P_k` shrinking,
-  then τ, then the oscillation). Iterate on `testing`.
-- If `n_obs` is still small or `obs_gate_span` narrow, the blocker is
-  **excitation**, not the estimator: consider a short deliberate gate step early
-  in the fill (textbook step-response ID, and a good thesis story alongside the
-  RLS "rekursive Parameterschätzung" angle).
-- Re-tune the symptom-fighting constants (deadband 1.5, asymmetric slew 15/6)
-  once K̂ is right — they were tuned against a broken model.
-- Then: collect representative thesis charts (esp. the adaptive learning trend and
-  now the cascade parameter-evolution trends from the new `used_/next_` summary
-  fields), and fill in thesis skeletons `10_regelungsbasierter` /
-  `11_strategievergleich` + LaTeX control equations to match the drawio diagrams.
+- Flash `8ff038f`, rerun the thin dummy cascade fill (keep the bucket topped up so
+  the plant is stationary). Verify with `cascade_analyze.py` **and** the new
+  `plot_runs.py … --session-summary-groups cascade` charts: the probe should now
+  produce ≥1 observation per early fill, K̂ should climb off the 0.36 seed toward
+  ~0.8–1.4 (thin dummy) and onset toward ~17–19 %, and the timeline's model ŷ
+  should start tracking the measured rate.
+- If K̂ moves but the loop still hunts, the seed K̂ (0.36) is ~2× low → **seed it
+  higher** so the first-fill feedforward doesn't over-open. Then re-tune the
+  symptom-fighting constants (deadband 1.5, asymmetric slew 15/6), which were set
+  against a broken model.
+- τ still tends to sit at its 0.60 s seed (needs a clean opening dwell — the probe
+  should now supply one); check whether it moves, else simplify τ too.
+- Then: collect thesis charts (adaptive learning trend + the cascade
+  parameter-evolution trend/timeline) and fill in skeletons `10_regelungsbasierter`
+  / `11_strategievergleich` + LaTeX control equations matching the drawio diagrams.
 
 **Uncommitted (host side, was noted earlier):** `plot_runs.py` `_plot_control_panel`
 (rate error / prediction error / PI integrator) written but NOT wired into the
