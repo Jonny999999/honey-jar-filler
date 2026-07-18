@@ -50,7 +50,7 @@ HELP_TITLE = "\x1b[38;5;230m"
 HELP_LABEL = "\x1b[38;5;153m"
 HELP_VALUE = "\x1b[38;5;120m"
 HELP_DIM = "\x1b[38;5;250m"
-LIVE_STATUS_HEADER_LINES = 3
+LIVE_STATUS_HEADER_LINES = 4
 WEIGHT_PLOT_HEIGHT = 8
 # Always leave at least this many rows for the scrolling log area above the
 # sticky footer. Without this the fixed-height footer fills a short terminal and
@@ -105,6 +105,11 @@ class LiveStatus:
     weight_g: float = 0.0
     relative_fill_g: float = 0.0
     gate_pct: float = 0.0
+    # Cascade learned plant model (only present in flow-cascade telemetry).
+    gate_gain: float | None = None
+    onset_pct: float | None = None
+    model_tau_s: float | None = None
+    obs_count: float | None = None
     last_sample_ts_us: int | None = None
 
 
@@ -603,6 +608,13 @@ def main() -> int:
                     f"{status_fmt_key('slot=')}{status_fmt_value(str(live.slot_idx))} "
                     f"{status_fmt_key('end=')}{status_fmt_value(live.last_end_reason[:12], dim=(live.last_end_reason == '-'))}"
                 ),
+                (
+                    f"{status_fmt_key('[model]')} "
+                    f"{status_fmt_key('K=')}{status_fmt_value(f'{live.gate_gain:.2f}' if live.gate_gain is not None else '-', accent=True)} g/s/% "
+                    f"{status_fmt_key('onset=')}{status_fmt_value(f'{live.onset_pct:.1f}%' if live.onset_pct is not None else '-')} "
+                    f"{status_fmt_key('tau=')}{status_fmt_value(f'{live.model_tau_s:.2f}s' if live.model_tau_s is not None else '-', accent=True)} "
+                    f"{status_fmt_key('obs=')}{status_fmt_value(f'{int(live.obs_count)}' if live.obs_count is not None else '-')}"
+                ),
             ][:visible_headers]
             + plot_lines,
             footer_top=scroll_bottom + 1,
@@ -744,6 +756,15 @@ def main() -> int:
             history.append(status.relative_fill_g)
         if isinstance(gate_pct, (int, float)):
             status.gate_pct = float(gate_pct)
+        for attr, key in (
+            ("gate_gain", "gate_gain_gps_per_pct"),
+            ("onset_pct", "flow_onset_gate_pct"),
+            ("model_tau_s", "model_tau_s"),
+            ("obs_count", "gain_obs_count"),
+        ):
+            val = record.get(key)
+            if isinstance(val, (int, float)):
+                setattr(status, attr, float(val))
         if isinstance(ts_us, int):
             status.last_sample_ts_us = ts_us
 
