@@ -92,20 +92,27 @@
 // Cascade controller. Deliberately gentle: the feedforward gate carries the
 // operating point, so the PI only trims. Updates are paced by the dead time so
 // the loop never reacts faster than the plant can answer.
-#define CASC_KP_PCT_PER_GPS 1.2f
+// Gentle by design: the model feedforward gate = (m*-b)/K already places the
+// gate at the right operating point, so the PI only trims. With K now well
+// identified, a hard Kp just amplifies the drippy, noisy rate feedback into a
+// gate that swings +/-12 % around the (correct) feedforward point -- measured on
+// the 22:25 run, where the integrator stayed calm (8 %) but the gate hunted 16->40 %.
+// Halve Kp so the loop leans on the feedforward and only nudges.
+#define CASC_KP_PCT_PER_GPS 0.6f
 #define CASC_KI_PCT_PER_GPS_S 0.40f
+// Symmetric, gentle slew. The old asymmetric "slam down 15 %, crawl up 6 %" was
+// the direct cause of the observed limit cycle: an over-reading drip burst drove
+// the gate down 15 % to the flow-onset floor (flow stopped), then it could only
+// crawl back up 6 %/update across the dead time (flow stayed stalled), then
+// overshot again. Equal, moderate steps let it back off without stalling.
 #define CASC_STEP_MAX_PCT 6.0f
-// Closing is rate-limited less aggressively than opening: when the actual rate
-// is well above the setpoint the gate should back off decisively (over-dosing
-// is the failure that ruins a jar), while opening stays gentle so the loop does
-// not surge into an overshoot. Asymmetric slew = "the more it is above, the
-// more it closes" without letting it lunge open by the same amount.
-#define CASC_STEP_MAX_DOWN_PCT 15.0f
+#define CASC_STEP_MAX_DOWN_PCT 6.0f
 #define CASC_INTEG_LIMIT_PCT 35.0f
 // A dripping medium cannot be regulated to fractions of a g/s; a tight deadband
 // just makes the loop twitch on drip-to-drip residue. Hold the gate unless the
-// averaged rate error is clearly outside this band.
-#define CASC_DEADBAND_GPS 1.5f
+// averaged rate error is clearly outside this band. ~2 g/s is ~10 % of a typical
+// bulk setpoint here and keeps the gate still through normal drip scatter.
+#define CASC_DEADBAND_GPS 2.0f
 #define CASC_HOLDOFF_MIN_MS 300.0f
 #define CASC_HOLDOFF_MAX_MS 2500.0f
 
@@ -177,7 +184,6 @@
 // from the telemetry. Timescale separation (K fast, onset slow) is what keeps
 // the pair from going circular the way the old joint two-point fit did.
 #define CASC_GAIN_K_ALPHA 0.30f       // per-observation EWMA for K
-#define CASC_ONSET_K_ALPHA 0.06f      // much slower: onset is a near-constant
 // Drip-robust gain identification: a thin/sticky medium releases in discrete
 // drops at low gate, so no instantaneous rate is meaningful. Only measure a
 // gate's flow once it has been HELD constant past the dead time, then as the
@@ -212,14 +218,13 @@
 
 // Flow-onset gate ("dead angle"): the gate % that must be opened before the
 // gaskets clear and ANY flow starts. It is a mechanical near-constant of the
-// valve (viscosity changes the slope K, not where flow begins), so learn it
-// slowly from steady flowing points (onset = gate - rate/K) and anchor the
-// affine offset to it: b = -K*onset. The controller then never commands below
-// onset + margin while it still needs flow, so a transient over-reaction cannot
-// dip the gate into the no-flow region and stall the loop.
-#define CASC_ONSET_SEED_PCT 16.0f   // realistic dead-angle seed (manual sweep ~17-20 %)
-#define CASC_ONSET_MIN_PCT 2.0f
-#define CASC_ONSET_MAX_PCT 40.0f
+// valve (viscosity changes the slope K, not where flow begins). It is a FIXED,
+// hand-calibrated constant, not learned -- it cannot be identified from steady
+// flow (see cascade_gain_update); a proper onset ID would slowly ramp the gate
+// and detect flow start/stop (future work). b = -K*onset, and the controller
+// never commands below onset + margin while it still needs flow, so a transient
+// over-reaction cannot dip the gate into the no-flow region and stall the loop.
+#define CASC_ONSET_SEED_PCT 16.0f   // hand-measured dead angle for this valve
 #define CASC_ONSET_MARGIN_PCT 2.0f
 #define CASC_FLOW_EPS_GPS 1.0f
 
@@ -518,36 +523,33 @@ static float gate_of_rate(float k, float b, float target_rate)
 
 // One local-gain update from a steady observation (gate, rate). Given the
 // current onset, the observation determines K directly: K_obs = rate/(gate-onset)
-// (a single bounded number, so the EWMA of it cannot diverge). The onset is then
-// nudged on a much slower timescale from the same point (onset = gate - rate/K),
-// so over the fast K-timescale it is effectively constant and the pair does not
-// go circular. b = -K*onset keeps the affine form the feedforward/Smith use.
+// (a single bounded number, so the EWMA of it cannot diverge).
+//
+// The onset is NOT learned here. It cannot be, from a steady point: given K,
+// `gate - rate/K` just re-derives where the fitted line crosses zero, so it
+// carries no independent information about the real flow-start gate and only
+// added a spurious degree of freedom (it drifted up to 19 % on the draining
+// fills, dragging K with it). The dead angle is a threshold-crossing that can
+// only be measured by slowly opening/closing the gate and watching flow
+// start/stop -- a separate identification, noted as future work. For now onset
+// is a fixed, hand-calibrated constant (CASC_ONSET_SEED_PCT, ~16 % measured),
+// and b = -K*onset. So one observation cleanly determines just K.
 static void cascade_gain_update(filler_strategy_runtime_t *rt, float gate, float rate)
 {
     if (!rt) return;
-    float onset = rt->learned_flow_onset_gate_pct;
-    float span = gate - onset;
+    float span = gate - rt->learned_flow_onset_gate_pct;
     if (span < CASC_ONSET_MARGIN_PCT) return;   // too close to onset: K ill-conditioned
 
     float k_before = rt->learned_gate_gain_gps_per_pct;
-    float onset_before = rt->learned_flow_onset_gate_pct;
     float k_obs = clampf_local(rate / span, CASC_GATE_GAIN_MIN, CASC_GATE_GAIN_MAX);
     rt->learned_gate_gain_gps_per_pct = ewma(k_before, k_obs, CASC_GAIN_K_ALPHA);
-
-    // Slow onset refinement, only from points with good lever (well above onset)
-    // so a near-onset point's noise does not swing it.
-    float k_now = rt->learned_gate_gain_gps_per_pct;
-    if (k_now > CASC_GATE_GAIN_MIN && span > 2.0f * CASC_ONSET_MARGIN_PCT) {
-        float onset_obs = clampf_local(gate - rate / k_now, CASC_ONSET_MIN_PCT, CASC_ONSET_MAX_PCT);
-        rt->learned_flow_onset_gate_pct = ewma(rt->learned_flow_onset_gate_pct, onset_obs, CASC_ONSET_K_ALPHA);
-    }
-    rt->learned_gain_b = clampf_local(-k_now * rt->learned_flow_onset_gate_pct,
+    rt->learned_gain_b = clampf_local(-rt->learned_gate_gain_gps_per_pct * rt->learned_flow_onset_gate_pct,
                                       CASC_GAIN_B_MIN, CASC_GAIN_B_MAX);
     // Visible in the live console: one line per steady observation consumed.
-    ESP_LOGW(TAG, "LEARN K: obs gate=%.1f%% rate=%.1f g/s (K_obs=%.2f) -> K %.2f->%.2f onset %.1f->%.1f%%",
+    ESP_LOGW(TAG, "LEARN K: obs gate=%.1f%% rate=%.1f g/s (K_obs=%.2f) -> K %.2f->%.2f (onset fixed %.1f%%)",
              (double)gate, (double)rate, (double)k_obs, (double)k_before,
              (double)rt->learned_gate_gain_gps_per_pct,
-             (double)onset_before, (double)rt->learned_flow_onset_gate_pct);
+             (double)rt->learned_flow_onset_gate_pct);
 }
 
 static bool model_is_usable(const filler_strategy_runtime_t *rt)
