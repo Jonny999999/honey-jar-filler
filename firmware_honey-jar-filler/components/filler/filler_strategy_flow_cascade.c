@@ -217,7 +217,7 @@
 // affine offset to it: b = -K*onset. The controller then never commands below
 // onset + margin while it still needs flow, so a transient over-reaction cannot
 // dip the gate into the no-flow region and stall the loop.
-#define CASC_ONSET_SEED_PCT 10.0f
+#define CASC_ONSET_SEED_PCT 16.0f   // realistic dead-angle seed (manual sweep ~17-20 %)
 #define CASC_ONSET_MIN_PCT 2.0f
 #define CASC_ONSET_MAX_PCT 40.0f
 #define CASC_ONSET_MARGIN_PCT 2.0f
@@ -235,15 +235,15 @@
 // At tau=0.6 s a T=1.0 s window reads only 51 % of the true new rate. Without
 // the correction every short dwell under-reports its rate, which flattens the
 // identified slope. The learned tau is what makes the correction possible.
-#define CASC_MODEL_TAU_S 0.60f
+#define CASC_MODEL_TAU_S 0.20f   // seed: this plant reacts fast once the dead time passes
 #define CASC_TAU_MIN_S 0.05f
-#define CASC_TAU_MAX_S 3.00f
+#define CASC_TAU_MAX_S 1.20f   // no medium here rises slower than this
 // tau is estimated from the fill's OPENING dwell (the one step where the rate
 // provably starts from zero): compare the whole-window average against the rate
 // over the settled tail, tau ~ (1 - avg/r_tail)*T. Needs a tail that is actually
 // settled, hence a minimum window.
 #define CASC_TAU_TAIL_S 1.00f
-#define CASC_TAU_MIN_WINDOW_S 1.40f
+#define CASC_TAU_MIN_WINDOW_S 1.00f  // the probe hold easily clears this
 #define LEARN_ALPHA_TAU 0.30f
 // Reject an observation whose window is too short relative to tau: the de-bias
 // divides by (1-B), so a large B amplifies measurement noise without limit.
@@ -529,9 +529,10 @@ static void cascade_gain_update(filler_strategy_runtime_t *rt, float gate, float
     float span = gate - onset;
     if (span < CASC_ONSET_MARGIN_PCT) return;   // too close to onset: K ill-conditioned
 
+    float k_before = rt->learned_gate_gain_gps_per_pct;
+    float onset_before = rt->learned_flow_onset_gate_pct;
     float k_obs = clampf_local(rate / span, CASC_GATE_GAIN_MIN, CASC_GATE_GAIN_MAX);
-    rt->learned_gate_gain_gps_per_pct =
-        ewma(rt->learned_gate_gain_gps_per_pct, k_obs, CASC_GAIN_K_ALPHA);
+    rt->learned_gate_gain_gps_per_pct = ewma(k_before, k_obs, CASC_GAIN_K_ALPHA);
 
     // Slow onset refinement, only from points with good lever (well above onset)
     // so a near-onset point's noise does not swing it.
@@ -542,6 +543,11 @@ static void cascade_gain_update(filler_strategy_runtime_t *rt, float gate, float
     }
     rt->learned_gain_b = clampf_local(-k_now * rt->learned_flow_onset_gate_pct,
                                       CASC_GAIN_B_MIN, CASC_GAIN_B_MAX);
+    // Visible in the live console: one line per steady observation consumed.
+    ESP_LOGW(TAG, "LEARN K: obs gate=%.1f%% rate=%.1f g/s (K_obs=%.2f) -> K %.2f->%.2f onset %.1f->%.1f%%",
+             (double)gate, (double)rate, (double)k_obs, (double)k_before,
+             (double)rt->learned_gate_gain_gps_per_pct,
+             (double)onset_before, (double)rt->learned_flow_onset_gate_pct);
 }
 
 static bool model_is_usable(const filler_strategy_runtime_t *rt)
@@ -691,8 +697,12 @@ static void cascade_learn_tau(filler_strategy_runtime_t *rt, float rel_g, int64_
     float r_tail = (rel_g - s_gain_tail_rel_g) / tail_s;
     if (r_tail <= CASC_FLOW_EPS_GPS || avg_rate >= r_tail) return;
     float tau_est = clampf_local((1.0f - avg_rate / r_tail) * win_s, CASC_TAU_MIN_S, CASC_TAU_MAX_S);
-    rt->learned_model_tau_s = ewma(rt->learned_model_tau_s, tau_est, LEARN_ALPHA_TAU);
+    float tau_before = rt->learned_model_tau_s;
+    rt->learned_model_tau_s = ewma(tau_before, tau_est, LEARN_ALPHA_TAU);
     rt->learned_model_tau_s = clampf_local(rt->learned_model_tau_s, CASC_TAU_MIN_S, CASC_TAU_MAX_S);
+    ESP_LOGW(TAG, "LEARN tau: opening rise avg=%.1f tail=%.1f g/s over %.2f s (tau_est=%.2f) -> tau %.2f->%.2f s",
+             (double)avg_rate, (double)r_tail, (double)win_s, (double)tau_est,
+             (double)tau_before, (double)rt->learned_model_tau_s);
 }
 
 // Steady-dwell tracker. A gate is only informative once it has been HELD past
@@ -1244,12 +1254,22 @@ static void cascade_on_enter(filler_strategy_runtime_t *rt, filler_state_t state
             }
             rt->adapted_drip_wait_ms = entry->drip_wait_ms;
             rt->gate_ceiling_pct = gate_ceiling_for_entry(entry, tick->params);
-            // Start at the feedforward gate for the initial (decoupled) fast
-            // setpoint by inverting the learned affine model.
-            rt->control_gate_cmd_pct = clampf_local(
-                gate_of_rate(rt->learned_gate_gain_gps_per_pct, rt->learned_gain_b,
-                             desired_fast_rate_gps(tick->params)),
-                0.0f, rt->gate_ceiling_pct);
+            if (rt->probe_pending) {
+                // Open DIRECTLY at the probe gate so the probe hold is also the
+                // fill's opening step: the rate rises from zero at a constant
+                // gate, which is the one clean measurement tau needs (and a solid
+                // K observation). Precomputed here so the probe just holds it.
+                rt->probe_gate_pct = clampf_local(rt->gate_ceiling_pct * CASC_PROBE_GATE_FRAC,
+                                                  CASC_PROBE_GATE_MIN_PCT, CASC_PROBE_GATE_MAX_PCT);
+                rt->control_gate_cmd_pct = rt->probe_gate_pct;
+            } else {
+                // Start at the feedforward gate for the initial (decoupled) fast
+                // setpoint by inverting the learned affine model.
+                rt->control_gate_cmd_pct = clampf_local(
+                    gate_of_rate(rt->learned_gate_gain_gps_per_pct, rt->learned_gain_b,
+                                 desired_fast_rate_gps(tick->params)),
+                    0.0f, rt->gate_ceiling_pct);
+            }
             log_learned_entry("starting cascade fill with", tick->preset_index, entry);
             ESP_LOGI(TAG, "gate ceiling=%.1f%% (preset max=%u%%, successful_fills=%lu)",
                      (double)rt->gate_ceiling_pct, (unsigned)tick->params->max_gate_pct,
