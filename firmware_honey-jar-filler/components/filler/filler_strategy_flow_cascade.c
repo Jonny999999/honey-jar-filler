@@ -122,10 +122,15 @@
 // fixed fraction of the fast rate (see profile_target_rate_gps) rather than the
 // learned slow rate, which collapses toward the fast rate when a continuous
 // profile never produces a distinct slow phase.
-#define CASC_DECEL_BAND_MIN_G 20.0f
+#define CASC_DECEL_BAND_MIN_G 28.0f
 #define CASC_DECEL_BAND_MULT 1.6f
 #define CASC_RATE_MIN_FLOOR_GPS 3.0f
 #define CASC_TERMINAL_RATE_FRAC 0.25f
+// Reach the terminal rate this many grams BEFORE the close threshold, so the
+// profile actually sits at the constant terminal rate for a visible stretch
+// before closing (textbook fast -> linear ramp -> constant terminal -> close),
+// instead of still ramping down when the close fires.
+#define CASC_TERMINAL_HOLD_G 10.0f
 
 // Bulk-phase setpoint (the profile's fast rate) is a CHOSEN, controllable
 // trajectory derived from the jar size, NOT the learned achievable rate. Using
@@ -561,12 +566,16 @@ static bool model_is_usable(const filler_strategy_runtime_t *rt)
 }
 
 // Update the delay-free plant model ŷ and the delayed model output ŷ_d from the
-// current gate command. Runs every new weight sample.
+// current gate command. Runs every new weight sample, INCLUDING after the close
+// (with the gate forced to 0) so the prediction keeps simulating the post-close
+// decay to zero instead of freezing at its last value.
 static void cascade_update_model(filler_strategy_runtime_t *rt, float dt_s)
 {
     if (!rt || dt_s <= 0.0f) return;
     // Steady-state model rate from the learned affine model  rate = K*gate + b.
-    float ss = rate_of_gate(rt->learned_gate_gain_gps_per_pct, rt->learned_gain_b, rt->control_gate_cmd_pct);
+    // After the close the commanded gate is 0, so the model relaxes toward 0.
+    float gate = rt->first_close_seen ? 0.0f : rt->control_gate_cmd_pct;
+    float ss = rate_of_gate(rt->learned_gate_gain_gps_per_pct, rt->learned_gain_b, gate);
     float tau = (rt->learned_model_tau_s > CASC_TAU_MIN_S) ? rt->learned_model_tau_s : CASC_MODEL_TAU_S;
     float a = clampf_local(dt_s / tau, 0.0f, 1.0f);
     s_model_rate_gps += a * (ss - s_model_rate_gps);
@@ -809,7 +818,9 @@ static void update_rate_estimates(filler_strategy_runtime_t *rt, const filler_st
             // cascade_gain_track_dwell).
             cascade_gain_track_dwell(rt, rt->control_gate_cmd_pct, rel_g, tick->latest->ts_us);
 
-            if (!rt->first_close_seen) cascade_update_model(rt, dt_s);
+            // Keep simulating after the close too (gate forced to 0 inside), so
+            // the predicted rate decays to zero instead of freezing in the chart.
+            cascade_update_model(rt, dt_s);
         }
     }
 
@@ -905,7 +916,10 @@ static float profile_target_rate_gps(const filler_strategy_runtime_t *rt, const 
 
     float band = fmaxf(CASC_DECEL_BAND_MIN_G, rt->learned_post_close_gain_g * CASC_DECEL_BAND_MULT +
                                               rt->learned_dead_time_s * fast);
-    float frac = clampf_local(eff_remaining / band, 0.0f, 1.0f);
+    // Ramp reaches terminal CASC_TERMINAL_HOLD_G before eff_remaining hits zero,
+    // so there is a constant-terminal plateau before the close, and the ramp
+    // therefore also begins that much earlier.
+    float frac = clampf_local((eff_remaining - CASC_TERMINAL_HOLD_G) / band, 0.0f, 1.0f);
     return terminal + (fast - terminal) * frac;
 }
 
