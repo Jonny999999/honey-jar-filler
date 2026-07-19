@@ -323,6 +323,14 @@ static void filler_publish_fill_summary(uint32_t run_id,
     rec.fill_duration_s = summary->fill_duration_s;
     rec.adapted_drip_wait_ms = summary->drip_wait_used_ms;
     rec.refill_count = summary->refill_count;
+    rec.used_gate_gain_gps_per_pct = summary->used_gate_gain_gps_per_pct;
+    rec.used_gain_b_gps = summary->used_gain_b_gps;
+    rec.used_onset_gate_pct = summary->used_onset_gate_pct;
+    rec.used_model_tau_s = summary->used_model_tau_s;
+    rec.next_gate_gain_gps_per_pct = summary->next_gate_gain_gps_per_pct;
+    rec.next_gain_b_gps = summary->next_gain_b_gps;
+    rec.next_onset_gate_pct = summary->next_onset_gate_pct;
+    rec.next_model_tau_s = summary->next_model_tau_s;
     rec.used_dead_time_s = summary->used_dead_time_s;
     rec.used_post_close_gain_g = summary->used_post_close_gain_g;
     rec.used_fast_rate_gps = summary->used_fast_rate_gps;

@@ -67,7 +67,17 @@ typedef struct {
     float model_rate_gps;          // ŷ  delay-free model rate
     float model_delayed_gps;       // ŷ_d model rate through the dead time
     float control_integ_pct;       // PI integrator state
-    float gate_gain_gps_per_pct;   // K̂  identified plant gain
+    float gate_gain_gps_per_pct;   // K̂  affine slope K
+    // Affine plant-model identification detail (cascade), verifiable offline:
+    // the offset, the flow-onset gate, the last steady observation the estimator
+    // consumed (held, not cleared), and how many it has integrated.
+    float gain_offset_b_gps;       // b  affine offset [g/s]
+    float flow_onset_gate_pct;     // onset ("dead angle"); b = -K*onset
+    float gain_obs_gate_pct;       // last steady observation (gate, rate)
+    float gain_obs_rate_gps;       // held; a change in gain_obs_count marks a new one
+    float gain_obs_count;          // # steady observations K has integrated (confidence)
+    float model_tau_s;             // learned FOPDT lag used by the Smith model
+    float control_rate_gps;        // windowed rate used as the control feedback
     uint32_t refill_count;
 } filler_strategy_sample_telemetry_t;
 

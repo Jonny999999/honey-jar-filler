@@ -429,6 +429,13 @@ static bool scale_publish_telemetry_sample(int64_t ts_us, float weight_g)
         rec.model_delayed_gps = strategy_sample.model_delayed_gps;
         rec.control_integ_pct = strategy_sample.control_integ_pct;
         rec.gate_gain_gps_per_pct = strategy_sample.gate_gain_gps_per_pct;
+        rec.gain_offset_b_gps = strategy_sample.gain_offset_b_gps;
+        rec.flow_onset_gate_pct = strategy_sample.flow_onset_gate_pct;
+        rec.gain_obs_gate_pct = strategy_sample.gain_obs_gate_pct;
+        rec.gain_obs_rate_gps = strategy_sample.gain_obs_rate_gps;
+        rec.gain_obs_count = strategy_sample.gain_obs_count;
+        rec.model_tau_s = strategy_sample.model_tau_s;
+        rec.control_rate_gps = strategy_sample.control_rate_gps;
         rec.refill_count = strategy_sample.refill_count;
     }
 

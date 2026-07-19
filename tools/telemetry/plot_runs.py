@@ -4,7 +4,9 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import shlex
 import shutil
+import sys
 import tempfile
 import textwrap
 from pathlib import Path
@@ -70,7 +72,7 @@ FIGURE_PROFILES = {
     "default": (8.67, 5.0),
     "narrow": (6.8, 4.65),
 }
-SESSION_SUMMARY_GROUP_ORDER = ["overview", "adaptive", "compare"]
+SESSION_SUMMARY_GROUP_ORDER = ["overview", "adaptive", "compare", "cascade"]
 PLAIN_PROFILE_SUFFIX = {
     "default": "wide",
     "narrow": "narrow",
@@ -87,18 +89,36 @@ RATE_SERIES_SPECS: dict[str, dict[str, str]] = {
     "filtered": {"field": "rate_filtered_gps", "label": "Gefilterte Füllrate [g/s]", "color": "#2563eb"},
     "medium": {"field": "rate_filtered_medium_gps", "label": "Mittlere Filterrate [g/s]", "color": "#7c3aed"},
     "slow": {"field": "rate_filtered_slow_gps", "label": "Langsame Filterrate [g/s]", "color": "#ea580c"},
+    # The drip-averaged rate the cascade loop actually regulates on (and that the
+    # plant model is identified against) -- the honest "measured rate" to compare
+    # with the setpoint and the prediction, far cleaner than the jumpy filtered rate.
+    "control": {"field": "control_rate_gps", "label": "Geregelte Füllrate [g/s]", "color": "#0f172a"},
 }
-RATE_SELECTION_ORDER = ["raw", "2sample", "4sample", "filtered", "medium", "slow"]
+RATE_SELECTION_ORDER = ["raw", "2sample", "4sample", "filtered", "medium", "slow", "control"]
 LINE_RATE_FILTERED = RATE_SERIES_SPECS["filtered"]["color"]
 LINE_TARGET_RATE = "#15803d"
+# Cascade / Smith-predictor model signals (flow-cascade only).
+LINE_MODEL_RATE = "#9333ea"
 STATE_BAND_EDGE = "#94a3b8"
 STATE_BAND_KEYS = {"FILL", "DRIP_WAIT", "VERIFY_TARGET", "FAULT"}
 RATE_AXIS_LABEL = "Füllrate [g/s]"
-STATE_BAND_FIGURE_EXTRA_H = 0.32
-STATE_BAND_HEIGHT_RATIO = 0.44
+STATE_BAND_FIGURE_EXTRA_H = 0.52
+STATE_BAND_HEIGHT_RATIO = 0.66
 MAIN_PLOT_HEIGHT_RATIO = 3.8
 RATE_PLOT_HEIGHT_RATIO = 1.7
+RATE_PLOT_HEIGHT_RATIO_DENSE = 2.8
+RATE_PLOT_HEIGHT_RATIO_CASCADE = MAIN_PLOT_HEIGHT_RATIO
+RATE_FIGURE_EXTRA_H_DENSE = 0.55
+RATE_FIGURE_EXTRA_H_CASCADE = 1.2
+CONTROL_PLOT_HEIGHT_RATIO = 1.5
+CONTROL_FIGURE_EXTRA_H = 1.05
 DEBUG_FIGURE_EXTRA_H = 1.1
+EXPORT_PAD_INCHES = 0.06
+COMMAND_LOG_FILENAME = "plot_runs_last_command.txt"
+# Cascade control-loop panel signals.
+LINE_RATE_ERROR = "#e11d48"
+LINE_CONTROL_INTEG = "#0891b2"
+CONTROL_AXIS_LABEL = "Regelabw. [g/s]"
 STATE_BAND_LABEL_MIN_WIDTH_S = 0.35
 STATE_BAND_LABEL_OUTSIDE_WIDTH_S = 1.45
 SESSION_LINE_COLORS = {
@@ -116,7 +136,37 @@ SESSION_LINE_COLORS = {
     "next_fast_rate_gps": "#1e40af",
     "measured_slow_rate_gps": "#14b8a6",
     "next_slow_rate_gps": "#0f766e",
+    "used_gate_gain_gps_per_pct": "#b45309",
+    "next_gate_gain_gps_per_pct": "#f59e0b",
+    "used_onset_gate_pct": "#6d28d9",
+    "next_onset_gate_pct": "#a78bfa",
+    "used_model_tau_s": "#0e7490",
+    "next_model_tau_s": "#22d3ee",
 }
+
+# Cascade plant-model parameters for the per-fill (cross-run) learning chart.
+# "used_" is the value the fill actually ran with, "next_" the value learned by
+# the end of that fill -- the gap between them is the update that fill applied,
+# and the "next_" line across fills is the learning trend.
+CASCADE_SUMMARY_METRICS = [
+    ("used_gate_gain_gps_per_pct", "next_gate_gain_gps_per_pct",
+     "K [g/s pro %]", "Streckenverstärkung K̂ (lokal, EWMA)"),
+    ("used_onset_gate_pct", "next_onset_gate_pct",
+     "Totwinkel [%]", "Fluss-Einsatzpunkt (onset)"),
+    ("used_model_tau_s", "next_model_tau_s",
+     "tau [s]", "Zeitkonstante τ (FOPDT)"),
+    ("used_dead_time_s", "next_dead_time_s",
+     "Totzeit L [s]", "Totzeit L"),
+    ("used_post_close_gain_g", "next_post_close_gain_g",
+     "Nachlauf [g]", "Nachlaufmasse (post-close)"),
+]
+
+
+# Optional seam for drawing an extra layer on a finished fill figure, called
+# just before the figure is saved with (fig, ax, rate_ax, fill_run, records).
+# annotate_ch07.py installs the thesis ch. 07 annotation layer here; nothing in
+# the normal plotting path sets it, so plot_runs.py on its own is unaffected.
+ANNOTATION_HOOK: Any = None
 
 
 def _parse_fill_selection(value: str) -> list[int]:
@@ -415,6 +465,7 @@ def _series_from_samples(
     list[float | None],
     dict[str, list[float | None]],
     list[float | None],
+    dict[str, list[float | None]],
     float | None,
 ]:
     x_samples = [_seconds_from_focus(fill_run, record) for record in samples]
@@ -436,13 +487,22 @@ def _series_from_samples(
         name: [_float_value(record, spec["field"]) for record in samples]
         for name, spec in RATE_SERIES_SPECS.items()
     }
+    strategy = (fill_run.strategy_name or "").strip().lower()
     target_rate_series = [_float_value(record, "target_rate_gps") for record in samples]
-    if (fill_run.strategy_name or "").strip().lower() == "flow-control":
+    if strategy in ("flow-control", "flow-cascade"):
         target_rate_series = [
             0.0 if gate_value is not None and gate_value <= 0.5 else target_rate
             for gate_value, target_rate in zip(gate_pct, target_rate_series, strict=True)
         ]
-    return x_samples, fill_mass, gate_pct, rate_series, target_rate_series, base_weight_g
+    # Cascade Smith-predictor / control-loop signals (flow-cascade telemetry).
+    control_series = {
+        "model_rate": [_float_value(record, "model_rate_gps") for record in samples],
+        "model_delayed": [_float_value(record, "model_delayed_gps") for record in samples],
+        "rate_error": [_float_value(record, "rate_error_gps") for record in samples],
+        "control_integ": [_float_value(record, "control_integ_pct") for record in samples],
+        "gate_gain": [_float_value(record, "gate_gain_gps_per_pct") for record in samples],
+    }
+    return x_samples, fill_mass, gate_pct, rate_series, target_rate_series, control_series, base_weight_g
 
 
 def _plot_state_background(
@@ -607,10 +667,13 @@ def _annotate_gate_events(
     samples: list[dict[str, Any]],
 ) -> None:
     strategy_name = (fill_run.strategy_name or "").strip().lower()
-    flow_control_mode = strategy_name == "flow-control"
+    # Continuously-modulating strategies change the gate on almost every control
+    # tick, so labelling every step just clutters the line. Label only the first
+    # opening and the final close; the scatter dots still show every change.
+    sparse_labels = strategy_name in ("flow-control", "flow-cascade")
     first_open_index: int | None = None
     last_zero_index: int | None = None
-    if flow_control_mode:
+    if sparse_labels:
         for index, gate_record in enumerate(gates):
             gate_pct = _float_value(gate_record, "gate_pct")
             if gate_pct is None:
@@ -627,7 +690,7 @@ def _annotate_gate_events(
             continue
         x_gate = _aligned_gate_x(fill_run, gate_record, samples, gate_pct)
         ax2.scatter([x_gate], [gate_pct], color=LINE_GATE, s=20, zorder=6)
-        if flow_control_mode:
+        if sparse_labels:
             if index not in {first_open_index, last_zero_index}:
                 continue
 
@@ -928,6 +991,7 @@ def _draw_debug_metadata(
     fill_run: FillRun,
     base_weight_g: float | None,
     records: list[dict[str, Any]],
+    command_text: str | None,
 ) -> None:
     summary = _fill_summary_record(records, fill_run)
     first_adaptive_sample = _first_adaptive_sample(records, fill_run)
@@ -1043,9 +1107,34 @@ def _draw_debug_metadata(
     right_y = y_after_session
     left_y = _draw_meta_section(meta_ax, "Lauf", general_lines, x_label=0.0, x_value=0.26, y_start=left_y)
     left_y = _draw_meta_section(meta_ax, "Ergebnis", result_lines, x_label=0.0, x_value=0.26, y_start=left_y)
-    _draw_meta_section(meta_ax, "Preset-Parameter", preset_lines, x_label=0.0, x_value=0.26, y_start=left_y)
+    left_y = _draw_meta_section(meta_ax, "Preset-Parameter", preset_lines, x_label=0.0, x_value=0.26, y_start=left_y)
     right_y = _draw_meta_section(meta_ax, "Laufzeitwerte", runtime_lines, x_label=0.50, x_value=0.79, y_start=right_y)
-    _draw_meta_section(meta_ax, "Adaptionswerte", adaptive_next_lines, x_label=0.50, x_value=0.79, y_start=right_y)
+    right_y = _draw_meta_section(meta_ax, "Adaptionswerte", adaptive_next_lines, x_label=0.50, x_value=0.79, y_start=right_y)
+
+    if command_text:
+        command_title_y = min(left_y, right_y)
+        wrapped_command = "\n".join(textwrap.wrap(command_text, width=92)) or command_text
+        meta_ax.text(
+            0.0,
+            command_title_y,
+            "Plot command",
+            ha="left",
+            va="top",
+            fontsize=8.8,
+            color="#0f172a",
+            fontweight="bold",
+        )
+        meta_ax.text(
+            0.0,
+            command_title_y - 0.043,
+            wrapped_command,
+            ha="left",
+            va="top",
+            fontsize=6.0,
+            color="#334155",
+            family="monospace",
+            linespacing=1.08,
+        )
 
 
 def _create_figure_axes(
@@ -1055,22 +1144,31 @@ def _create_figure_axes(
     rate_layout: str,
     state_style: str,
     figure_profile: str,
-) -> tuple[Any, Any | None, Any, Any | None, Any | None]:
+    want_control_panel: bool,
+    rate_plot_height_ratio: float,
+    rate_figure_extra_h: float,
+) -> tuple[Any, Any | None, Any, Any | None, Any | None, Any | None]:
     figure_width, figure_height_base = _figure_size(figure_profile)
     want_rate = show_rate != "none"
     want_band = state_style == "band"
     subplot_rate = want_rate and rate_layout == "subplot"
 
     figure_height = figure_height_base + (STATE_BAND_FIGURE_EXTRA_H if want_band else 0.0)
+    if subplot_rate:
+        figure_height += rate_figure_extra_h
+    if want_control_panel:
+        figure_height += CONTROL_FIGURE_EXTRA_H
     if debug:
         figure_height += DEBUG_FIGURE_EXTRA_H
-    left_rows = 1 + (1 if want_band else 0) + (1 if subplot_rate else 0)
+    left_rows = 1 + (1 if want_band else 0) + (1 if subplot_rate else 0) + (1 if want_control_panel else 0)
     left_height_ratios: list[float] = []
     if want_band:
         left_height_ratios.append(STATE_BAND_HEIGHT_RATIO)
     left_height_ratios.append(MAIN_PLOT_HEIGHT_RATIO)
     if subplot_rate:
-        left_height_ratios.append(RATE_PLOT_HEIGHT_RATIO)
+        left_height_ratios.append(rate_plot_height_ratio)
+    if want_control_panel:
+        left_height_ratios.append(CONTROL_PLOT_HEIGHT_RATIO)
 
     if debug:
         fig = plt.figure(figsize=(figure_width + DEBUG_META_WIDTH, figure_height))
@@ -1084,23 +1182,27 @@ def _create_figure_axes(
         ax = fig.add_subplot(gs[main_row, 0])
         band_ax = fig.add_subplot(gs[0, 0], sharex=ax) if want_band else None
         rate_ax = fig.add_subplot(gs[main_row + 1, 0], sharex=ax) if subplot_rate else None
+        control_row = main_row + 1 + (1 if subplot_rate else 0)
+        control_ax = fig.add_subplot(gs[control_row, 0], sharex=ax) if want_control_panel else None
         meta_ax = fig.add_subplot(gs[:, 1])
         meta_ax.axis("off")
         if want_rate and rate_layout == "overlay":
-            return fig, band_ax, ax, ax.twinx(), meta_ax
-        return fig, band_ax, ax, rate_ax, meta_ax
+            return fig, band_ax, ax, ax.twinx(), control_ax, meta_ax
+        return fig, band_ax, ax, rate_ax, control_ax, meta_ax
 
     fig = plt.figure(figsize=(figure_width, figure_height))
     gs = fig.add_gridspec(left_rows, 1, height_ratios=left_height_ratios)
     main_row = 1 if want_band else 0
     ax = fig.add_subplot(gs[main_row, 0])
     band_ax = fig.add_subplot(gs[0, 0], sharex=ax) if want_band else None
+    control_row = main_row + 1 + (1 if subplot_rate else 0)
+    control_ax = fig.add_subplot(gs[control_row, 0], sharex=ax) if want_control_panel else None
     if subplot_rate:
         rate_ax = fig.add_subplot(gs[main_row + 1, 0], sharex=ax)
-        return fig, band_ax, ax, rate_ax, None
+        return fig, band_ax, ax, rate_ax, control_ax, None
     if want_rate and rate_layout == "overlay":
-        return fig, band_ax, ax, ax.twinx(), None
-    return fig, band_ax, ax, None, None
+        return fig, band_ax, ax, ax.twinx(), control_ax, None
+    return fig, band_ax, ax, None, control_ax, None
 
 
 def _outside_legend_columns(
@@ -1181,6 +1283,7 @@ def _plot_rate_panel(
     x_samples: list[float],
     rate_series: dict[str, list[float | None]],
     target_rate_series: list[float | None],
+    control_series: dict[str, list[float | None]],
     *,
     show_rate: str,
     overlay: bool,
@@ -1206,7 +1309,8 @@ def _plot_rate_panel(
         handles.append(line_rate)
         labels.append(spec["label"])
         plotted_any = True
-    if (fill_run.strategy_name or "").strip().lower() == "flow-control":
+    strategy = (fill_run.strategy_name or "").strip().lower()
+    if strategy in ("flow-control", "flow-cascade"):
         if any(value is not None for value in target_rate_series):
             (line_target_rate,) = rate_ax.plot(
                 x_samples,
@@ -1214,12 +1318,40 @@ def _plot_rate_panel(
                 color=LINE_TARGET_RATE,
                 linewidth=1.5 if overlay else 1.6,
                 linestyle=(0, (5, 2)),
-                label="Ziel-Füllrate [g/s]",
+                label="Ziel-Füllrate ṁ* [g/s]",
                 zorder=5 if overlay else 2,
                 alpha=0.95,
             )
             handles.append(line_target_rate)
-            labels.append("Ziel-Füllrate [g/s]")
+            labels.append("Ziel-Füllrate ṁ* [g/s]")
+            plotted_any = True
+    if strategy == "flow-cascade":
+        # Smith-predictor model rates: delay-free model output ŷ and its
+        # dead-time-delayed version ŷ_d. Comparing ŷ_d with the measured
+        # (filtered) rate shows the prediction error the controller reacts to.
+        model_rate = control_series.get("model_rate", [])
+        model_delayed = control_series.get("model_delayed", [])
+        # The dead-time-DELAYED model output ŷ_d is what should line up with the
+        # measured rate, so draw it solid (the direct visual comparison). The
+        # delay-free ŷ is the model's instantaneous belief -- draw it dotted as
+        # the reference, so it is obvious how far ahead the prediction runs.
+        if any(value is not None for value in model_delayed):
+            (line_model_d,) = rate_ax.plot(
+                x_samples, model_delayed,
+                color=LINE_MODEL_RATE, linewidth=1.3, linestyle="-",
+                label="Modellrate verz. ŷ_d [g/s]", zorder=(7 if overlay else 3), alpha=0.9,
+            )
+            handles.append(line_model_d)
+            labels.append("Modellrate verz. ŷ_d [g/s]")
+            plotted_any = True
+        if any(value is not None for value in model_rate):
+            (line_model,) = rate_ax.plot(
+                x_samples, model_rate,
+                color=LINE_MODEL_RATE, linewidth=1.2, linestyle=(0, (1, 1.4)),
+                label="Modellrate ŷ [g/s]", zorder=(7 if overlay else 3), alpha=0.8,
+            )
+            handles.append(line_model)
+            labels.append("Modellrate ŷ [g/s]")
             plotted_any = True
     if overlay:
         rate_ax.set_ylabel(RATE_AXIS_LABEL, color=LINE_RATE_FILTERED)
@@ -1247,6 +1379,134 @@ def _plot_rate_panel(
     return handles, labels
 
 
+def _plot_control_panel(
+    control_ax: Any,
+    x_samples: list[float],
+    rate_series: dict[str, list[float | None]],
+    control_series: dict[str, list[float | None]],
+) -> tuple[list[Any], list[str]]:
+    """Cascade control-loop internals, linkable to the block diagram:
+    - rate error e_r = ṁ* − feedback (into the inner PI controller F_R,i)
+    - prediction error ṁ_m − ŷ_d (the Smith correction, output of Σ_corr)
+    both in g/s on the primary axis; the PI integrator on a secondary % axis."""
+    handles: list[Any] = []
+    labels: list[str] = []
+    plotted_any = False
+
+    filtered = rate_series.get("filtered", [])
+    model_delayed = control_series.get("model_delayed", [])
+    rate_error = control_series.get("rate_error", [])
+    integ = control_series.get("control_integ", [])
+
+    prediction_error = [
+        (m - d) if (m is not None and d is not None) else None
+        for m, d in zip(filtered, model_delayed, strict=True)
+    ]
+
+    control_ax.axhline(0.0, color="#94a3b8", linewidth=0.8, alpha=0.7, zorder=1)
+    if any(v is not None for v in rate_error):
+        (l_e,) = control_ax.plot(
+            x_samples, rate_error, color=LINE_RATE_ERROR, linewidth=1.5,
+            label="Ratenfehler e_r [g/s]", zorder=3, alpha=0.95,
+        )
+        handles.append(l_e)
+        labels.append("Ratenfehler e_r [g/s]")
+        plotted_any = True
+    if any(v is not None for v in prediction_error):
+        (l_p,) = control_ax.plot(
+            x_samples, prediction_error, color=LINE_MODEL_RATE, linewidth=1.4,
+            linestyle=(0, (5, 2)), label="Prädiktionsfehler ṁ_m−ŷ_d [g/s]", zorder=3, alpha=0.9,
+        )
+        handles.append(l_p)
+        labels.append("Prädiktionsfehler ṁ_m−ŷ_d [g/s]")
+        plotted_any = True
+
+    control_ax.set_ylabel(CONTROL_AXIS_LABEL)
+    control_ax.set_xlabel("Zeit relativ zum Füllbeginn [s]", labelpad=10)
+    control_ax.grid(True, axis="both", color="#cbd5e1", linewidth=0.6, alpha=0.55)
+    control_ax.set_axisbelow(True)
+
+    if any(v is not None for v in integ):
+        integ_ax = control_ax.twinx()
+        (l_i,) = integ_ax.plot(
+            x_samples, integ, color=LINE_CONTROL_INTEG, linewidth=1.3,
+            linestyle=(0, (1, 1)), label="PI-Integrator [%]", zorder=2, alpha=0.9,
+        )
+        integ_ax.set_ylabel("PI-Integrator [%]", color=LINE_CONTROL_INTEG)
+        integ_ax.tick_params(axis="y", colors=LINE_CONTROL_INTEG, labelsize=9)
+        integ_ax.spines["right"].set_color(LINE_CONTROL_INTEG)
+        handles.append(l_i)
+        labels.append("PI-Integrator [%]")
+        plotted_any = True
+
+    if not plotted_any:
+        control_ax.text(
+            0.5, 0.5, "Keine Regler-Telemetrie in diesem Lauf",
+            transform=control_ax.transAxes, ha="center", va="center",
+            fontsize=8.5, color="#64748b",
+        )
+    return handles, labels
+
+
+def _has_cascade_control_series(strategy: str, control_series: dict[str, list[float | None]]) -> bool:
+    return strategy == "flow-cascade" and any(
+        value is not None
+        for key in ("model_delayed", "rate_error", "control_integ", "gate_gain")
+        for value in control_series.get(key, [])
+    )
+
+
+def _rate_panel_layout(strategy: str, show_rate: str, rate_layout: str) -> tuple[float, float]:
+    if show_rate == "none" or rate_layout != "subplot":
+        return RATE_PLOT_HEIGHT_RATIO, 0.0
+
+    selected_count = len(_selected_rate_series(show_rate))
+    if strategy in ("flow-control", "flow-cascade"):
+        selected_count += 1
+    if strategy == "flow-cascade":
+        selected_count += 2
+        return RATE_PLOT_HEIGHT_RATIO_CASCADE, RATE_FIGURE_EXTRA_H_CASCADE
+    if selected_count > 2:
+        return RATE_PLOT_HEIGHT_RATIO_DENSE, RATE_FIGURE_EXTRA_H_DENSE
+    return RATE_PLOT_HEIGHT_RATIO, 0.0
+
+
+def _scaled_rate_panel_layout(
+    strategy: str,
+    show_rate: str,
+    rate_layout: str,
+    rate_height_scale: float,
+) -> tuple[float, float]:
+    rate_ratio, extra_h = _rate_panel_layout(strategy, show_rate, rate_layout)
+    if show_rate == "none" or rate_layout != "subplot":
+        return rate_ratio, extra_h
+    scale = max(0.2, rate_height_scale)
+    return rate_ratio * scale, extra_h * scale
+
+
+def _save_figure(fig: Any, out_path: Path, fmt: str) -> None:
+    # Final tight crop is more reliable than trying to predict every title/legend
+    # combination up front with fixed subplot margins.
+    fig.canvas.draw()
+    fig.savefig(
+        out_path,
+        dpi=180 if fmt == "png" else None,
+        bbox_inches="tight",
+        pad_inches=EXPORT_PAD_INCHES,
+        facecolor="white",
+    )
+
+
+def _command_text(argv: list[str]) -> str:
+    return shlex.join(argv)
+
+
+def _write_command_log(session_dir: Path, command_text: str) -> Path:
+    out_path = session_dir / COMMAND_LOG_FILENAME
+    out_path.write_text(command_text + "\n", encoding="utf-8")
+    return out_path
+
+
 def _render_fill_variant(
     session_dir: Path,
     fill_run: FillRun,
@@ -1261,6 +1521,11 @@ def _render_fill_variant(
     rate_layout: str,
     figure_profile: str,
     output_name: str,
+    include_control_panel: bool,
+    show_target: bool,
+    mass_y_max: float | None,
+    rate_height_scale: float,
+    command_text: str | None,
 ) -> list[Path]:
     samples = _sample_events(records)
     if not samples:
@@ -1269,15 +1534,23 @@ def _render_fill_variant(
     states = _state_events(records)
     gates = _gate_events(records)
     faults = _fault_events(records)
-    x_samples, y_fill_mass, y_gate, rate_series, target_rate_series, base_weight_g = _series_from_samples(fill_run, samples)
+    x_samples, y_fill_mass, y_gate, rate_series, target_rate_series, control_series, base_weight_g = _series_from_samples(fill_run, samples)
+    strategy = (fill_run.strategy_name or "").strip().lower()
+    show_control_panel = include_control_panel and _has_cascade_control_series(strategy, control_series)
+    rate_plot_height_ratio, rate_figure_extra_h = _scaled_rate_panel_layout(
+        strategy, show_rate, rate_layout, rate_height_scale
+    )
 
     _figure_style()
-    fig, band_ax, ax, rate_ax, meta_ax = _create_figure_axes(
+    fig, band_ax, ax, rate_ax, control_ax, meta_ax = _create_figure_axes(
         debug=debug,
         show_rate=show_rate,
         rate_layout=rate_layout,
         state_style=state_style,
         figure_profile=figure_profile,
+        want_control_panel=show_control_panel,
+        rate_plot_height_ratio=rate_plot_height_ratio,
+        rate_figure_extra_h=rate_figure_extra_h,
     )
     ax2 = ax.twinx()
     overlay_rate = rate_ax is not None and show_rate != "none" and rate_layout == "overlay"
@@ -1289,7 +1562,7 @@ def _render_fill_variant(
     if debug:
         _annotate_state_badges(ax, fill_run, states)
 
-    if fill_run.target_g is not None:
+    if show_target and fill_run.target_g is not None:
         tol_low = fill_run.params.get("VAR(target_tol_low_g)")
         tol_high = fill_run.params.get("VAR(target_tol_high_g)")
         if isinstance(tol_low, (int, float)) and isinstance(tol_high, (int, float)):
@@ -1330,12 +1603,15 @@ def _render_fill_variant(
     _annotate_gate_events(ax2, fill_run, gates, samples)
     _annotate_faults(ax, fill_run, faults)
 
-    ax.set_xlabel("" if (rate_ax is not None and not overlay_rate) else "Zeit relativ zum Füllbeginn [s]")
+    has_lower_panel = (rate_ax is not None and not overlay_rate) or control_ax is not None
+    ax.set_xlabel("" if has_lower_panel else "Zeit relativ zum Füllbeginn [s]")
     ax.tick_params(labelbottom=True, axis="x", pad=1)
     ax.set_ylabel("Füllmasse [g]")
     ax2.set_ylabel("Klappenstellung [%]")
     ax2.set_ylim(-2, 112)
     ax2.set_yticks([0, 20, 40, 60, 80, 100])
+    if mass_y_max is not None:
+        ax.set_ylim(0.0, mass_y_max)
     ax.grid(True, axis="both", color="#cbd5e1", linewidth=0.7, alpha=0.65)
     ax.set_axisbelow(True)
 
@@ -1348,40 +1624,51 @@ def _render_fill_variant(
             x_samples,
             rate_series,
             target_rate_series,
+            control_series,
             show_rate=show_rate,
             overlay=overlay_rate,
         )
         if not overlay_rate:
             rate_ax.tick_params(labelbottom=True, axis="x", pad=4)
+    handles4: list[Any] = []
+    labels4: list[str] = []
+    if control_ax is not None:
+        handles4, labels4 = _plot_control_panel(
+            control_ax,
+            x_samples,
+            rate_series,
+            control_series,
+        )
+        control_ax.tick_params(labelbottom=True, axis="x", pad=4)
 
     handles1, labels1 = ax.get_legend_handles_labels()
     handles2, labels2 = ax2.get_legend_handles_labels()
-    legend_count = len(handles1) + len(handles2) + len(handles3)
+    legend_count = len(handles1) + len(handles2) + len(handles3) + len(handles4)
     outside_legend_cols = _outside_legend_columns(
         legend_count=legend_count,
         figure_profile=figure_profile,
-        subplot_rate=(rate_ax is not None and not overlay_rate),
+        subplot_rate=((rate_ax is not None and not overlay_rate) or control_ax is not None),
     )
     outside_legend_rows = 0
     if legend_placement == "outside":
         outside_legend_rows = max(1, (legend_count + outside_legend_cols - 1) // outside_legend_cols)
     bottom_margin = _layout_bottom_margin(
         debug=debug,
-        subplot_rate=(rate_ax is not None and not overlay_rate),
+        subplot_rate=((rate_ax is not None and not overlay_rate) or control_ax is not None),
         outside_legend_rows=outside_legend_rows,
     )
 
     _apply_figure_layout(
         fig,
         debug=debug,
-        subplot_rate=(rate_ax is not None and not overlay_rate),
+        subplot_rate=((rate_ax is not None and not overlay_rate) or control_ax is not None),
         want_band=(band_ax is not None),
         outside_legend_rows=outside_legend_rows,
     )
 
     legend_kwargs = {
-        "handles": handles1 + handles2 + handles3,
-        "labels": labels1 + labels2 + labels3,
+        "handles": handles1 + handles2 + handles3 + handles4,
+        "labels": labels1 + labels2 + labels3 + labels4,
         "frameon": False,
         "ncol": outside_legend_cols if legend_placement == "outside" else 1,
         "borderaxespad": 0.0,
@@ -1403,6 +1690,15 @@ def _render_fill_variant(
                 ncol=1,
                 borderaxespad=0.2,
             )
+        if control_ax is not None and handles4:
+            control_ax.legend(
+                handles=handles4,
+                labels=labels4,
+                frameon=False,
+                loc="upper right",
+                ncol=1,
+                borderaxespad=0.2,
+            )
     else:
         if legend_count > 0:
             legend_y = max(0.02, bottom_margin - (0.10 if debug else 0.01))
@@ -1417,14 +1713,56 @@ def _render_fill_variant(
             )
 
     if debug and meta_ax is not None:
-        _draw_debug_metadata(meta_ax, session_dir, fill_run, base_weight_g, records)
+        _draw_debug_metadata(meta_ax, session_dir, fill_run, base_weight_g, records, command_text)
+
+    if ANNOTATION_HOOK is not None:
+        ANNOTATION_HOOK(fig=fig, ax=ax, rate_ax=rate_ax, fill_run=fill_run, records=records)
 
     exported: list[Path] = []
     output_dir.mkdir(parents=True, exist_ok=True)
     stem = output_dir / f"{_output_stem_base(session_dir, fill_run)}__{output_name}"
     for fmt in formats:
         out_path = stem.parent / f"{stem.name}.{fmt}"
-        fig.savefig(out_path, dpi=180 if fmt == "png" else None)
+        _save_figure(fig, out_path, fmt)
+        exported.append(out_path)
+    plt.close(fig)
+    return exported
+
+
+def _render_control_only_variant(
+    session_dir: Path,
+    fill_run: FillRun,
+    records: list[dict[str, Any]],
+    output_dir: Path,
+    formats: list[str],
+    *,
+    figure_profile: str,
+    output_name: str,
+    rate_height_scale: float,
+) -> list[Path]:
+    samples = _sample_events(records)
+    if not samples:
+        raise ValueError(f"fill {fill_run.fill_id} has no sample records")
+
+    x_samples, _, _, rate_series, _, control_series, _ = _series_from_samples(fill_run, samples)
+    strategy = (fill_run.strategy_name or "").strip().lower()
+    if not _has_cascade_control_series(strategy, control_series):
+        return []
+
+    _figure_style()
+    figure_width, figure_height_base = _figure_size(figure_profile)
+    fig, control_ax = plt.subplots(1, 1, figsize=(figure_width, max(2.45, figure_height_base * 0.64 * max(0.2, rate_height_scale))))
+    handles, labels = _plot_control_panel(control_ax, x_samples, rate_series, control_series)
+    if handles:
+        control_ax.legend(handles=handles, labels=labels, frameon=False, loc="upper right", ncol=1, borderaxespad=0.2)
+    fig.tight_layout(rect=(0.04, 0.05, 0.985, 0.985), pad=0.35, h_pad=0.45, w_pad=0.6)
+
+    exported: list[Path] = []
+    output_dir.mkdir(parents=True, exist_ok=True)
+    stem = output_dir / f"{_output_stem_base(session_dir, fill_run)}__{output_name}"
+    for fmt in formats:
+        out_path = stem.parent / f"{stem.name}.{fmt}"
+        _save_figure(fig, out_path, fmt)
         exported.append(out_path)
     plt.close(fig)
     return exported
@@ -1442,7 +1780,14 @@ def _plot_fill(
     rate_layout: str,
     figure_profile: str,
     plain_both_profiles: bool,
+    cascade_control_export: str,
+    show_target: bool,
+    mass_y_max: float | None,
+    rate_height_scale: float,
+    command_text: str | None,
 ) -> list[Path]:
+    strategy = (fill_run.strategy_name or "").strip().lower()
+    split_cascade_control = strategy == "flow-cascade" and cascade_control_export == "separate"
     exported = _render_fill_variant(
         session_dir,
         fill_run,
@@ -1456,6 +1801,11 @@ def _plot_fill(
         rate_layout=rate_layout,
         figure_profile=figure_profile,
         output_name="debug",
+        include_control_panel=True,
+        show_target=show_target,
+        mass_y_max=mass_y_max,
+        rate_height_scale=rate_height_scale,
+        command_text=command_text,
     )
     plain_profiles = ["default", "narrow"] if plain_both_profiles else [figure_profile]
     for plain_profile in plain_profiles:
@@ -1476,8 +1826,29 @@ def _plot_fill(
                 rate_layout=rate_layout,
                 figure_profile=plain_profile,
                 output_name=output_name,
+                include_control_panel=not split_cascade_control,
+                show_target=show_target,
+                mass_y_max=mass_y_max,
+                rate_height_scale=rate_height_scale,
+                command_text=command_text,
             )
         )
+        if split_cascade_control:
+            control_output_name = "control-internals"
+            if plain_both_profiles:
+                control_output_name = f"control-internals_{_plain_profile_suffix(plain_profile)}"
+            exported.extend(
+                _render_control_only_variant(
+                    session_dir,
+                    fill_run,
+                    records,
+                    output_dir,
+                    formats,
+                    figure_profile=plain_profile,
+                    output_name=control_output_name,
+                    rate_height_scale=rate_height_scale,
+                )
+            )
     return exported
 
 
@@ -1494,7 +1865,7 @@ def _export_session_figure(
     exported: list[Path] = []
     for fmt in formats:
         out_path = stem.parent / f"{stem.name}.{fmt}"
-        fig.savefig(out_path, dpi=180 if fmt == "png" else None)
+        _save_figure(fig, out_path, fmt)
         exported.append(out_path)
     plt.close(fig)
     return exported
@@ -1761,6 +2132,185 @@ def _plot_session_compare(
     )
 
 
+def _plot_session_cascade_trend(
+    session_dir: Path,
+    entries: list[dict[str, Any]],
+    output_dir: Path,
+    formats: list[str],
+) -> list[Path]:
+    """Cross-run learning trend of the cascade plant-model parameters, one line
+    per parameter (the value learned by the end of each fill). Compact for the
+    thesis: the plant gain K on its own, the two time constants (dead time L and
+    lag tau) merged on a shared seconds axis, and the post-close drip mass. The
+    now-constant flow onset is intentionally omitted. This is the "do the
+    parameters actually converge across fills?" figure."""
+    def series(field: str) -> tuple[list[int], list[float]]:
+        return _summary_series(entries, field)
+
+    # Panel 3 (K) is the headline; L+tau share a panel; post-close its own.
+    have_k = bool(series("next_gate_gain_gps_per_pct")[0])
+    have_time = bool(series("next_dead_time_s")[0]) or bool(series("next_model_tau_s")[0])
+    have_post = bool(series("next_post_close_gain_g")[0])
+    panels = [p for p, ok in (("k", have_k), ("time", have_time), ("post", have_post)) if ok]
+    if not panels:
+        return []
+
+    x_ticks = [int(entry["fill_id"]) for entry in entries]
+    fig, axes = plt.subplots(len(panels), 1, sharex=True, figsize=(8.4, 2.1 * len(panels) + 1.0))
+    axes_list = [axes] if len(panels) == 1 else list(axes)
+    fig.suptitle("Sitzungsübersicht: gelernte Streckenparameter (Kaskade)", x=0.08, y=0.985,
+                 ha="left", fontsize=13, color="#0f172a")
+    fig.text(0.08, 0.955, _session_summary_subtitle(session_dir, entries), ha="left", va="top",
+             fontsize=9.2, color="#475569")
+
+    def line(ax: Any, field: str, color: str, label: str | None = None,
+             marker: str = "o", linestyle: str = "-") -> None:
+        x, y = series(field)
+        if not x:
+            return
+        ax.plot(x, y, color=color, linewidth=1.9, marker=marker, markersize=4.6,
+                linestyle=linestyle, label=label)
+
+    for ax, panel in zip(axes_list, panels, strict=True):
+        if panel == "k":
+            line(ax, "next_gate_gain_gps_per_pct", SESSION_LINE_COLORS["next_gate_gain_gps_per_pct"])
+            ax.set_ylabel("K̂ [g/s pro %]")
+            ax.set_title("Streckenverstärkung K̂ (lokal identifiziert)", loc="left",
+                         fontsize=10.5, color="#0f172a")
+        elif panel == "time":
+            line(ax, "next_dead_time_s", SESSION_LINE_COLORS["next_dead_time_s"], label="Totzeit L")
+            line(ax, "next_model_tau_s", SESSION_LINE_COLORS["next_model_tau_s"], label="Zeitkonstante τ",
+                 marker="s", linestyle="--")
+            ax.set_ylabel("Zeit [s]")
+            ax.set_title("Totzeit L und Zeitkonstante τ", loc="left", fontsize=10.5, color="#0f172a")
+            ax.legend(frameon=False, loc="upper left", ncol=2)
+        else:
+            line(ax, "next_post_close_gain_g", SESSION_LINE_COLORS["next_post_close_gain_g"])
+            ax.set_ylabel("Nachlauf [g]")
+            ax.set_title("Nachlaufmasse (post-close)", loc="left", fontsize=10.5, color="#0f172a")
+
+    _setup_session_axes(axes_list, x_ticks)
+    fig.tight_layout(rect=(0.06, 0.06, 0.98, 0.93))
+    return _export_session_figure(fig, output_dir, session_dir=session_dir,
+                                  suffix="session-cascade-params", formats=formats)
+
+
+def _plot_session_cascade_timeline(
+    session_dir: Path,
+    fill_runs: list[FillRun],
+    fill_records: dict[int, list[dict[str, Any]]],
+    output_dir: Path,
+    formats: list[str],
+) -> list[Path]:
+    """Continuous within-session timeline of the cascade parameters at per-sample
+    (sub-fill) resolution: shows the model adapting WITHIN each fill and across
+    fills, with fill boundaries marked and each steady observation flagged. This
+    is what reveals whether the estimator is actually being fed (observation
+    ticks) and how K/onset move when it is."""
+    ordered = sorted(fill_runs, key=lambda fr: fr.fill_id)
+    t: list[float] = []
+    K: list[float | None] = []
+    onset: list[float | None] = []
+    tau: list[float | None] = []
+    meas: list[float | None] = []
+    model: list[float | None] = []
+    target: list[float | None] = []
+    boundaries: list[tuple[float, int]] = []
+    obs_t: list[float] = []
+    obs_gate: list[float] = []
+    obs_rate: list[float] = []
+
+    clock = 0.0
+    t0_us: int | None = None
+    prev_obs_count: float | None = None
+    for fr in ordered:
+        samples = _sample_events(fill_records.get(fr.fill_id, []))
+        if not samples:
+            continue
+        if t0_us is None:
+            t0_us = _ts_us(samples[0])
+        start = (_ts_us(samples[0]) - t0_us) / 1e6
+        boundaries.append((start, fr.fill_id))
+        for rec in samples:
+            ts = (_ts_us(rec) - t0_us) / 1e6
+            t.append(ts)
+            K.append(_float_value(rec, "gate_gain_gps_per_pct"))
+            onset.append(_float_value(rec, "flow_onset_gate_pct"))
+            tau.append(_float_value(rec, "model_tau_s"))
+            meas.append(_float_value(rec, "control_rate_gps"))
+            model.append(_float_value(rec, "model_rate_gps"))
+            target.append(_float_value(rec, "target_rate_gps"))
+            count = _float_value(rec, "gain_obs_count")
+            g = _float_value(rec, "gain_obs_gate_pct")
+            r = _float_value(rec, "gain_obs_rate_gps")
+            if count is not None and prev_obs_count is not None and count > prev_obs_count and g and r:
+                obs_t.append(ts)
+                obs_gate.append(g)
+                obs_rate.append(r)
+            if count is not None:
+                prev_obs_count = count
+        clock = t[-1] if t else clock
+
+    if not t or all(v is None for v in K):
+        return []
+
+    fig, (axK, axT, axR) = plt.subplots(3, 1, sharex=True, figsize=(10.5, 7.4))
+    fig.suptitle("Sitzungsverlauf: Streckenmodell über die Zeit (Kaskade)", x=0.06, y=0.985,
+                 ha="left", fontsize=13, color="#0f172a")
+    fig.text(0.06, 0.955, f"Sitzung: {session_dir.name}", ha="left", va="top", fontsize=9.2, color="#475569")
+
+    def _mark_fills(ax: Any) -> None:
+        for bx, fid in boundaries:
+            ax.axvline(bx, color="#cbd5e1", linewidth=0.8, zorder=0)
+        top = ax.get_ylim()[1]
+        for bx, fid in boundaries:
+            ax.annotate(f"#{fid}", xy=(bx, top), xytext=(2, -2), textcoords="offset points",
+                        fontsize=7, color="#94a3b8", va="top")
+
+    # Panel 1: K on the left axis, onset on a twin axis, observation ticks.
+    axK.plot(t, K, color="#b45309", linewidth=1.7, label="K̂ [g/s pro %]")
+    axK.set_ylabel("K̂ [g/s pro %]", color="#b45309")
+    axK.tick_params(axis="y", labelcolor="#b45309")
+    axK_o = axK.twinx()
+    axK_o.plot(t, onset, color="#6d28d9", linewidth=1.4, linestyle="--", label="onset [%]")
+    axK_o.set_ylabel("Totwinkel onset [%]", color="#6d28d9")
+    axK_o.tick_params(axis="y", labelcolor="#6d28d9")
+    if obs_t:
+        axK.plot(obs_t, [K[min(range(len(t)), key=lambda i: abs(t[i] - ot))] for ot in obs_t],
+                 linestyle="none", marker="v", markersize=6, color="#dc2626",
+                 label=f"Beobachtung ({len(obs_t)})", zorder=5)
+    axK.set_title("Verstärkung K̂ und Totwinkel (Beobachtungen = rote Marker)", loc="left",
+                  fontsize=10.5, color="#0f172a")
+    _mark_fills(axK)
+    h1, l1 = axK.get_legend_handles_labels()
+    h2, l2 = axK_o.get_legend_handles_labels()
+    axK.legend(h1 + h2, l1 + l2, frameon=False, loc="upper right", ncol=3, fontsize=8)
+
+    # Panel 2: tau.
+    axT.plot(t, tau, color="#0e7490", linewidth=1.7)
+    axT.set_ylabel("τ [s]")
+    axT.set_title("Zeitkonstante τ (FOPDT)", loc="left", fontsize=10.5, color="#0f172a")
+    _mark_fills(axT)
+
+    # Panel 3: measured control rate vs model prediction vs target.
+    axR.plot(t, meas, color="#0f172a", linewidth=1.3, label="gemessen (control_rate)")
+    axR.plot(t, model, color="#2563eb", linewidth=1.3, linestyle="--", label="Modell ŷ")
+    axR.plot(t, target, color="#16a34a", linewidth=1.1, linestyle=":", label="Sollrate ṁ*")
+    axR.set_ylabel("Rate [g/s]")
+    axR.set_xlabel("Zeit in der Sitzung [s]")
+    axR.set_title("Ratenverfolgung: Modell ŷ vs. gemessen vs. Sollwert", loc="left",
+                  fontsize=10.5, color="#0f172a")
+    axR.legend(frameon=False, loc="upper right", ncol=3, fontsize=8)
+    _mark_fills(axR)
+
+    for ax in (axK, axT, axR):
+        ax.grid(True, axis="both", color="#e2e8f0", linewidth=0.6, alpha=0.6)
+        ax.set_axisbelow(True)
+    fig.tight_layout(rect=(0.04, 0.04, 0.98, 0.93))
+    return _export_session_figure(fig, output_dir, session_dir=session_dir,
+                                  suffix="session-cascade-timeline", formats=formats)
+
+
 def _plot_session_summaries(
     session_dir: Path,
     fill_runs: list[FillRun],
@@ -1782,6 +2332,9 @@ def _plot_session_summaries(
         exported.extend(_plot_session_adaptive(session_dir, entries, output_dir, formats))
     if "compare" in groups:
         exported.extend(_plot_session_compare(session_dir, entries, output_dir, formats))
+    if "cascade" in groups:
+        exported.extend(_plot_session_cascade_trend(session_dir, entries, output_dir, formats))
+        exported.extend(_plot_session_cascade_timeline(session_dir, fill_runs, fill_records, output_dir, formats))
     return exported, entries
 
 
@@ -1907,6 +2460,31 @@ def main() -> int:
         help="Use the normal thesis chart size or a narrower 16:10 variant for side-by-side placement",
     )
     parser.add_argument(
+        "--cascade-control-export",
+        choices=["separate", "merged"],
+        default="separate",
+        help=(
+            "For flow-cascade plain exports: create a separate control-internals figure "
+            "or merge that panel into the main fill chart. Debug export is always merged."
+        ),
+    )
+    parser.add_argument(
+        "--hide-target",
+        action="store_true",
+        help="Disable target-mass line and tolerance band overlays",
+    )
+    parser.add_argument(
+        "--mass-y-max",
+        type=float,
+        help="Force the fill-mass axis upper limit, for example 200",
+    )
+    parser.add_argument(
+        "--rate-height-scale",
+        type=float,
+        default=1.0,
+        help="Multiply the dedicated rate subplot height, for example 1.5",
+    )
+    parser.add_argument(
         "--plain-both-profiles",
         action="store_true",
         help="Export the plain chart in both wide and narrow variants with suffixed filenames; debug is exported once",
@@ -1934,6 +2512,10 @@ def main() -> int:
     )
     parser.set_defaults(clear_output=True, session_summary=True)
     args = parser.parse_args()
+    if args.rate_height_scale <= 0:
+        raise SystemExit("--rate-height-scale must be > 0")
+    if args.mass_y_max is not None and args.mass_y_max <= 0:
+        raise SystemExit("--mass-y-max must be > 0")
 
     session_dir, fill_runs, fill_records = _load_input(
         args.input_path,
@@ -1960,6 +2542,8 @@ def main() -> int:
     if args.clear_output and output_dir.exists():
         shutil.rmtree(output_dir)
         cleared_output = True
+    command_text = _command_text([sys.executable, *sys.argv]) if sys.argv else _command_text([sys.executable])
+    command_log_path = _write_command_log(session_dir, command_text)
     exported: list[Path] = []
     for fill_run in selected_fills:
         exported.extend(
@@ -1975,6 +2559,11 @@ def main() -> int:
                 rate_layout=args.rate_layout,
                 figure_profile=args.figure_profile,
                 plain_both_profiles=args.plain_both_profiles,
+                cascade_control_export=args.cascade_control_export,
+                show_target=not args.hide_target,
+                mass_y_max=args.mass_y_max,
+                rate_height_scale=args.rate_height_scale,
+                command_text=command_text,
             )
         )
     session_summary_exported: list[Path] = []
@@ -1994,11 +2583,13 @@ def main() -> int:
     print(f"Output:   {output_dir}")
     print(f"Cleared:  {'yes' if cleared_output else 'no'}")
     print(f"Formats:  {', '.join(formats)}")
+    print(f"Command:  {command_log_path}")
     print(f"Plotted:  {len(selected_fills)} fill runs")
     print("Variants: debug, plain")
     print(f"Legend:   {args.legend_placement}")
     print(f"Rate:     {args.show_rate}")
     print(f"Layout:   {args.rate_layout}")
+    print(f"Cascade:  {args.cascade_control_export} plain export")
     print(f"Profile:  {args.figure_profile}")
     print(f"Plain:    {'wide+narrow' if args.plain_both_profiles else args.figure_profile}")
     print(f"Session summaries: {'on' if args.session_summary else 'off'}")

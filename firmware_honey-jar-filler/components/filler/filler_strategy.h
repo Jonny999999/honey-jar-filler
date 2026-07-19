@@ -65,7 +65,23 @@ typedef struct {
     float learned_post_close_gain_g;
     float learned_fast_rate_gps;
     float learned_slow_rate_gps;
-    float learned_gate_gain_gps_per_pct;
+    // Cascade affine plant model  rate = K*gate + b  (learned_gate_gain = slope
+    // K [g/s per %], learned_gain_b = offset [g/s], typically <0 for the flow
+    // onset). K is a single LOCAL gain learned by EWMA of rate/(gate-onset) over
+    // steady observations; onset is a slow near-constant; b = -K*onset.
+    float learned_gate_gain_gps_per_pct;   // slope K
+    float learned_gain_b;                  // offset b
+    float learned_flow_onset_gate_pct;     // flow-onset gate ("dead angle"); b = -K*onset
+    float gain_obs_gate_pct;               // last steady observation fed to the estimator
+    float gain_obs_rate_gps;
+    float learned_model_tau_s;             // FOPDT lag behind the dead time
+    // Identification probe: a deliberate constant-gate hold to guarantee one
+    // clean steady observation when the loop never settles on its own.
+    bool probe_pending;                    // this fill should probe once flow starts
+    bool probe_active;                     // currently holding the probe gate
+    int64_t probe_end_us;
+    float probe_gate_pct;
+    float coldstart_close_bias_g;          // conservative early-close bias, decays over fills
     float learned_finish_trim_g;
     float learned_fast_start_gate_pct;
     float learned_slow_start_gate_pct;
@@ -81,6 +97,7 @@ typedef struct {
     bool measured_near_close_valid;
     float target_g;
     float control_gate_cmd_pct;
+    float control_rate_gps;        // windowed (smoothed) rate used as control feedback
     float gate_ceiling_pct;
     float gate_at_slow_entry_pct;
     float gate_at_close_pct;
@@ -129,6 +146,17 @@ typedef struct {
     float next_near_close_g;
     float next_close_early_g;
     float next_drip_wait_ms;
+    // Cascade identified plant model: what this fill RAN with vs what the next
+    // fill will use. The summary previously carried no cascade model state at
+    // all, so the cross-run parameter-evolution charts had nothing to plot.
+    float used_gate_gain_gps_per_pct;
+    float used_gain_b_gps;
+    float used_onset_gate_pct;
+    float used_model_tau_s;
+    float next_gate_gain_gps_per_pct;
+    float next_gain_b_gps;
+    float next_onset_gate_pct;
+    float next_model_tau_s;
     char reason[24];
 } filler_strategy_fill_summary_t;
 

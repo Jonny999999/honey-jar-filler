@@ -316,6 +316,10 @@ static void telemetry_emit_record(const telemetry_record_t *rec)
                    ",\"adapted_drip_wait_ms\":%.3f"
                    ",\"model_rate_gps\":%.3f,\"model_delayed_gps\":%.3f"
                    ",\"control_integ_pct\":%.3f,\"gate_gain_gps_per_pct\":%.4f"
+                   ",\"gain_offset_b_gps\":%.3f,\"flow_onset_gate_pct\":%.3f"
+                   ",\"gain_obs_gate_pct\":%.3f,\"gain_obs_rate_gps\":%.3f"
+                   ",\"gain_obs_count\":%.0f,\"model_tau_s\":%.3f"
+                   ",\"control_rate_gps\":%.3f"
                    ",\"refill_count\":%" PRIu32,
                    strategy_escaped,
                    text_escaped,
@@ -343,6 +347,13 @@ static void telemetry_emit_record(const telemetry_record_t *rec)
                    (double)rec->model_delayed_gps,
                    (double)rec->control_integ_pct,
                    (double)rec->gate_gain_gps_per_pct,
+                   (double)rec->gain_offset_b_gps,
+                   (double)rec->flow_onset_gate_pct,
+                   (double)rec->gain_obs_gate_pct,
+                   (double)rec->gain_obs_rate_gps,
+                   (double)rec->gain_obs_count,
+                   (double)rec->model_tau_s,
+                   (double)rec->control_rate_gps,
                    rec->refill_count);
         }
         printf("}\n");
@@ -429,6 +440,10 @@ static void telemetry_emit_record(const telemetry_record_t *rec)
                ",\"next_slow_rate_gps\":%.3f,\"next_near_close_bias_g\":%.3f"
                ",\"next_near_close_g\":%.3f"
                ",\"next_close_early_g\":%.3f,\"next_drip_wait_ms\":%.3f"
+               ",\"used_gate_gain_gps_per_pct\":%.4f,\"used_gain_b_gps\":%.3f"
+               ",\"used_onset_gate_pct\":%.3f,\"used_model_tau_s\":%.3f"
+               ",\"next_gate_gain_gps_per_pct\":%.4f,\"next_gain_b_gps\":%.3f"
+               ",\"next_onset_gate_pct\":%.3f,\"next_model_tau_s\":%.3f"
                ",\"params\":{",
                rec->ts_us,
                rec->run_id,
@@ -467,7 +482,15 @@ static void telemetry_emit_record(const telemetry_record_t *rec)
                (double)rec->learned_near_close_bias_g,
                (double)rec->adapted_near_close_g,
                (double)rec->adapted_close_early_g,
-               (double)rec->next_drip_wait_ms);
+               (double)rec->next_drip_wait_ms,
+               (double)rec->used_gate_gain_gps_per_pct,
+               (double)rec->used_gain_b_gps,
+               (double)rec->used_onset_gate_pct,
+               (double)rec->used_model_tau_s,
+               (double)rec->next_gate_gain_gps_per_pct,
+               (double)rec->next_gain_b_gps,
+               (double)rec->next_onset_gate_pct,
+               (double)rec->next_model_tau_s);
         telemetry_emit_params_json(&rec->params);
         printf("}}\n");
         break;
