@@ -89,8 +89,12 @@ RATE_SERIES_SPECS: dict[str, dict[str, str]] = {
     "filtered": {"field": "rate_filtered_gps", "label": "Gefilterte Füllrate [g/s]", "color": "#2563eb"},
     "medium": {"field": "rate_filtered_medium_gps", "label": "Mittlere Filterrate [g/s]", "color": "#7c3aed"},
     "slow": {"field": "rate_filtered_slow_gps", "label": "Langsame Filterrate [g/s]", "color": "#ea580c"},
+    # The drip-averaged rate the cascade loop actually regulates on (and that the
+    # plant model is identified against) -- the honest "measured rate" to compare
+    # with the setpoint and the prediction, far cleaner than the jumpy filtered rate.
+    "control": {"field": "control_rate_gps", "label": "Geregelte Füllrate [g/s]", "color": "#0f172a"},
 }
-RATE_SELECTION_ORDER = ["raw", "2sample", "4sample", "filtered", "medium", "slow"]
+RATE_SELECTION_ORDER = ["raw", "2sample", "4sample", "filtered", "medium", "slow", "control"]
 LINE_RATE_FILTERED = RATE_SERIES_SPECS["filtered"]["color"]
 LINE_TARGET_RATE = "#15803d"
 # Cascade / Smith-predictor model signals (flow-cascade only).
@@ -663,10 +667,13 @@ def _annotate_gate_events(
     samples: list[dict[str, Any]],
 ) -> None:
     strategy_name = (fill_run.strategy_name or "").strip().lower()
-    flow_control_mode = strategy_name == "flow-control"
+    # Continuously-modulating strategies change the gate on almost every control
+    # tick, so labelling every step just clutters the line. Label only the first
+    # opening and the final close; the scatter dots still show every change.
+    sparse_labels = strategy_name in ("flow-control", "flow-cascade")
     first_open_index: int | None = None
     last_zero_index: int | None = None
-    if flow_control_mode:
+    if sparse_labels:
         for index, gate_record in enumerate(gates):
             gate_pct = _float_value(gate_record, "gate_pct")
             if gate_pct is None:
@@ -683,7 +690,7 @@ def _annotate_gate_events(
             continue
         x_gate = _aligned_gate_x(fill_run, gate_record, samples, gate_pct)
         ax2.scatter([x_gate], [gate_pct], color=LINE_GATE, s=20, zorder=6)
-        if flow_control_mode:
+        if sparse_labels:
             if index not in {first_open_index, last_zero_index}:
                 continue
 
@@ -1324,23 +1331,27 @@ def _plot_rate_panel(
         # (filtered) rate shows the prediction error the controller reacts to.
         model_rate = control_series.get("model_rate", [])
         model_delayed = control_series.get("model_delayed", [])
-        if any(value is not None for value in model_rate):
-            (line_model,) = rate_ax.plot(
-                x_samples, model_rate,
-                color=LINE_MODEL_RATE, linewidth=1.2, linestyle="-",
-                label="Modellrate ŷ [g/s]", zorder=(7 if overlay else 3), alpha=0.9,
-            )
-            handles.append(line_model)
-            labels.append("Modellrate ŷ [g/s]")
-            plotted_any = True
+        # The dead-time-DELAYED model output ŷ_d is what should line up with the
+        # measured rate, so draw it solid (the direct visual comparison). The
+        # delay-free ŷ is the model's instantaneous belief -- draw it dotted as
+        # the reference, so it is obvious how far ahead the prediction runs.
         if any(value is not None for value in model_delayed):
             (line_model_d,) = rate_ax.plot(
                 x_samples, model_delayed,
-                color=LINE_MODEL_RATE, linewidth=1.1, linestyle=(0, (1, 1)),
-                label="Modellrate verz. ŷ_d [g/s]", zorder=(7 if overlay else 3), alpha=0.75,
+                color=LINE_MODEL_RATE, linewidth=1.3, linestyle="-",
+                label="Modellrate verz. ŷ_d [g/s]", zorder=(7 if overlay else 3), alpha=0.9,
             )
             handles.append(line_model_d)
             labels.append("Modellrate verz. ŷ_d [g/s]")
+            plotted_any = True
+        if any(value is not None for value in model_rate):
+            (line_model,) = rate_ax.plot(
+                x_samples, model_rate,
+                color=LINE_MODEL_RATE, linewidth=1.2, linestyle=(0, (1, 1.4)),
+                label="Modellrate ŷ [g/s]", zorder=(7 if overlay else 3), alpha=0.8,
+            )
+            handles.append(line_model)
+            labels.append("Modellrate ŷ [g/s]")
             plotted_any = True
     if overlay:
         rate_ax.set_ylabel(RATE_AXIS_LABEL, color=LINE_RATE_FILTERED)
@@ -2127,34 +2138,56 @@ def _plot_session_cascade_trend(
     output_dir: Path,
     formats: list[str],
 ) -> list[Path]:
-    """Cross-run learning trend of the cascade plant-model parameters: one panel
-    per parameter, each showing the value the fill ran with ("used", solid) and
-    the value learned by the end of that fill ("next", dashed). This is the
-    "do the parameters actually converge across fills?" chart for the thesis."""
-    available = [
-        m for m in CASCADE_SUMMARY_METRICS
-        if _summary_series(entries, m[0])[0] or _summary_series(entries, m[1])[0]
-    ]
-    if not available:
+    """Cross-run learning trend of the cascade plant-model parameters, one line
+    per parameter (the value learned by the end of each fill). Compact for the
+    thesis: the plant gain K on its own, the two time constants (dead time L and
+    lag tau) merged on a shared seconds axis, and the post-close drip mass. The
+    now-constant flow onset is intentionally omitted. This is the "do the
+    parameters actually converge across fills?" figure."""
+    def series(field: str) -> tuple[list[int], list[float]]:
+        return _summary_series(entries, field)
+
+    # Panel 3 (K) is the headline; L+tau share a panel; post-close its own.
+    have_k = bool(series("next_gate_gain_gps_per_pct")[0])
+    have_time = bool(series("next_dead_time_s")[0]) or bool(series("next_model_tau_s")[0])
+    have_post = bool(series("next_post_close_gain_g")[0])
+    panels = [p for p, ok in (("k", have_k), ("time", have_time), ("post", have_post)) if ok]
+    if not panels:
         return []
 
     x_ticks = [int(entry["fill_id"]) for entry in entries]
-    fig, axes = plt.subplots(len(available), 1, sharex=True, figsize=(8.67, 2.05 * len(available) + 1.0))
-    axes_list = [axes] if len(available) == 1 else list(axes)
+    fig, axes = plt.subplots(len(panels), 1, sharex=True, figsize=(8.4, 2.1 * len(panels) + 1.0))
+    axes_list = [axes] if len(panels) == 1 else list(axes)
     fig.suptitle("Sitzungsübersicht: gelernte Streckenparameter (Kaskade)", x=0.08, y=0.985,
                  ha="left", fontsize=13, color="#0f172a")
     fig.text(0.08, 0.955, _session_summary_subtitle(session_dir, entries), ha="left", va="top",
              fontsize=9.2, color="#475569")
 
-    for ax, (used_field, next_field, ylabel, title) in zip(axes_list, available, strict=True):
-        _plot_compare_series(
-            ax, entries,
-            left_field=used_field, left_label="verwendet (used)",
-            left_color=SESSION_LINE_COLORS.get(used_field, "#b45309"),
-            right_field=next_field, right_label="gelernt (next)",
-            right_color=SESSION_LINE_COLORS.get(next_field, "#f59e0b"),
-            ylabel=ylabel, title=title,
-        )
+    def line(ax: Any, field: str, color: str, label: str | None = None,
+             marker: str = "o", linestyle: str = "-") -> None:
+        x, y = series(field)
+        if not x:
+            return
+        ax.plot(x, y, color=color, linewidth=1.9, marker=marker, markersize=4.6,
+                linestyle=linestyle, label=label)
+
+    for ax, panel in zip(axes_list, panels, strict=True):
+        if panel == "k":
+            line(ax, "next_gate_gain_gps_per_pct", SESSION_LINE_COLORS["next_gate_gain_gps_per_pct"])
+            ax.set_ylabel("K̂ [g/s pro %]")
+            ax.set_title("Streckenverstärkung K̂ (lokal identifiziert)", loc="left",
+                         fontsize=10.5, color="#0f172a")
+        elif panel == "time":
+            line(ax, "next_dead_time_s", SESSION_LINE_COLORS["next_dead_time_s"], label="Totzeit L")
+            line(ax, "next_model_tau_s", SESSION_LINE_COLORS["next_model_tau_s"], label="Zeitkonstante τ",
+                 marker="s", linestyle="--")
+            ax.set_ylabel("Zeit [s]")
+            ax.set_title("Totzeit L und Zeitkonstante τ", loc="left", fontsize=10.5, color="#0f172a")
+            ax.legend(frameon=False, loc="upper left", ncol=2)
+        else:
+            line(ax, "next_post_close_gain_g", SESSION_LINE_COLORS["next_post_close_gain_g"])
+            ax.set_ylabel("Nachlauf [g]")
+            ax.set_title("Nachlaufmasse (post-close)", loc="left", fontsize=10.5, color="#0f172a")
 
     _setup_session_axes(axes_list, x_ticks)
     fig.tight_layout(rect=(0.06, 0.06, 0.98, 0.93))
