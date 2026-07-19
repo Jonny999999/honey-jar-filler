@@ -81,6 +81,7 @@ typedef struct {
     bool probe_active;                     // currently holding the probe gate
     int64_t probe_end_us;
     float probe_gate_pct;
+    float coldstart_close_bias_g;          // conservative early-close bias, decays over fills
     float learned_finish_trim_g;
     float learned_fast_start_gate_pct;
     float learned_slow_start_gate_pct;

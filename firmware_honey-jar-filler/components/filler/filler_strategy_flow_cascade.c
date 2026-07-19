@@ -132,6 +132,19 @@
 // instead of still ramping down when the close fires.
 #define CASC_TERMINAL_HOLD_G 10.0f
 
+// Thesis illustration (compile-time toggle, default ON, trivial to remove):
+// start CONSERVATIVE so the error curve shows a clear "poor cold start ->
+// improves over runs" trend. Without it the close/drip learning converges in ~1
+// fill and the very first jar is already accurate, which hides the learning.
+// A bias closes the gate early (slight underfill) on the first fills and decays
+// linearly to zero over CASC_COLDSTART_FILLS successful fills; the normal
+// finish-trim/post-close learning then carries the error the rest of the way to
+// zero. Purely a starting-condition effect: it does not touch the draining-phase
+// fills, so it does not fake the "worse at the end" (that stays a duration story).
+#define CASC_COLDSTART_CONSERVATIVE 1
+#define CASC_COLDSTART_BIAS_G 12.0f    // extra early-close grams on the very first fill
+#define CASC_COLDSTART_FILLS 4.0f      // decays linearly to 0 over this many successful fills
+
 // Bulk-phase setpoint (the profile's fast rate) is a CHOSEN, controllable
 // trajectory derived from the jar size, NOT the learned achievable rate. Using
 // the learned/measured rate as the setpoint creates a positive-feedback loop
@@ -1068,7 +1081,8 @@ static void update_thresholds(filler_strategy_runtime_t *rt, const filler_strate
                             rt->learned_post_close_gain_g * 1.5f + 15.0f);
     close_max = fminf(close_max, (float)tick->params->target_grams * 0.6f);
     float close_candidate = rt->predicted_remaining_g + CLOSE_BUFFER_G -
-                            rt->close_early_relax_g - rt->learned_finish_trim_g;
+                            rt->close_early_relax_g - rt->learned_finish_trim_g +
+                            rt->coldstart_close_bias_g;  // conservative cold start (decays to 0)
     rt->adapted_close_early_g = clampf_local(close_candidate, 2.0f, close_max);
     rt->adapted_drip_wait_ms = clampf_local(rt->adapted_drip_wait_ms, DRIP_WAIT_MIN_MS, DRIP_WAIT_MAX_MS);
 }
@@ -1265,6 +1279,14 @@ static void cascade_on_enter(filler_strategy_runtime_t *rt, filler_state_t state
                                 (entry->successful_fills == 0u) ||
                                 (entry->fills_without_obs >= CASC_PROBE_RETRY_FILLS);
             rt->probe_active = false;
+#if CASC_COLDSTART_CONSERVATIVE
+            // Conservative cold start (thesis illustration): decays to 0 over the
+            // first CASC_COLDSTART_FILLS successful fills.
+            rt->coldstart_close_bias_g = CASC_COLDSTART_BIAS_G *
+                fmaxf(0.0f, 1.0f - (float)entry->successful_fills / CASC_COLDSTART_FILLS);
+#else
+            rt->coldstart_close_bias_g = 0.0f;
+#endif
             if (!env->jar_tare_get || !env->jar_tare_get(&rt->run_base_weight_g)) {
                 rt->run_base_weight_g = tick->latest ? tick->latest->grams : 0.0f;
             }
