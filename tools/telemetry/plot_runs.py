@@ -92,7 +92,7 @@ RATE_SERIES_SPECS: dict[str, dict[str, str]] = {
     # The drip-averaged rate the cascade loop actually regulates on (and that the
     # plant model is identified against) -- the honest "measured rate" to compare
     # with the setpoint and the prediction, far cleaner than the jumpy filtered rate.
-    "control": {"field": "control_rate_gps", "label": "Geregelte Füllrate [g/s]", "color": "#0f172a"},
+    "control": {"field": "control_rate_gps", "label": "Gefilterte Füllrate [g/s]", "color": "#2563eb"},
 }
 RATE_SELECTION_ORDER = ["raw", "2sample", "4sample", "filtered", "medium", "slow", "control"]
 LINE_RATE_FILTERED = RATE_SERIES_SPECS["filtered"]["color"]
@@ -1878,9 +1878,9 @@ def _plot_session_overview(
     formats: list[str],
 ) -> list[Path]:
     x_ticks = [int(entry["fill_id"]) for entry in entries]
-    fig, axes = plt.subplots(3, 1, sharex=True, figsize=(8.67, 7.9))
-    fig.suptitle("Sitzungsübersicht Füllläufe", x=0.08, y=0.985, ha="left", fontsize=13, color="#0f172a")
-    fig.text(0.08, 0.955, _session_summary_subtitle(session_dir, entries), ha="left", va="top", fontsize=9.2, color="#475569")
+    # Refills panel is half height: it usually only toggles 0/1 and carries little.
+    fig, axes = plt.subplots(3, 1, sharex=True, figsize=(8.67, 6.2),
+                             gridspec_kw={"height_ratios": [1.0, 1.0, 0.5]})
 
     plotted = [
         _plot_single_series(
@@ -1912,7 +1912,7 @@ def _plot_session_overview(
         plt.close(fig)
         return []
     _setup_session_axes(list(axes), x_ticks)
-    fig.tight_layout(rect=(0.06, 0.06, 0.98, 0.93))
+    fig.tight_layout()
     return _export_session_figure(
         fig,
         output_dir,
@@ -1928,10 +1928,10 @@ def _plot_session_adaptive(
     output_dir: Path,
     formats: list[str],
 ) -> list[Path]:
+    # Nachtropfzeit dropped (near-constant, carries little information).
     metrics = [
         ("used_near_close_g", "Nahe Schließen [g]", "Eingesetzter Schwellwert für Nahe Schließen", SESSION_LINE_COLORS["used_near_close_g"]),
         ("used_close_early_g", "Früh schließen [g]", "Eingesetzter Früh-Schließen-Wert", SESSION_LINE_COLORS["used_close_early_g"]),
-        ("drip_wait_used_ms", "Nachtropfzeit [ms]", "Tatsächlich verwendete Nachtropfzeit", SESSION_LINE_COLORS["drip_wait_used_ms"]),
     ]
     available = [
         metric for metric in metrics if _summary_series(entries, metric[0])[0]
@@ -1940,10 +1940,8 @@ def _plot_session_adaptive(
         return []
 
     x_ticks = [int(entry["fill_id"]) for entry in entries]
-    fig, axes = plt.subplots(len(available), 1, sharex=True, figsize=(8.67, 2.15 * len(available) + 1.0))
+    fig, axes = plt.subplots(len(available), 1, sharex=True, figsize=(8.67, 2.15 * len(available) + 0.4))
     axes_list = [axes] if len(available) == 1 else list(axes)
-    fig.suptitle("Sitzungsübersicht adaptive Parameter", x=0.08, y=0.985, ha="left", fontsize=13, color="#0f172a")
-    fig.text(0.08, 0.955, _session_summary_subtitle(session_dir, entries), ha="left", va="top", fontsize=9.2, color="#475569")
 
     for ax, (field, ylabel, title, color) in zip(axes_list, available, strict=True):
         _plot_single_series(
@@ -1956,7 +1954,7 @@ def _plot_session_adaptive(
         )
 
     _setup_session_axes(axes_list, x_ticks)
-    fig.tight_layout(rect=(0.06, 0.06, 0.98, 0.93))
+    fig.tight_layout()
     return _export_session_figure(
         fig,
         output_dir,
@@ -2052,8 +2050,6 @@ def _plot_session_compare(
     x_ticks = [int(entry["fill_id"]) for entry in entries]
     fig, axes = plt.subplots(len(available_keys), 1, sharex=True, figsize=(8.67, 2.3 * len(available_keys) + 1.0))
     axes_list = [axes] if len(available_keys) == 1 else list(axes)
-    fig.suptitle("Sitzungsübersicht Messwerte und Folgeschätzungen", x=0.08, y=0.985, ha="left", fontsize=13, color="#0f172a")
-    fig.text(0.08, 0.955, _session_summary_subtitle(session_dir, entries), ha="left", va="top", fontsize=9.2, color="#475569")
 
     for ax, key in zip(axes_list, available_keys, strict=True):
         if key == "post_close":
@@ -2122,7 +2118,7 @@ def _plot_session_compare(
                 ax.legend(frameon=False, loc="upper left", ncol=2)
 
     _setup_session_axes(axes_list, x_ticks)
-    fig.tight_layout(rect=(0.06, 0.06, 0.98, 0.93))
+    fig.tight_layout()
     return _export_session_figure(
         fig,
         output_dir,
@@ -2156,12 +2152,8 @@ def _plot_session_cascade_trend(
         return []
 
     x_ticks = [int(entry["fill_id"]) for entry in entries]
-    fig, axes = plt.subplots(len(panels), 1, sharex=True, figsize=(8.4, 2.1 * len(panels) + 1.0))
+    fig, axes = plt.subplots(len(panels), 1, sharex=True, figsize=(8.4, 2.0 * len(panels) + 0.4))
     axes_list = [axes] if len(panels) == 1 else list(axes)
-    fig.suptitle("Sitzungsübersicht: gelernte Streckenparameter (Kaskade)", x=0.08, y=0.985,
-                 ha="left", fontsize=13, color="#0f172a")
-    fig.text(0.08, 0.955, _session_summary_subtitle(session_dir, entries), ha="left", va="top",
-             fontsize=9.2, color="#475569")
 
     def line(ax: Any, field: str, color: str, label: str | None = None,
              marker: str = "o", linestyle: str = "-") -> None:
@@ -2174,23 +2166,23 @@ def _plot_session_cascade_trend(
     for ax, panel in zip(axes_list, panels, strict=True):
         if panel == "k":
             line(ax, "next_gate_gain_gps_per_pct", SESSION_LINE_COLORS["next_gate_gain_gps_per_pct"])
-            ax.set_ylabel("K̂ [g/s pro %]")
-            ax.set_title("Streckenverstärkung K̂ (lokal identifiziert)", loc="left",
+            ax.set_ylabel(r"$\hat{K}$ [g/s pro %]")
+            ax.set_title(r"Streckenverstärkung $\hat{K}$ (lokal identifiziert)", loc="left",
                          fontsize=10.5, color="#0f172a")
         elif panel == "time":
             line(ax, "next_dead_time_s", SESSION_LINE_COLORS["next_dead_time_s"], label="Totzeit L")
-            line(ax, "next_model_tau_s", SESSION_LINE_COLORS["next_model_tau_s"], label="Zeitkonstante τ",
+            line(ax, "next_model_tau_s", SESSION_LINE_COLORS["next_model_tau_s"], label=r"Zeitkonstante $\tau$",
                  marker="s", linestyle="--")
             ax.set_ylabel("Zeit [s]")
-            ax.set_title("Totzeit L und Zeitkonstante τ", loc="left", fontsize=10.5, color="#0f172a")
-            ax.legend(frameon=False, loc="upper left", ncol=2)
+            ax.set_title(r"Totzeit L und Zeitkonstante $\tau$", loc="left", fontsize=10.5, color="#0f172a")
+            ax.legend(frameon=False, loc="upper right", ncol=2)
         else:
             line(ax, "next_post_close_gain_g", SESSION_LINE_COLORS["next_post_close_gain_g"])
             ax.set_ylabel("Nachlauf [g]")
             ax.set_title("Nachlaufmasse (post-close)", loc="left", fontsize=10.5, color="#0f172a")
 
     _setup_session_axes(axes_list, x_ticks)
-    fig.tight_layout(rect=(0.06, 0.06, 0.98, 0.93))
+    fig.tight_layout()
     return _export_session_figure(fig, output_dir, session_dir=session_dir,
                                   suffix="session-cascade-params", formats=formats)
 
@@ -2254,10 +2246,7 @@ def _plot_session_cascade_timeline(
     if not t or all(v is None for v in K):
         return []
 
-    fig, (axK, axT, axR) = plt.subplots(3, 1, sharex=True, figsize=(10.5, 7.4))
-    fig.suptitle("Sitzungsverlauf: Streckenmodell über die Zeit (Kaskade)", x=0.06, y=0.985,
-                 ha="left", fontsize=13, color="#0f172a")
-    fig.text(0.06, 0.955, f"Sitzung: {session_dir.name}", ha="left", va="top", fontsize=9.2, color="#475569")
+    fig, (axK, axT, axR) = plt.subplots(3, 1, sharex=True, figsize=(10.5, 7.0))
 
     def _mark_fills(ax: Any) -> None:
         for bx, fid in boundaries:
@@ -2306,7 +2295,7 @@ def _plot_session_cascade_timeline(
     for ax in (axK, axT, axR):
         ax.grid(True, axis="both", color="#e2e8f0", linewidth=0.6, alpha=0.6)
         ax.set_axisbelow(True)
-    fig.tight_layout(rect=(0.04, 0.04, 0.98, 0.93))
+    fig.tight_layout()
     return _export_session_figure(fig, output_dir, session_dir=session_dir,
                                   suffix="session-cascade-timeline", formats=formats)
 
