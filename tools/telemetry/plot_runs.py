@@ -850,7 +850,7 @@ def _setup_session_axes(
     axes: Any,
     x_values: list[int],
     *,
-    xlabel: str = "Fülllauf / Füll-ID [-]",
+    xlabel: str = "Fülllauf",
 ) -> None:
     if isinstance(axes, list):
         axes_list = axes
@@ -1326,32 +1326,32 @@ def _plot_rate_panel(
             labels.append("Ziel-Füllrate ṁ* [g/s]")
             plotted_any = True
     if strategy == "flow-cascade":
-        # Smith-predictor model rates: delay-free model output ŷ and its
-        # dead-time-delayed version ŷ_d. Comparing ŷ_d with the measured
+        # Smith-predictor model rates: delay-free model output ṁ_p and its
+        # dead-time-delayed version ṁ_pd. Comparing ṁ_pd with the measured
         # (filtered) rate shows the prediction error the controller reacts to.
         model_rate = control_series.get("model_rate", [])
         model_delayed = control_series.get("model_delayed", [])
-        # The dead-time-DELAYED model output ŷ_d is what should line up with the
+        # The dead-time-DELAYED model output ṁ_pd is what should line up with the
         # measured rate, so draw it solid (the direct visual comparison). The
-        # delay-free ŷ is the model's instantaneous belief -- draw it dotted as
+        # delay-free ṁ_p is the model's instantaneous belief -- draw it dotted as
         # the reference, so it is obvious how far ahead the prediction runs.
         if any(value is not None for value in model_delayed):
             (line_model_d,) = rate_ax.plot(
                 x_samples, model_delayed,
                 color=LINE_MODEL_RATE, linewidth=1.3, linestyle="-",
-                label="Modellrate verz. ŷ_d [g/s]", zorder=(7 if overlay else 3), alpha=0.9,
+                label="Modellrate verz. ṁ_pd [g/s]", zorder=(7 if overlay else 3), alpha=0.9,
             )
             handles.append(line_model_d)
-            labels.append("Modellrate verz. ŷ_d [g/s]")
+            labels.append("Modellrate verz. ṁ_pd [g/s]")
             plotted_any = True
         if any(value is not None for value in model_rate):
             (line_model,) = rate_ax.plot(
                 x_samples, model_rate,
                 color=LINE_MODEL_RATE, linewidth=1.2, linestyle=(0, (1, 1.4)),
-                label="Modellrate ŷ [g/s]", zorder=(7 if overlay else 3), alpha=0.8,
+                label="Modellrate ṁ_p [g/s]", zorder=(7 if overlay else 3), alpha=0.8,
             )
             handles.append(line_model)
-            labels.append("Modellrate ŷ [g/s]")
+            labels.append("Modellrate ṁ_p [g/s]")
             plotted_any = True
     if overlay:
         rate_ax.set_ylabel(RATE_AXIS_LABEL, color=LINE_RATE_FILTERED)
@@ -1930,8 +1930,8 @@ def _plot_session_adaptive(
 ) -> list[Path]:
     # Nachtropfzeit dropped (near-constant, carries little information).
     metrics = [
-        ("used_near_close_g", "Nahe Schließen [g]", "Eingesetzter Schwellwert für Nahe Schließen", SESSION_LINE_COLORS["used_near_close_g"]),
-        ("used_close_early_g", "Früh schließen [g]", "Eingesetzter Früh-Schließen-Wert", SESSION_LINE_COLORS["used_close_early_g"]),
+        ("used_near_close_g", "Restmasse [g]", "Restmasse für die reduzierte Öffnung", SESSION_LINE_COLORS["used_near_close_g"]),
+        ("used_close_early_g", "Restmasse [g]", "Restmasse beim Schließen", SESSION_LINE_COLORS["used_close_early_g"]),
     ]
     available = [
         metric for metric in metrics if _summary_series(entries, metric[0])[0]
