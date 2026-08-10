@@ -46,6 +46,9 @@ screenshots
 
 
 # === project specific ===
+# editor local history (VSCode Local History extension)
+**/.history/
+
 # telemetry captures / generated plots
 data/telemetry/
 

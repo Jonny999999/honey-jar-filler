@@ -1,23 +1,36 @@
 # honey-jar-filler
 
-Semi-automatic **weight-based honey jar filler** with a **jar carousel/magazine** and a **servo-actuated honey gate**.  
-This repo contains the **KiCad PCB-Project**, **FreeCAD** models, and firmware (ESP-IDF).
+Semi-automatic **weight-based honey jar filler** with a **jar carousel/magazine** and a
+**servo-actuated honey gate**. A load cell weighs each jar in real time while the
+firmware modulates the gate to hit a target fill mass.
 
-  <img src="cad/exports/screenshots/assembly.png" alt="Assembly Preview" width="70%">
+This repository holds the complete build — **KiCad PCB**, **FreeCAD** mechanics, and
+**ESP-IDF firmware** — plus the telemetry tooling used to capture and analyse fills.
+The machine is also the subject of a **bachelor thesis** that evaluates several
+**dosing strategies** for accurately dispensing a viscous, drifting medium (honey);
+see [Dosing strategies](#dosing-strategies).
 
-*3d model of the planned system*
+<p align="center">
+  <img src="cad/exports/screenshots/system-overview.png" alt="System overview (CAD)" width="72%">
+</p>
+
+*System overview (CAD): pressurised bucket on the stand, the servo-actuated gate, and
+the carousel base housing the control board and load cell, with a jar in position.*
 
 <p align="center">
   <img src="doc/images/pcb_populated.jpg" alt="Custom board fully populated" width="48%">
   <img src="doc/images/pcb_IO-test.jpg" alt="I/O test with peripherals" width="48%">
 </p>
 
-*Left: custom pcb fully populated. Right: I/O test with all peripherals connected.*
+*Left: the custom control board, fully populated. Right: I/O bring-up with all
+peripherals connected.*
 
 ## Repo contents
-- `pcb_honey-jar-filler/` - KiCad project (schematic & PCB, exports)
-- `cad/` - FreeCAD parts, 3D models, full assembly
-- `firmware_honey-jar-filler/` - firmware for esp32 (ESP-IDF)
+- `pcb_honey-jar-filler/` — KiCad project (schematic, PCB, exports)
+- `cad/` — FreeCAD parts, 3D models, full assembly
+- `firmware_honey-jar-filler/` — ESP32 firmware (ESP-IDF)
+- `tools/telemetry/` — host-side capture, run-splitting, and plotting tools
+- `doc/` — build photos and notes
 
 ## Features (PCB / system)
 - Load cell input (HX711) for weight-based dosing
@@ -26,11 +39,31 @@ This repo contains the **KiCad PCB-Project**, **FreeCAD** models, and firmware (
 - Optional outputs: heater control, tank pressurization valve
 - Power: 12–40 V input, 5 V buck (logic), adjustable 4–9 V rail (servo)
 
-## Ideas
+## Dosing strategies
+Dosing honey accurately is hard: there is a **dead time** of several seconds between
+moving the gate and seeing the weight respond, the flow **keeps dripping after the
+gate closes**, the gate→flow relationship is **nonlinear**, and disturbances
+(viscosity, temperature, falling bucket level) **drift within and between fills**.
+Fixed thresholds therefore cannot stay optimal, which is what motivates the strategy
+comparison at the heart of the thesis.
+
+The firmware implements the strategies as interchangeable modules
+(`firmware_honey-jar-filler/components/filler/`), selectable from the OLED menu:
+
+- **heuristic** — fixed two-stage thresholds; the simple baseline.
+- **adaptive-heuristic** — the same fill sequence, but dead time, post-close drip and
+  fill rates are learned between fills, so it converges after a jar or two.
+- **flow-cascade** — a control-based approach: an outer deceleration rate profile
+  (feed-forward trajectory) feeding an inner PI rate loop with an online-identified
+  affine plant model and Smith-predictor dead-time compensation.
+- **manual** / **sequence** — encoder-driven and scripted modes, used for bring-up and
+  for capturing clean reference runs.
+
+## Roadmap / ideas
 - Rotary carousel automation (indexing, run/stop with braking)
 - Outlet warming (silicone band / water jacket)
 - Jar presence detection
-- Web UI / profiles / batch counter (ESP-IDF)
+- Web UI / profiles / batch counter
 
 ## Schematic + layout preview
 <p align="center">
@@ -41,7 +74,7 @@ This repo contains the **KiCad PCB-Project**, **FreeCAD** models, and firmware (
 </p>
 
 ## Firmware build (ESP-IDF)
-- Install ESP-IDF **v5.5.2** and export its environment (`. ./export.sh`).
+- Install ESP-IDF **v5.5.1** and export its environment (`. ./export.sh`).
 - Enter the firmware project:
 ```bash
 cd firmware_honey-jar-filler
@@ -103,6 +136,15 @@ Current script layout:
   Offline chart exporter for thesis figures. It writes both a plain LaTeX-ready
   chart and a debug variant with metadata, based on fill mass, gate percentage,
   and FSM state overlays.
+- `tools/telemetry/strategy_compare.py`
+  Cross-strategy comparison charts (accuracy point clouds, speed–accuracy
+  trade-off, throughput) for the thesis' strategy-comparison chapter. Reads each
+  session's per-fill summaries and is explicit about which runs are a controlled
+  comparison and which are only indicative.
+- `tools/telemetry/cascade_analyze.py`
+  Diagnostics for the flow-cascade strategy: per-fill plant-model estimate
+  (gain/onset/lag) beside an offline ground-truth fit, to spot a diverging
+  identifier at a glance.
 
 Session capture output:
 - `data/telemetry/<session>/session.log`
