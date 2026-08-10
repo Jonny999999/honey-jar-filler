@@ -23,6 +23,7 @@
 
 // Button debounce.
 #define UI_BTN_DEBOUNCE_MS 50
+#define UI_BTN_LONG_PRESS_MS 800
 
 // Encoder step for target grams.
 #define UI_TARGET_STEP_G 10u
@@ -113,6 +114,7 @@ static void ui_render_anim_block(uint8_t r, uint8_t g, uint8_t b, int pos)
     if (!s_strip) return;
     int count = CONFIG_WS2812_LED_COUNT;
     if (count <= 0) return;
+    int opposite_pos = (pos + (count / 2)) % count;
 
     uint8_t dr = (uint8_t)((r * UI_ANIM_DIM_PCT) / 100);
     uint8_t dg = (uint8_t)((g * UI_ANIM_DIM_PCT) / 100);
@@ -124,6 +126,8 @@ static void ui_render_anim_block(uint8_t r, uint8_t g, uint8_t b, int pos)
     for (int i = 0; i < UI_ANIM_BLOCK_LEN; ++i) {
         int idx = (pos + i) % count;
         ui_ws2812_set_pixel(idx, dr, dg, db);
+        int opposite_idx = (opposite_pos + i) % count;
+        ui_ws2812_set_pixel(opposite_idx, dr, dg, db);
     }
     (void)led_strip_refresh(s_strip);
 }
@@ -137,10 +141,52 @@ static void ui_update_state_outputs(filler_state_t st, uint8_t r, uint8_t g, uin
     ui_ws2812_set_all(r, g, b);
 }
 
+static bool ui_manual_fill_active(filler_state_t st)
+{
+    return st == FILLER_FILL && app_fill_strategy_get_active() == APP_FILL_STRATEGY_MANUAL;
+}
+
 static void ui_handle_button(filler_state_t st)
 {
+    static bool manual_pressed = false;
+    static bool manual_long_sent = false;
+    static int64_t manual_press_start_us = 0;
     static int last_btn = 1; // active-low
     int cur = gpio_get_level(CONFIG_BUTTON_1_GPIO);
+    int64_t now_us = esp_timer_get_time();
+
+    if (ui_manual_fill_active(st)) {
+        if (!manual_pressed && last_btn != 0 && cur == 0) {
+            manual_pressed = true;
+            manual_long_sent = false;
+            manual_press_start_us = now_us;
+        }
+
+        if (manual_pressed && !manual_long_sent &&
+            (now_us - manual_press_start_us) >= ((int64_t)UI_BTN_LONG_PRESS_MS * 1000)) {
+            ESP_LOGI(TAG, "button: manual abort");
+            filler_request_abort();
+            manual_long_sent = true;
+        }
+
+        if (manual_pressed && last_btn == 0 && cur != 0) {
+            if (!manual_long_sent &&
+                (now_us - manual_press_start_us) >= ((int64_t)UI_BTN_DEBOUNCE_MS * 1000)) {
+                ESP_LOGI(TAG, "button: manual advance");
+                filler_request_start();
+            }
+            manual_pressed = false;
+            manual_long_sent = false;
+            manual_press_start_us = 0;
+        }
+
+        last_btn = cur;
+        return;
+    }
+
+    manual_pressed = false;
+    manual_long_sent = false;
+    manual_press_start_us = 0;
 
     if (last_btn != 0 && cur == 0) {
         vTaskDelay(pdMS_TO_TICKS(UI_BTN_DEBOUNCE_MS));
@@ -162,17 +208,23 @@ static void ui_handle_button(filler_state_t st)
 
 static void ui_handle_encoder(filler_state_t st, int32_t enc_delta, int64_t *last_beep_us)
 {
-    // Only apply changes when idle or fault; always drain queue elsewhere.
     if (enc_delta == 0) return;
-    if (st != FILLER_IDLE && st != FILLER_FAULT) return;
 
-    app_params_t p;
-    app_params_get(&p);
-    int32_t tgt = (int32_t)p.target_grams + (int32_t)enc_delta * (int32_t)UI_TARGET_STEP_G;
-    if (tgt < 0) tgt = 0;
-    p.target_grams = (uint32_t)tgt;
-    (void)app_params_set(&p);
-    ESP_LOGI(TAG, "encoder: target=%u g", (unsigned)p.target_grams);
+    if (ui_manual_fill_active(st)) {
+        filler_request_manual_gate_delta(enc_delta);
+    } else {
+        // Outside manual mode the encoder keeps its existing role: tweak the
+        // target mass only when the machine is not actively running.
+        if (st != FILLER_IDLE && st != FILLER_FAULT) return;
+
+        app_params_t p;
+        app_params_get(&p);
+        int32_t tgt = (int32_t)p.target_grams + (int32_t)enc_delta * (int32_t)UI_TARGET_STEP_G;
+        if (tgt < 0) tgt = 0;
+        p.target_grams = (uint32_t)tgt;
+        (void)app_params_set(&p);
+        ESP_LOGI(TAG, "encoder: target=%u g", (unsigned)p.target_grams);
+    }
 
     if (last_beep_us) {
         int64_t now_us = esp_timer_get_time();
@@ -186,12 +238,17 @@ static void ui_handle_encoder(filler_state_t st, int32_t enc_delta, int64_t *las
 static void ui_render(ssd1306_handle_t disp,
                       const scale_latest_t *s,
                       const app_params_t *p,
+                      const char *preset_name,
+                      app_fill_strategy_t strategy,
+                      float gate_pct,
                       filler_state_t st,
                       uint8_t slot,
                       filler_fault_t flt,
                       bool has_tare,
                       float tare_g)
 {
+    if (!disp) return;
+
     char line1[24];
     char line2[32];
     char line3[32];
@@ -220,10 +277,17 @@ static void ui_render(ssd1306_handle_t disp,
     }
     ssd1306_draw_text(disp, 0, LINE2PIXEL(4), line2, true);
 
-    // Line 3: action hint + target.
-    snprintf(line3, sizeof(line3), "Btn:%s  Tgt:%ug",
-             (st == FILLER_IDLE || st == FILLER_FAULT) ? "START" : "STOP",
-             (unsigned)p->target_grams);
+    // Line 3: preset + target, or in manual mode preset + gate position.
+    if (strategy == APP_FILL_STRATEGY_MANUAL) {
+        unsigned shown_gate = (gate_pct < 0.0f) ? 0u : (unsigned)(gate_pct + 0.5f);
+        snprintf(line3, sizeof(line3), "%.10s G:%u%%",
+                 (preset_name && preset_name[0]) ? preset_name : "?",
+                 shown_gate);
+    } else {
+        snprintf(line3, sizeof(line3), "%.10s T:%ug",
+                 (preset_name && preset_name[0]) ? preset_name : "?",
+                 (unsigned)p->target_grams);
+    }
     ssd1306_draw_text(disp, 0, LINE2PIXEL(6), line3, true);
 
     ssd1306_display(disp);
@@ -302,7 +366,7 @@ static void task_ui(void *arg)
         }
 
         if (!ui_menu_is_active(&menu)) {
-            if (enc_long && (st == FILLER_IDLE || st == FILLER_FAULT)) {
+            if (enc_long) {
                 app_params_t params;
                 app_params_get(&params);
                 ui_menu_enter(&menu, &params);
@@ -345,19 +409,24 @@ static void task_ui(void *arg)
 
         now_ticks = xTaskGetTickCount();
         if (now_ticks >= next_refresh) {
-            if (ui_menu_is_active(&menu)) {
+            // Headless mode keeps buttons and LED status active even when no OLED
+            // is connected on the current board.
+            if (cfg.disp && ui_menu_is_active(&menu)) {
                 ui_menu_render(&menu, cfg.disp);
-            } else {
+            } else if (cfg.disp) {
                 scale_latest_t latest = {0};
                 scale_latest_get(&latest);
 
                 app_params_t params;
                 app_params_get(&params);
+                const char *preset_name = app_presets_get_name(app_presets_get_active_index());
+                app_fill_strategy_t strategy = app_fill_strategy_get_active();
 
                 uint8_t slot = filler_get_slot_idx();
+                float gate_pct = filler_get_gate_percent();
                 float tare_g = 0.0f;
                 bool has_tare = filler_get_jar_tare(&tare_g);
-                ui_render(cfg.disp, &latest, &params, st, slot, flt, has_tare, tare_g);
+                ui_render(cfg.disp, &latest, &params, preset_name, strategy, gate_pct, st, slot, flt, has_tare, tare_g);
             }
             next_refresh = now_ticks + period;
         }

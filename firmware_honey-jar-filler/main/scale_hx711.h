@@ -65,6 +65,12 @@ esp_err_t scale_hx711_start_poll(scale_hx711_t *s,
                                  UBaseType_t queue_len,
                                  QueueHandle_t *out_queue);
 
+// Development helper: publish simulated scale samples through the same
+// latest/queue/telemetry path used by the real HX711 poller.
+esp_err_t scale_hx711_start_fake_poll(TickType_t period,
+                                      UBaseType_t queue_len,
+                                      QueueHandle_t *out_queue);
+
 
 
 /**

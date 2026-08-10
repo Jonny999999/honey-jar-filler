@@ -11,15 +11,19 @@ extern "C" {
 #endif
 
 typedef enum {
-    UI_MENU_VIEW_LIST = 0,
-    UI_MENU_VIEW_EDIT
+    UI_MENU_VIEW_HOME = 0,
+    UI_MENU_VIEW_PRESET_LIST,
+    UI_MENU_VIEW_STRATEGY_LIST,
+    UI_MENU_VIEW_PARAM_LIST,
+    UI_MENU_VIEW_PARAM_EDIT,
 } ui_menu_view_t;
 
 typedef struct {
-    bool           active;
-    ui_menu_view_t view;
-    size_t         index;
-    app_params_t   working;
+    bool              active;
+    ui_menu_view_t    view;
+    size_t            index;
+    app_param_scope_t scope;
+    app_params_t      working;
 } ui_menu_t;
 
 void ui_menu_enter(ui_menu_t *m, const app_params_t *cur);

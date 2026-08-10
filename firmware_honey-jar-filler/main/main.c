@@ -23,8 +23,12 @@
 #include "iotest.h"
 #include "scale_hx711.h"
 #include "app.h"
+#include "telemetry.h"
 
 static const char *TAG = "main";
+
+#define CONFIG_TASK_PRIO_TELEMETRY 2
+#define CONFIG_TASK_CORE_TELEMETRY tskNO_AFFINITY
 
 
 static led_strip_handle_t s_strip;
@@ -50,6 +54,75 @@ static void ws2812_clear(void)
 {
     if (!s_strip) return;
     (void)led_strip_clear(s_strip);
+}
+
+// Probe the OLED before constructing the SSD1306 driver. The managed SSD1306
+// component uses blocking I2C transfers during init, so probing first keeps
+// startup from hanging on boards without the display attached.
+static ssd1306_handle_t startup_init_display(void)
+{
+    i2c_master_bus_config_t bus_cfg = {
+        .i2c_port = I2C_NUM_0,
+        .sda_io_num = CONFIG_DISPLAY_SDA_GPIO,
+        .scl_io_num = CONFIG_DISPLAY_SCL_GPIO,
+        .clk_source = I2C_CLK_SRC_DEFAULT,
+        .glitch_ignore_cnt = 7,
+        .flags.enable_internal_pullup = true,
+    };
+    ssd1306_config_t cfg = {
+        .bus = SSD1306_I2C,
+        .width = 128,
+        .height = 64,
+        .iface.i2c = {
+            .port = I2C_NUM_0,
+            .addr = 0x3C,
+            .rst_gpio = GPIO_NUM_NC,
+        },
+    };
+
+    i2c_master_bus_handle_t bus_handle = NULL;
+    ESP_LOGI(TAG, "startup: initializing I2C display bus");
+    esp_err_t err = i2c_new_master_bus(&bus_cfg, &bus_handle);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "startup: I2C display bus init failed (%s)", esp_err_to_name(err));
+        if (CONFIG_DISPLAY_REQUIRED) {
+            ESP_ERROR_CHECK(err);
+        }
+        return NULL;
+    }
+    ESP_LOGI(TAG, "startup: I2C display bus ready");
+
+    ESP_LOGI(TAG, "startup: probing OLED display");
+    err = i2c_master_probe(bus_handle, cfg.iface.i2c.addr, CONFIG_DISPLAY_PROBE_TIMEOUT_MS);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "startup: OLED probe failed (%s)", esp_err_to_name(err));
+        (void)i2c_del_master_bus(bus_handle);
+        if (CONFIG_DISPLAY_REQUIRED) {
+            ESP_ERROR_CHECK(err);
+        }
+        ESP_LOGW(TAG, "startup: continuing without display");
+        return NULL;
+    }
+
+    ESP_LOGI(TAG, "startup: initializing OLED display");
+    ssd1306_handle_t disp = NULL;
+    err = ssd1306_new_i2c(&cfg, &disp);
+    if (err != ESP_OK || !disp) {
+        ESP_LOGW(TAG, "startup: OLED init failed (%s)", esp_err_to_name(err));
+        (void)i2c_del_master_bus(bus_handle);
+        if (CONFIG_DISPLAY_REQUIRED) {
+            ESP_ERROR_CHECK(err != ESP_OK ? err : ESP_ERR_INVALID_STATE);
+        }
+        ESP_LOGW(TAG, "startup: continuing without display");
+        return NULL;
+    }
+
+    ssd1306_clear(disp);
+    ssd1306_draw_text(disp, 0, 0, "INITIALIZED", true);
+    ssd1306_display(disp);
+    ESP_LOGI(TAG, "startup: OLED display ready");
+
+    return disp;
 }
 
 // Startup LED strip self-test (blocking, runs once).
@@ -564,8 +637,10 @@ void app_main(void)
         ESP_ERROR_CHECK(nvs_flash_init());
     }
     // Default to warnings; bump specific components as needed.
+    // Strategy tags are raised explicitly so live dosing decisions and adaptive
+    // learning logs remain visible during tuning runs.
     esp_log_level_set("*", ESP_LOG_WARN);
-    esp_log_level_set("main", ESP_LOG_WARN);
+    esp_log_level_set("main", ESP_LOG_INFO);
     esp_log_level_set("app_params", ESP_LOG_INFO);
     esp_log_level_set("scale_hx711", ESP_LOG_WARN);
     esp_log_level_set("ui_task", ESP_LOG_INFO);
@@ -576,11 +651,23 @@ void app_main(void)
     esp_log_level_set("encoder_consumer", ESP_LOG_WARN);
     esp_log_level_set("scale_consumer", ESP_LOG_WARN);
     esp_log_level_set("filler_fsm", ESP_LOG_DEBUG);
+    esp_log_level_set("fill_strategy", ESP_LOG_DEBUG);
+    esp_log_level_set("fill_adaptive", ESP_LOG_DEBUG);
+    esp_log_level_set("fill_flowctrl", ESP_LOG_DEBUG);
+    esp_log_level_set("fill_manual", ESP_LOG_DEBUG);
+    esp_log_level_set("telemetry", ESP_LOG_INFO);
 
     // Load persistent app parameters (targets/timeouts).
     app_params_init();
     app_params_t app_params = {0};
     app_params_get(&app_params);
+
+    // Low-priority transport task for machine-readable telemetry. First step:
+    // start the backbone and publish a few lifecycle records only.
+    ESP_ERROR_CHECK(telemetry_start_task(CONFIG_TASK_PRIO_TELEMETRY, CONFIG_TASK_CORE_TELEMETRY));
+    (void)telemetry_publish_boot("firmware_start");
+    (void)telemetry_publish_preset(app_presets_get_active_index(),
+                                   app_presets_get_name(app_presets_get_active_index()));
 
 
     //=============================
@@ -634,10 +721,25 @@ void app_main(void)
     //===================
     //=== HX711 scale ===
     //===================
-    // init HX711 wrapper
+    // Keep the default startup strict on the real machine, but allow an
+    // explicit fake-sample mode for off-hardware telemetry testing.
     static scale_hx711_t scale;
-    ESP_ERROR_CHECK(scale_hx711_init(&scale));
-    scale_hx711_set_default(&scale);
+    esp_err_t scale_err = ESP_OK;
+    bool scale_fake_mode = (CONFIG_SCALE_FAKE_READS != 0);
+
+    if (scale_fake_mode) {
+        ESP_LOGW(TAG, "startup: using simulated scale samples");
+    } else {
+        scale_err = scale_hx711_init(&scale);
+        if (scale_err == ESP_OK) {
+            scale_hx711_set_default(&scale);
+        } else if (CONFIG_SCALE_REQUIRED) {
+            ESP_LOGE(TAG, "startup: scale init failed and the scale is required");
+            ESP_ERROR_CHECK(scale_err);
+        } else {
+            ESP_LOGW(TAG, "startup: scale init failed; continuing without real scale");
+        }
+    }
 
     #define SCALE_RUN_CALIBRATION 0
 #if SCALE_RUN_CALIBRATION //TODO: trigger this with UI
@@ -655,6 +757,7 @@ void app_main(void)
     //======================
     //=== Rotary Encoder ===
     //======================
+    ESP_LOGI(TAG, "startup: initializing rotary encoder");
     // Init the encoder library with that queue
     ESP_ERROR_CHECK(rotary_encoder_init(queue_encoder_events));
 
@@ -666,6 +769,7 @@ void app_main(void)
     };
     // Register encoder
     ESP_ERROR_CHECK(rotary_encoder_add(&enc));
+    ESP_LOGI(TAG, "startup: rotary encoder ready");
     // (Optional) Acceleration for faster turning feel
     //ESP_ERROR_CHECK(rotary_encoder_enable_acceleration(&enc, 400));
 
@@ -673,32 +777,7 @@ void app_main(void)
     //===============
     //=== Display ===
     //===============
-    i2c_master_bus_config_t bus_cfg = {
-        .i2c_port = I2C_NUM_0,
-        .sda_io_num = CONFIG_DISPLAY_SDA_GPIO,
-        .scl_io_num = CONFIG_DISPLAY_SCL_GPIO,
-        .clk_source = I2C_CLK_SRC_DEFAULT,
-        .glitch_ignore_cnt = 7,
-        .flags.enable_internal_pullup = true,
-    };
-    i2c_master_bus_handle_t bus_handle;
-    i2c_new_master_bus(&bus_cfg, &bus_handle);
-    ssd1306_config_t cfg = {
-        .bus = SSD1306_I2C,
-        .width = 128,
-        .height = 64,
-        .iface.i2c = {
-            .port = I2C_NUM_0,
-            .addr = 0x3C,
-            .rst_gpio = GPIO_NUM_NC,
-        },
-    };
-    ssd1306_handle_t disp;
-    ssd1306_new_i2c(&cfg, &disp);
-    ssd1306_clear(disp);
-    ssd1306_draw_text(disp, 0, 0, "INITIALIZED", true);
-    ssd1306_display(disp);
-    //ssd1306_draw_text_scaled(disp, 0, 4, "SSD1306 I2C", true, 2);
+    ssd1306_handle_t disp = startup_init_display();
 
 
     //=======================
@@ -714,7 +793,9 @@ void app_main(void)
         .open_deg = app_params.gate_open_deg,
         .close_deg = app_params.gate_close_deg,
     };
+    ESP_LOGI(TAG, "startup: initializing gate servo");
     ESP_ERROR_CHECK(gate_init(&gate_cfg));
+    ESP_LOGI(TAG, "startup: gate servo ready");
     if (CONFIG_DISABLE_SERVO) {
         ESP_LOGW(TAG, "Note: gate disabled by config");
         gate_set_enabled(false);
@@ -729,24 +810,38 @@ void app_main(void)
     //=== Start all tasks ===
     //=======================
     //--- buzzer task ---
+    ESP_LOGI(TAG, "startup: starting buzzer task");
     buzzer_task_start(3);
 
 
     // --- STARTUP SEQUENCE ---
+    ESP_LOGI(TAG, "startup: running startup sequence");
     buzzer_beep_short(3);
     if (CONFIG_WS2812_ENABLE && s_strip) {
         ws2812_startup_sequence();
     }
+    ESP_LOGI(TAG, "startup: startup sequence complete");
 
 
     //--- weight scale task ---
-    // start producer - constantly reads HX711 and updates a queue
-    ESP_ERROR_CHECK(scale_hx711_start_poll(
-        &scale,
-        CONFIG_HX711_AVG_SAMPLE_COUNT, //samples_avg
-        pdMS_TO_TICKS(CONFIG_HX711_POLL_INTERVAL_MS), //sample period
-        1,    // queue length - “latest only"
-        &queue_hx711_readouts));
+    if (scale_fake_mode) {
+        ESP_LOGI(TAG, "startup: starting simulated scale task");
+        ESP_ERROR_CHECK(scale_hx711_start_fake_poll(
+            pdMS_TO_TICKS(CONFIG_HX711_POLL_INTERVAL_MS),
+            1,
+            &queue_hx711_readouts));
+    } else if (scale_err == ESP_OK) {
+        // Start producer - constantly reads HX711 and updates a queue.
+        ESP_LOGI(TAG, "startup: starting HX711 scale task");
+        ESP_ERROR_CHECK(scale_hx711_start_poll(
+            &scale,
+            CONFIG_HX711_AVG_SAMPLE_COUNT,
+            pdMS_TO_TICKS(CONFIG_HX711_POLL_INTERVAL_MS),
+            1,
+            &queue_hx711_readouts));
+    } else {
+        ESP_LOGW(TAG, "startup: no scale source active; skipping scale task");
+    }
 
 
     //--- debug run modes: pick ONE for safety ---
