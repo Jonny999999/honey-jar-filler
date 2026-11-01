@@ -77,10 +77,20 @@ Registered in `app.h` (`app_fill_strategy_t`), `app.c` (`k_strategy_names`),
   bump, reduced-phase crawl/too fast), one direction per fill, ≤3. Reduced phase
   latched. Regime change (rate vs expectation ×1.6/×0.6, dead time ×1.6) resets
   the warmup. Learned no-flow **floor** for the reduced gate (also raises the
-  assumed onset). Persisted in NVS (`fill_agate`) as a **reference only**:
+  assumed onset). **Never stuck too low:** cold start 50 % (medium/thick focus;
+  thin honey is caught by safe-rate/too-fast), no-flow bumps +15 % up to 100 %
+  before the no-response fault (30 s at the last bump), and "zero flow after a
+  response" (hand press, blob, cut below onset) always opens again, ignoring
+  the correction budget/direction lock. In-fill fast corrections also move this
+  fill's reduced gate by the same factor (honey switch). Reduced gate learns UP
+  fast (clearly too slow → no confirmation, ≤10 pts) and DOWN cautiously (cliff).
+  Reduced target = 25 % of target rate, ≤ ½ of the achieved fast rate.
+  First hardware test (2026-11-01, no honey, hand presses) showed the old 30 %
+  start + max 2 bumps + inverted direction lock could sit too closed — fixed.
+  Persisted in NVS (`fill_agate`) as a **reference only**:
   warmup restarts each boot, first fill derated. ONE menu param (group "Auto
   gate"): `auto_fill_time_s` (25 s; speed vs spread). Slow rate (25 %), cold
-  start gate (30 %) and the Nachlauf seed (1.5 % of target) are `#define`s — a
+  start gate (50 %) and the Nachlauf seed (1.5 % of target) are `#define`s — a
   sim sweep showed they don't matter in sane ranges. Uses only target, tol
   low/high, fill_timeout and `drip_delay_ms` (seed of the learned drip wait);
   ignores `max_gate_pct`/`slow_gate_pct`/`slow_remaining_g`/`close_remaining_g`. Simulated only —
