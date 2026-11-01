@@ -10,10 +10,18 @@ Firmware + KiCad PCB + CAD for a machine that fills honey jars, and the subject
 of Jonny's **bachelor thesis**. The thesis evaluates **dosing strategies** and
 the difficulty of accurately dosing a viscous medium.
 
-- Thesis LaTeX: `/home/jonny/HAW-LA/s8/latex` (may not be present on every
-  machine). Well-developed chapters: `07_prozessanalyse` (the plant problem),
-  `08_heuristische`, `09_erweiterte` (adaptive); `10_regelungsbasierter` and
-  `11_strategievergleich` are still skeletons.
+- Thesis LaTeX: `/home/jonny/HAW-LA/bachelor/s8/latex` (may not be present on
+  every machine). **Finished and submitted** (repo tagged `v1.0`, 2026-08-10).
+  Conclusion (ch. 11/12): **adaptive-heuristic chosen** (~-1.6 g mean, smallest
+  spread); its stated limit = fixed gate openings, so fill time grows as the
+  bucket drains. Cascade shown in one 9-fill thin-dummy session only. Outlook
+  (ch. 12) = the post-thesis optimization list: learn openings/target rate in the
+  adaptive strategy, analytic close time, bucket-level pressure sensor, cascade
+  on real honey.
+- Recorded sessions live in the Syncthing folder
+  `/home/jonny/projects/honey-jar-filler/data/telemetry/` (its `.git` is corrupt —
+  data only). By date: 06-14 thick real honey, 06-17 fake honey, 07-05 dummy +
+  dark thin honey, 07-15..19 water-thin dummy.
 - Strategy control-diagram drafts (drawio, in the thesis repo):
   `Figures_src/diagrams_flow-cascade_DRAFT.drawio` — portrait + horizontal
   cascade/Smith-predictor block diagrams and a flowchart, in Jonny's style
@@ -58,6 +66,25 @@ Registered in `app.h` (`app_fill_strategy_t`), `app.c` (`k_strategy_names`),
   `doc/cascade-affine-gain-testnotes.md` for the test checklist). Conservative by
   design. Framing: outer profile is a *Steuerung*/trajectory generator (function
   of remaining mass, no feedback); inner PI+feedforward is the *Regelung*.
+- **adaptive-gate** (`filler_strategy_adaptive_gate.c`, post-thesis, branch
+  `adaptive-gate-learning`) — the "turn on and forget" mode. Adaptive heuristic
+  + **learned gate openings** per phase so each runs at a target rate
+  (`r_f* = target/auto_fill_time_s`, `r_s* = auto_slow_rate_pct·min(r_f*, achieved)`).
+  NOT a continuous controller: between fills a steady LS rate per phase moves the
+  learned gate only outside a ±15 % band (slow: ±25 %, two agreeing fills),
+  damped (α 0.75, sign-flip halving); within a fill only gross cases act (>1.5×
+  cumulative / >2× sliding too fast, <½ too slow while >40 % remains, no flow →
+  bump, reduced-phase crawl/too fast), one direction per fill, ≤3. Reduced phase
+  latched. Regime change (rate vs expectation ×1.6/×0.6, dead time ×1.6) resets
+  the warmup. Learned no-flow **floor** for the reduced gate (also raises the
+  assumed onset). Persisted in NVS (`fill_agate`) as a **reference only**:
+  warmup restarts each boot, first fill derated. ONE menu param (group "Auto
+  gate"): `auto_fill_time_s` (25 s; speed vs spread). Slow rate (25 %), cold
+  start gate (30 %) and the Nachlauf seed (1.5 % of target) are `#define`s — a
+  sim sweep showed they don't matter in sane ranges. Uses only target, tol
+  low/high, fill_timeout and `drip_delay_ms` (seed of the learned drip wait);
+  ignores `max_gate_pct`/`slow_gate_pct`/`slow_remaining_g`/`close_remaining_g`. Simulated only —
+  **hardware test pending**.
 - **manual** (`filler_strategy_manual.c`) — encoder→gate, button→advance.
 - **sequence** (`filler_strategy_sequence.c`) — scripted timed gate script
   (edit `k_seq[]`), no target/learning; for a clean Strecke (plant) reference
@@ -260,6 +287,12 @@ learned/measured dead_time/post_close/rates, adapted close/near thresholds, and
   `target_g/CASC_FAST_FILL_S` trajectory; only the plant model is learned.
 
 ## Analysis tooling
+`tools/sim/` — **host simulator running the real strategy C code** against a
+closed-loop plant calibrated on the recorded sessions (see `tools/sim/README.md`).
+`tools/sim/build.sh` then `python3 tools/sim/scenarios.py [-s NAME] [-c CONFIG] [-d]`
+(drain, thick, concave, dark honey, bucket top-up, mid-fill top-up, honey switch,
+reboot). Rebuild after every firmware change. Use it before flashing.
+
 `tools/telemetry/cascade_analyze.py <session_dir> [--fill N] [--every K]` — per-fill
 K/b/onset/operating-point summary table + optional per-sample gate/rate/model
 trace. Built this session to stop re-deriving the cascade diagnostics each time;
@@ -268,44 +301,33 @@ extend it rather than writing throwaway scripts.
 ## Conventions
 - Commits: `FW:` (firmware) / `TOOL:` (host tools) / `DOC:` (docs/notes) prefix,
   comma-separated changes; "Add new fill strategy: <name> (...)" for new
-  strategies. End with `Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>`.
+  strategies. **No `Co-Authored-By` / AI attribution trailers** in this repo (the
+  remote history was rewritten to remove them; don't reintroduce).
   Merges: `Merge branch 'fill-strategies' into dev - <summary>`.
 - The clangd "Unknown argument '-mlongcalls'…" IDE errors are xtensa-vs-clang
   noise — ignore; trust `idf.py build`.
 
 ## Current state / next
-All strategies build clean. **Active work is on branch `testing`** — a scratch
-branch for iterative hardware tuning of the cascade, one small commit per test
-iteration, to be squash/merged to `dev` manually later.
+Repo re-synced 2026-11-01: the remote history had been rewritten (Claude
+co-author trailers stripped) — local was reset to the remote, `debug` branch
+deleted, `dev` == `main` == `v1.0`. Branching: feature branches off `dev`,
+merge `--no-ff` (feature→dev, dev→main).
 
-Latest arc (all on `testing`, thin dummy medium): RLS identification was found to
-**diverge** (`16:00` run: K on a rail ~½ of samples) → replaced with a **single
-local gain** `K=EWMA(rate/(gate−onset))` (`0f8a623`). That was stable but
-**starved** (`20:23` test2: 3 observations in 17 fills, K/onset/τ frozen at seeds,
-jars accurate only via the close/drip heuristic) → added a deliberate
-**identification probe** (`8ff038f`, a fixed-gate hold to force a clean
-observation). Chart tool gained a **`cascade` session-summary group** (`plot_runs.py`
-`--session-summary-groups cascade`): cross-run `used_/next_` param trends +
-a within-session per-sample timeline with observation markers. Builds clean,
-**probe flash + retest pending**.
+**Active:** branch `adaptive-gate-learning` — new strategy `adaptive-gate` +
+`tools/sim/`. Builds clean (ESP-IDF 5.5.1). Sim (5 seeds, all scenarios): 100 %
+jars ok, no faults, mean −0.6…−2.1 g, sd 1.6–3 g, first jar +0.5…+3.9 g (baseline
+tuned: +4…+11 g); fill time still rises as the bucket drains but much less
+(thin: ×1.5 at 25 s, ×1.3 at 12 s vs ×2.2 baseline; thick: no gain, gate already
+100 %); ~1 in-fill correction per normal session. Weakest case: dark thin honey
+(onset ~24 %) sd 3 g / max 9.9 g vs 1.6 / 3.7 g for a well-tuned preset. Default 25 s is deliberately slower than the
+tuned thin baseline (33 vs 12 s open); `auto_fill_time_s=12` → ~18 s.
+`APP_PARAMS_VERSION` 15→16: first boot after flashing resets presets/machine
+params/selected strategy to built-in defaults.
 
-**Next:**
-- Flash `8ff038f`, rerun the thin dummy cascade fill (keep the bucket topped up so
-  the plant is stationary). Verify with `cascade_analyze.py` **and** the new
-  `plot_runs.py … --session-summary-groups cascade` charts: the probe should now
-  produce ≥1 observation per early fill, K̂ should climb off the 0.36 seed toward
-  ~0.8–1.4 (thin dummy) and onset toward ~17–19 %, and the timeline's model ŷ
-  should start tracking the measured rate.
-- If K̂ moves but the loop still hunts, the seed K̂ (0.36) is ~2× low → **seed it
-  higher** so the first-fill feedforward doesn't over-open. Then re-tune the
-  symptom-fighting constants (deadband 1.5, asymmetric slew 15/6), which were set
-  against a broken model.
-- τ still tends to sit at its 0.60 s seed (needs a clean opening dwell — the probe
-  should now supply one); check whether it moves, else simplify τ too.
-- Then: collect thesis charts (adaptive learning trend + the cascade
-  parameter-evolution trend/timeline) and fill in skeletons `10_regelungsbasierter`
-  / `11_strategievergleich` + LaTeX control equations matching the drawio diagrams.
-
-**Uncommitted (host side, was noted earlier):** `plot_runs.py` `_plot_control_panel`
-(rate error / prediction error / PI integrator) written but NOT wired into the
-gridspec/render path — finish + commit as `TOOL:`.
+**Next:** flash + hardware test of `adaptive-gate` (thin dummy first, bucket
+draining; then real honey); check telemetry `used_/next_fast|slow_gate_pct`,
+`obs_*_rate_gps`, `gate_corrections`, `regime_change` in the fill summaries.
+Open ideas: signed finish-trim on the ~−2 g bias (or aim slightly above target —
+legal underfill rules), menu/OLED display of the learned gates, plot support for
+the new summary fields. ESP-IDF version is mixed in the repo (`dependencies.lock`
+says 5.5.2, `sdkconfig`/README say 5.5.1) — pick one.
