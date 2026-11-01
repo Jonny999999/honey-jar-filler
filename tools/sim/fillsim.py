@@ -162,6 +162,13 @@ def run_session(strategy: str, medium: str | Medium, n_fills: int, bucket_g: flo
                     if t_in >= ev.at_s:
                         if ev.kind == "refill_midfill":
                             plant.add_to_bucket(float(ev.value))
+                        elif ev.kind == "press_midfill":
+                            # value = (grams, seconds): someone pushes on the scale
+                            g, dur = ev.value
+                            plant.ext_g = float(g)
+                            midfill.append(Event(ev.fill, "release_midfill", None, at_s=ev.at_s + float(dur)))
+                        elif ev.kind == "release_midfill":
+                            plant.ext_g = 0.0
                         elif ev.kind == "medium_midfill":
                             plant.set_medium(make_medium(ev.value) if isinstance(ev.value, str) else ev.value)
                         midfill.remove(ev)

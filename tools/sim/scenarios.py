@@ -62,6 +62,19 @@ def scenarios():
             "gate default": ("adaptive-gate", dict(AUTO, target_grams=500, target_tol_high_g=10,
                                                    drip_delay_ms=25000, fill_timeout_ms=600000)),
         }),
+        "very_thick": ("very_thick", 6, 7400, [], {
+            "adaptive tuned-thick": ("adaptive-heuristic", dict(THICK_TUNED)),
+            "gate fw-defaults": ("adaptive-gate", {}),
+        }),
+        "hand_press": ("thick", 4, 7000, [Event(1, "press_midfill", (4.0, 3.0), at_s=3.0)], {
+            "gate fw-defaults": ("adaptive-gate", {}),
+        }),
+        "prod_thin_honey": ("dark_thin_honey", 8, 7000, [], {
+            "gate fw-defaults": ("adaptive-gate", {}),
+        }),
+        "prod_thin_dummy": ("thin_dummy", 8, 7000, [], {
+            "gate fw-defaults": ("adaptive-gate", {}),
+        }),
         "reboot_refilled": ("thin_dummy", 10, 2000,
                             [Event(6, "reboot"), Event(6, "refill_bucket", 2500)], thin_cfg),
     }

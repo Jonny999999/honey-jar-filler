@@ -92,6 +92,13 @@ MEDIA: dict[str, Medium] = {
                               tau_s=0.5, residue_g=3.0, residue_tau_s=5.0, onset_pool_g=4.0,
                               close_impact_g=5.0, onset_impact_g=2.0, breakup_rate_gps=3.0,
                               drop_mass_g=0.3, head_exp=1.0, m_ref_g=8700.0),
+    # Very thick / cold or creamed honey (extrapolated, not recorded): half the
+    # thick flow, longer strand build -> ~2 g/s at 50 %, ~20 s opening dead time.
+    "very_thick": Medium(name="very_thick", K=0.05, onset=10.0, curve=1.0,
+                         l_min_s=1.5, m_build_g=40.0, adjust_delay_s=2.0, close_delay_s=0.6,
+                         tau_s=1.5, residue_g=6.0, residue_tau_s=12.0, onset_pool_g=8.0,
+                         close_impact_g=12.0, onset_impact_g=3.0, breakup_rate_gps=2.0,
+                         drop_mass_g=0.5, head_exp=1.0, m_ref_g=7400.0),
     # Fake honey, 2026-06-17: 27 % stable ~9 g/s, 50 % ~39 g/s (K~1.3, onset ~20 %).
     "fake_honey": Medium(name="fake_honey", K=1.3, onset=20.0, curve=1.0,
                          l_min_s=0.5, m_build_g=6.0, adjust_delay_s=0.3, close_delay_s=0.3,
@@ -127,6 +134,7 @@ class Plant:
         self.first_contact = False
         self.hist: list[float] = []  # apparent mass for the scale averaging window
         self.dispensed_g = 0.0       # total mass that left the bucket
+        self.ext_g = 0.0             # external force on the scale (hand press), apparent grams
 
     # ------------------------------------------------------------------
     def head_factor(self) -> float:
@@ -231,7 +239,7 @@ class Plant:
                 self.jar_mass += m.drop_mass_g
                 self.pending -= m.drop_mass_g
         self.impact *= math.exp(-dt / max(m.impact_tau_s, 1e-3))
-        self.hist.append(self.jar_tare + self.jar_mass + self.impact)
+        self.hist.append(self.jar_tare + self.jar_mass + self.impact + self.ext_g)
         n = max(1, int(round((m.scale_avg_ms / 1000.0) / dt)))
         if len(self.hist) > n:
             del self.hist[: len(self.hist) - n]
