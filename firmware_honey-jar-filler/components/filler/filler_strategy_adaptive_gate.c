@@ -127,7 +127,8 @@
 #define AG_SLOW_TOO_FAST 2.0f           // reduced phase above this x target = cut now
 
 // ---- close threshold vs actual slow rate ------------------------------------
-#define AG_CLOSE_SCALE_MIN 0.8f
+#define AG_CLOSE_SCALE_MIN 0.6f        // with a full steady window
+#define AG_CLOSE_SCALE_MIN_SLIDE 0.75f  // with only the 2 s sliding window
 #define AG_CLOSE_SCALE_MAX 2.0f
 #define AG_CLOSE_SCALE_DEADBAND 0.20f
 
@@ -649,7 +650,9 @@ static void update_thresholds(filler_strategy_runtime_t *rt, const filler_strate
         if (sliding && r > 1.0f + AG_CLOSE_SCALE_DEADBAND) {
             scale = clampf_local(r, 1.0f, AG_CLOSE_SCALE_MAX);           // faster: close earlier
         } else if (steady && r < 1.0f - AG_CLOSE_SCALE_DEADBAND) {
-            scale = clampf_local(r, AG_CLOSE_SCALE_MIN, 1.0f);           // slower: only with a full window
+            scale = clampf_local(r, AG_CLOSE_SCALE_MIN, 1.0f);           // slower: close later
+        } else if (sliding && r < 1.0f - AG_CLOSE_SCALE_DEADBAND) {
+            scale = clampf_local(r, AG_CLOSE_SCALE_MIN_SLIDE, 1.0f);
         } else if (!sliding && r > 2.0f) {
             // no steady slow window yet: the filtered rate still carries the
             // fast-phase transition, so only a GROSS excess closes earlier
@@ -1030,6 +1033,8 @@ static void mark_first_close(filler_strategy_runtime_t *rt, const filler_strateg
     if (!tick->latest || rt->first_close_seen) return;
     if (s_fill.phase == PH_SLOW && s_fill.slide_valid) s_fill.close_rate_meas = s_fill.slide_rate;
     else if (s_fill.phase == PH_SLOW && s_fill.seg_coarse_valid) s_fill.close_rate_meas = s_fill.seg_coarse_rate;
+    else s_fill.close_rate_meas = rt->filtered_rate_medium_gps;   // rough, but the post-close
+                                                                  // gain learned now belongs to it
     seg_store_obs();
     rt->first_close_seen = true;
     rt->first_close_ts_us = tick->latest->ts_us;
