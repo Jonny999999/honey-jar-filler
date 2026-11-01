@@ -59,11 +59,16 @@
 #define AG_ONSET_PCT 15.0f
 #define AG_MIN_FLOW_MARGIN_PCT 3.0f     // never learn a gate below onset + this
 #define AG_GATE_CAP_PCT 100.0f
-#define AG_COLD_FAST_GATE_PCT 30.0f     // first-ever opening (corrected in-fill if far off)
+// First-ever opening. Real honey ranges from ~66 g/s at 50 % (dark thin) to
+// ~4 g/s at 50 % (thick, needs ~100 %). 50 % is the middle: thick honey flows
+// at once and is opened further in-fill, thin honey is caught by the safe-rate
+// cutback / in-fill too-fast rule within ~1 s (no spill on a 500 g jar).
+#define AG_COLD_FAST_GATE_PCT 50.0f
 #define AG_COLD_SLOW_GATE_PCT 24.0f     // slow gate before anything is known
 // Reduced-phase rate as % of the fast rate. Sim sweep: 25-50 % all equivalent,
 // 10 % crawls at the onset cliff (refills) -> fixed, not a menu parameter.
 #define AG_SLOW_RATE_PCT 25.0f
+#define AG_SLOW_MAX_OF_ACHIEVED 0.5f    // ... but at most half the achieved fast rate
 // First-ever post-close (Nachlauf) guess, from the jar size instead of the
 // legacy close_remaining_g (whose default 150 g caused ~3 refills/session).
 // Measured Nachlauf: thin ~5 g @300 g, thick ~7-9 g @500 g.
@@ -79,6 +84,10 @@
 #define AG_SLOW_DEADBAND 0.25f
 #define AG_SLOW_LEARN_ALPHA 0.5f
 #define AG_SLOW_STEP_UP_MAX_PCT 3.0f
+// Going UP only costs time (close scaling covers accuracy), the no-flow cliff
+// is only below: a clearly too slow reduced phase moves up at once, further.
+#define AG_SLOW_CLEARLY_SLOW 1.5f
+#define AG_SLOW_STEP_UP_CLEAR_PCT 10.0f
 #define AG_SLOW_STEP_DOWN_MAX_PCT 1.5f  // going down risks the no-flow cliff
 // "Barely anything flowed at gate g" is certain one-sided evidence that the
 // onset is above g: the reduced opening never goes below that again.
@@ -118,9 +127,14 @@
 #define AG_INRUN_DOWN_RATIO_MIN 0.35f
 #define AG_INRUN_MAX_CORRECTIONS 3u
 #define AG_INRUN_UP_MIN_REMAINING_FRAC 0.40f
-#define AG_NOFLOW_BUMP_PCT 12.0f        // nothing comes out -> open this much more
+#define AG_NOFLOW_BUMP_PCT 15.0f        // nothing comes out -> open this much more
 #define AG_NOFLOW_BUMP_AFTER_S 8.0f     // ... after this long without response
-#define AG_NOFLOW_MAX_BUMPS 2u
+#define AG_NOFLOW_MAX_BUMPS 8u          // effectively: keep opening up to the cap
+// "No flow" after a response (a blob, a bump against the scale): the steady
+// rate is ~0. Never a state to stay in -> open further regardless of the
+// correction budget / direction lock.
+#define AG_ZERO_FLOW_GPS 0.5f
+#define AG_ZERO_FLOW_TARGET_FRAC 0.10f
 #define AG_SLOW_STALL_FRAC 0.4f         // reduced phase below this x target = crawling
 #define AG_SLOW_STALL_BUMP_PCT 3.0f
 #define AG_SLOW_STALL_MAX 2u
@@ -153,8 +167,11 @@
 #define RESPONSE_THRESHOLD_MAX_G 6.0f
 #define DEAD_TIME_MIN_S 0.10f
 #define DEAD_TIME_MAX_S 15.00f
-#define NO_RESPONSE_MIN_S 15.00f
-#define NO_RESPONSE_MAX_S 30.00f
+// Measured from the LAST no-flow bump, i.e. normally with the gate at 100 %.
+// Waiting with the gate open over an empty bucket cannot spill, while very
+// thick/cold honey may need long to form a strand -> generous.
+#define NO_RESPONSE_MIN_S 30.00f
+#define NO_RESPONSE_MAX_S 45.00f
 #define NO_RESPONSE_DEAD_TIME_MULT 4.0f
 #define NO_RESPONSE_EXTRA_S 1.5f
 #define CLOSE_BUFFER_G 1.5f
@@ -219,6 +236,7 @@ typedef struct {
     uint8_t noflow_bumps;
     uint8_t slow_bumps;
     float open_rate;                   // first steady rate of the opening segment
+    float open_gate_cmd;               // gate this fill opened at
     float open_gate;
     int64_t last_bump_us;
     // current constant-gate segment
@@ -241,7 +259,9 @@ typedef struct {
     bool slide_valid;
     float close_rate_meas;             // sliding rate at the close command
     uint8_t slow_cuts;
-    int8_t dir_lock[PH_COUNT];         // in-fill corrections never reverse within a fill
+    float floor_evidence;              // highest reduced gate this fill that (nearly) did not flow
+    int8_t dir_lock[PH_COUNT];         // in-fill corrections never reverse within a fill:
+                                       // -1 = already cut (no opening), +1 = already opened (no cut)
     // last valid segment per phase (learning input)
     bool obs_valid[PH_COUNT];
     float obs_gate[PH_COUNT];
@@ -287,6 +307,7 @@ static float gate_min_pct(void) { return AG_ONSET_PCT + AG_MIN_FLOW_MARGIN_PCT; 
 // Effective flow onset: the geometric assumption, raised (never lowered) by the
 // learned no-flow floor - proven evidence that nothing flows below it.
 static float s_onset_eff = AG_ONSET_PCT;
+static float s_slow_floor_now;   // learned reduced-gate floor of the active preset
 
 // Ratio rule on the open part of the gate: the flow is ~proportional to
 // (gate - onset), so scaling that part by r*/r targets r*.
@@ -295,6 +316,11 @@ static float gate_for_ratio(float gate, float ratio)
     float open = fmaxf(gate - s_onset_eff, AG_MIN_FLOW_MARGIN_PCT);
     return s_onset_eff + open * ratio;
 }
+
+// An in-fill correction of the fast gate proves this honey flows differently
+// than the learned reference (thinner/thicker batch, bucket topped up): the
+// reduced opening of THIS fill moves by the same factor on the open part.
+static void follow_slow_gate(float fast_before, float fast_after);
 
 // ------------------------------------------------------------ store -------
 
@@ -370,6 +396,7 @@ static ag_entry_t *entry_for(uint8_t preset, const app_params_t *p, bool *was_pe
                  (unsigned)preset, (double)e->gate_pct[PH_FAST], (double)e->gate_pct[PH_SLOW]);
     }
     s_onset_eff = fmaxf(AG_ONSET_PCT, e->slow_floor_pct - AG_FLOOR_MARGIN_PCT);
+    s_slow_floor_now = e->slow_floor_pct;
     return e;
 }
 
@@ -383,14 +410,14 @@ static float fast_target_gps(const app_params_t *p)
 
 static float slow_target_gps(const app_params_t *p, const ag_entry_t *e)
 {
-    // A gate-saturated fast phase (thick honey at 100 %) delivers less than r_f*;
-    // the slow phase is a fraction of what the fast phase really achieves then.
-    // No loop: the fast gate is pinned at its cap in exactly that case.
-    float fast = fast_target_gps(p);
-    if (e && e->obs_rate_gps[PH_FAST] > 0.1f && e->obs_rate_gps[PH_FAST] < fast) {
-        fast = e->obs_rate_gps[PH_FAST];
-    }
-    return fmaxf(0.5f, fast * AG_SLOW_RATE_PCT / 100.0f);
+    // Accuracy depends on the ABSOLUTE rate at close, so the reduced phase aims
+    // at a fixed fraction of the target rate. A gate-saturated fast phase
+    // (thick honey at 100 %) may deliver less: then at most half of what it
+    // really achieves, so the reduced phase still is a reduction. No loop: the
+    // fast gate is pinned at its cap in exactly that case.
+    float slow = fast_target_gps(p) * AG_SLOW_RATE_PCT / 100.0f;
+    if (e && e->obs_rate_gps[PH_FAST] > 0.1f) slow = fminf(slow, e->obs_rate_gps[PH_FAST] * AG_SLOW_MAX_OF_ACHIEVED);
+    return fmaxf(0.5f, slow);
 }
 
 // --------------------------------------------- inherited rate machinery ---
@@ -480,6 +507,15 @@ static float settle_dead_time_s(const filler_strategy_runtime_t *rt)
 static void seg_store_obs(void)
 {
     int ph = s_fill.phase;
+    // "barely anything flowed at this reduced gate" is kept even if a later
+    // segment of the same phase becomes the learning observation
+    if (ph == PH_SLOW && (s_fill.seg_valid || s_fill.seg_coarse_valid)) {
+        float r = s_fill.seg_valid ? s_fill.seg_rate : s_fill.seg_coarse_rate;
+        if (r < s_fill.target_gps[PH_SLOW] * AG_FLOOR_EVIDENCE_FRAC &&
+            s_fill.seg_gate + AG_FLOOR_MARGIN_PCT > s_fill.floor_evidence) {
+            s_fill.floor_evidence = s_fill.seg_gate + AG_FLOOR_MARGIN_PCT;
+        }
+    }
     if (!s_fill.seg_valid) {
         // a reduced phase too short for a full window still proves "clearly
         // too fast" (the case that never self-corrects otherwise: too fast ->
@@ -605,6 +641,18 @@ static void command_phase_gate(filler_strategy_runtime_t *rt, const filler_strat
     command_gate(rt, env, phase, gate, label, now_us, true);
 }
 
+static void follow_slow_gate(float fast_before, float fast_after)
+{
+    if (s_fill.reduced_latched) return;
+    float k = (fast_after - s_onset_eff) / fmaxf(fast_before - s_onset_eff, AG_MIN_FLOW_MARGIN_PCT);
+    k = clampf_local(k, AG_INRUN_DOWN_RATIO_MIN, AG_INRUN_UP_RATIO_MAX);
+    float before = s_fill.gate_cmd[PH_SLOW];
+    float g = gate_for_ratio(before, k);
+    g = clampf_local(g, fmaxf(gate_min_pct(), s_slow_floor_now), fmaxf(fast_after, gate_min_pct()));
+    s_fill.gate_cmd[PH_SLOW] = g;
+    ESP_LOGI(TAG, "reduced gate follows the in-fill correction: %.1f%% -> %.1f%%", (double)before, (double)g);
+}
+
 // ------------------------------------------------- thresholds (parent) ----
 
 static float transition_fast_rate_gps(const filler_strategy_runtime_t *rt)
@@ -620,7 +668,10 @@ static float transition_fast_rate_gps(const filler_strategy_runtime_t *rt)
 // observation (dead time + settle + window), at the slow TARGET rate.
 static float near_window_g(const filler_strategy_runtime_t *rt, const app_params_t *p)
 {
-    float L = rt->learned_dead_time_s;
+    // this fill's own measured dead time once known: after a honey change the
+    // learned one belongs to the old honey (thick L x thin rate = a reduced
+    // phase starting hundreds of grams early)
+    float L = settle_dead_time_s(rt);
     float dwell_s = fmaxf(2.5f, L + AG_SETTLE_AFTER_CHANGE_S + AG_WINDOW_MIN_S + 1.5f);
     float margin = clampf_local(s_fill.target_gps[PH_SLOW] * dwell_s,
                                 NEAR_CLOSE_CONTROL_MARGIN_MIN_G, NEAR_CLOSE_CONTROL_MARGIN_MAX_G);
@@ -778,7 +829,8 @@ static bool learn_phase_gate(ag_entry_t *e, int ph, const app_params_t *p, float
     // single observation is noisy (drips): act only when two consecutive fills
     // agree on the direction, on their geometric mean. A regime change or an
     // in-fill correction is evidence enough on its own.
-    if (slow && !s_fill.regime_change && !s_fill.obs_from_correction[ph]) {
+    bool clearly_slow = slow && ratio > AG_SLOW_CLEARLY_SLOW;
+    if (slow && !clearly_slow && !s_fill.regime_change && !s_fill.obs_from_correction[ph]) {
         float pend = e->slow_pending_ratio;
         if (!out_of_band) {
             e->slow_pending_ratio = 0.0f;
@@ -813,7 +865,7 @@ static bool learn_phase_gate(ag_entry_t *e, int ph, const app_params_t *p, float
     // step limits only bound the slow drift learning; an in-fill correction
     // already proved the new gate on the plant
     if (slow || !s_fill.obs_from_correction[ph]) {
-        float up = slow ? AG_SLOW_STEP_UP_MAX_PCT : AG_STEP_UP_MAX_PCT;
+        float up = slow ? (clearly_slow ? AG_SLOW_STEP_UP_CLEAR_PCT : AG_SLOW_STEP_UP_MAX_PCT) : AG_STEP_UP_MAX_PCT;
         float down = slow ? AG_SLOW_STEP_DOWN_MAX_PCT : AG_STEP_DOWN_MAX_PCT;
         next = clampf_local(next, before - down, before + up);
     }
@@ -885,6 +937,11 @@ static void publish_summary_and_learn(filler_strategy_runtime_t *rt, const fille
     bool gate_learn = rt->response_detected && strcmp(reason ? reason : "", "scale_stale") != 0;
     float ratio_f = 1.0f, ratio_s = 1.0f;
     bool ch_f = false, ch_s = false;
+    if (gate_learn && s_fill.floor_evidence > e->slow_floor_pct) {
+        e->slow_floor_pct = s_fill.floor_evidence;
+        ESP_LOGI(TAG, "slow floor -> %.1f%% (reduced phase crawled below it)", (double)e->slow_floor_pct);
+        if (e->gate_pct[PH_SLOW] < e->slow_floor_pct) e->gate_pct[PH_SLOW] = e->slow_floor_pct;
+    }
     if (gate_learn) {
         float fast_before = e->gate_pct[PH_FAST];
         ch_f = learn_phase_gate(e, PH_FAST, p, &ratio_f);
@@ -1061,7 +1118,10 @@ static void check_regime(filler_strategy_runtime_t *rt, const ag_entry_t *e)
     float open_obs = fmaxf(e->obs_gate_pct[PH_FAST] - s_onset_eff, AG_MIN_FLOW_MARGIN_PCT);
     float expected = e->obs_rate_gps[PH_FAST] * open_now / open_obs;
     float dev = s_fill.seg_rate / fmaxf(expected, 0.1f);
-    float dt_dev = (e->dead_time_s > 0.0f && rt->measured_dead_time_s > 0.0f)
+    // dead time depends on the flow itself (L ~ m/q), so compare it only when
+    // this fill opened at about the gate the reference was observed at
+    bool same_gate = fabsf(s_fill.open_gate_cmd - e->obs_gate_pct[PH_FAST]) < 5.0f;
+    float dt_dev = (same_gate && e->dead_time_s > 0.0f && rt->measured_dead_time_s > 0.0f)
         ? rt->measured_dead_time_s / e->dead_time_s : 1.0f;
     if (dev > AG_REGIME_HI || dev < AG_REGIME_LO || dt_dev > AG_REGIME_DEAD_TIME || dt_dev < 1.0f / AG_REGIME_DEAD_TIME) {
         s_fill.regime_change = true;
@@ -1075,9 +1135,21 @@ static bool inrun_correct_fast(filler_strategy_runtime_t *rt, const filler_strat
                                const filler_strategy_tick_t *tick, float remaining_g)
 {
     if (s_fill.reduced_latched || s_fill.phase != PH_FAST) return false;
-    if (s_fill.corrections >= AG_INRUN_MAX_CORRECTIONS) return false;
     if (!s_fill.seg_valid && !s_fill.slide_valid) return false;
     float target = s_fill.target_gps[PH_FAST];
+    if (s_fill.seg_valid && s_fill.slide_valid && s_fill.seg_gate < AG_GATE_CAP_PCT - 0.5f &&
+        fmaxf(s_fill.seg_rate, s_fill.slide_rate) < fmaxf(AG_ZERO_FLOW_GPS, target * AG_ZERO_FLOW_TARGET_FRAC)) {
+        float g0 = s_fill.seg_gate;
+        float g1 = clampf_local(g0 + AG_NOFLOW_BUMP_PCT, gate_min_pct(), AG_GATE_CAP_PCT);
+        s_fill.corrections++;
+        s_fill.dir_lock[PH_FAST] = 1;
+        ESP_LOGW(TAG, "in-fill no_flow: rate %.2f g/s over %.1f s -> fast gate %.1f%% -> %.1f%%",
+                 (double)fmaxf(s_fill.seg_rate, s_fill.slide_rate), (double)s_fill.seg_window_s, (double)g0, (double)g1);
+        s_fill.obs_from_correction[PH_FAST] = true;
+        command_phase_gate(rt, env, PH_FAST, g1, "no_flow", tick->now_us);
+        return true;
+    }
+    if (s_fill.corrections >= AG_INRUN_MAX_CORRECTIONS) return false;
     // too fast: the sliding window (sees a step, e.g. the bucket topped up
     // mid-fill); too slow: the cumulative AND the sliding rate must agree
     bool cum_fast = s_fill.seg_valid && s_fill.seg_rate > target * AG_INRUN_TOO_FAST;
@@ -1088,13 +1160,13 @@ static bool inrun_correct_fast(filler_strategy_runtime_t *rt, const filler_strat
     float next = g;
     const char *why = NULL;
     int8_t dir = 0;
-    if ((cum_fast || slide_fast) && s_fill.dir_lock[PH_FAST] >= 0) {
+    if ((cum_fast || slide_fast) && s_fill.dir_lock[PH_FAST] <= 0) {
         // size by the calmer cumulative rate unless only the step detector saw it
         r = cum_fast ? s_fill.seg_rate : s_fill.slide_rate;
         next = gate_for_ratio(g, clampf_local(target / r, AG_INRUN_DOWN_RATIO_MIN, 1.0f));
         why = "too_fast";
         dir = -1;
-    } else if (s_fill.dir_lock[PH_FAST] <= 0 && (r = r_slow) * AG_INRUN_TOO_SLOW < target && g < AG_GATE_CAP_PCT - 0.5f &&
+    } else if (s_fill.dir_lock[PH_FAST] >= 0 && (r = r_slow) * AG_INRUN_TOO_SLOW < target && g < AG_GATE_CAP_PCT - 0.5f &&
                remaining_g > (float)tick->params->target_grams * AG_INRUN_UP_MIN_REMAINING_FRAC) {
         float ratio = (r > 0.2f) ? fminf(target / r, AG_INRUN_UP_RATIO_MAX) : AG_INRUN_UP_RATIO_MAX;
         next = fminf(gate_for_ratio(g, ratio), g + AG_INRUN_UP_STEP_MAX_PCT);
@@ -1109,6 +1181,7 @@ static bool inrun_correct_fast(filler_strategy_runtime_t *rt, const filler_strat
     ESP_LOGW(TAG, "in-fill %s: rate %.1f g/s target %.1f g/s over %.1f s -> fast gate %.1f%% -> %.1f%%",
              why, (double)r, (double)target, (double)s_fill.seg_window_s, (double)g, (double)next);
     s_fill.obs_from_correction[PH_FAST] = true;
+    follow_slow_gate(g, next);
     command_phase_gate(rt, env, PH_FAST, next, why, tick->now_us);
     return true;
 }
@@ -1144,6 +1217,7 @@ static void ag_on_enter(filler_strategy_runtime_t *rt, filler_state_t state, fil
                                                         gate_min_pct(), AG_GATE_CAP_PCT);
             }
             s_fill.gate_start[PH_FAST] = s_fill.gate_cmd[PH_FAST];
+            s_fill.open_gate_cmd = s_fill.gate_cmd[PH_FAST];
             s_fill.gate_start[PH_SLOW] = s_fill.gate_cmd[PH_SLOW];
             ESP_LOGI(TAG, "start fill preset=%u fills=%lu/%lu target %.1f/%.1f g/s gates fast=%.1f%% slow=%.1f%%%s",
                      (unsigned)tick->preset_index, (unsigned long)e->successful_fills, (unsigned long)e->total_fills,
@@ -1296,6 +1370,7 @@ static filler_state_t ag_step(filler_strategy_runtime_t *rt, filler_state_t stat
                 s_fill.safe_gate = g;
                 s_fill.safe_rate = rt->filtered_rate_gps;
                 s_fill.gate_cmd[PH_FAST] = clampf_local(fminf(ng, g), gate_min_pct(), AG_GATE_CAP_PCT);
+                follow_slow_gate(g, s_fill.gate_cmd[PH_FAST]);
                 ESP_LOGW(TAG, "safe-rate cutback rate=%.1f g/s limit=%.1f g/s -> gate %.1f%% (fast gate now %.1f%%)",
                          (double)rt->filtered_rate_gps, (double)safe_limit,
                          (double)fminf(s_fill.gate_cmd[PH_SLOW], s_fill.gate_cmd[PH_FAST]), (double)s_fill.gate_cmd[PH_FAST]);
@@ -1362,7 +1437,7 @@ static filler_state_t ag_step(filler_strategy_runtime_t *rt, filler_state_t stat
         } else {
             // reduced phase: only "way too fast" (cut now) and "it stalled"
             // move the gate
-            if (s_fill.phase == PH_SLOW && s_fill.slide_valid && s_fill.slow_cuts < 1u && s_fill.dir_lock[PH_SLOW] >= 0 &&
+            if (s_fill.phase == PH_SLOW && s_fill.slide_valid && s_fill.slow_cuts < 1u && s_fill.dir_lock[PH_SLOW] <= 0 &&
                 s_fill.slide_rate > s_fill.target_gps[PH_SLOW] * AG_SLOW_TOO_FAST) {
                 s_fill.slow_cuts++;
                 s_fill.corrections++;
@@ -1376,8 +1451,11 @@ static filler_state_t ag_step(filler_strategy_runtime_t *rt, filler_state_t stat
                 s_fill.obs_from_correction[PH_SLOW] = true;
                 command_phase_gate(rt, env, PH_SLOW, g, "slow_cut", tick->now_us);
             } else if (s_fill.phase == PH_SLOW && s_fill.seg_valid &&
-                s_fill.seg_rate < s_fill.target_gps[PH_SLOW] * AG_SLOW_STALL_FRAC &&
-                s_fill.slow_bumps < AG_SLOW_STALL_MAX && s_fill.dir_lock[PH_SLOW] <= 0) {
+                ((s_fill.seg_rate < s_fill.target_gps[PH_SLOW] * AG_SLOW_STALL_FRAC &&
+                  s_fill.slow_bumps < AG_SLOW_STALL_MAX && s_fill.dir_lock[PH_SLOW] >= 0) ||
+                 // nothing flows at all (e.g. a cut below this honey's onset):
+                 // never a state to stay in -> open again despite the lock
+                 (s_fill.seg_rate < AG_ZERO_FLOW_GPS && s_fill.seg_gate < AG_GATE_CAP_PCT - 0.5f))) {
                 s_fill.corrections++;
                 s_fill.slow_bumps++;
                 s_fill.dir_lock[PH_SLOW] = 1;
