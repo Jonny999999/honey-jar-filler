@@ -48,7 +48,7 @@
 
 #define AG_NAMESPACE "fill_agate"
 #define AG_KEY_STORE "learn_v1"
-#define AG_STORE_VERSION 1u
+#define AG_STORE_VERSION 2u   // bump to discard stored learning (v1 = hand-press test garbage)
 #define AG_ENABLE_PERSISTENT_LEARNING 1
 
 // ---- gate model / learning ------------------------------------------------
