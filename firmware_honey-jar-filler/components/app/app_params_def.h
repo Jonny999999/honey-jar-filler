@@ -6,7 +6,7 @@
 #define APP_PARAMS_DEF_H
 
 // Bump APP_PARAMS_VERSION to force defaults reload.
-#define APP_PARAMS_VERSION 16
+#define APP_PARAMS_VERSION 17
 
 #define VAR(x)     x
 #define LABEL(x)   x
@@ -23,7 +23,7 @@
     /*=== Preset-scoped recipe settings ===*/                             \
     /*=== Target + verification ===*/                                    \
     APP_PARAM_U32(VAR(target_grams), LABEL("Target"), UNIT("g"),            \
-                    DEFAULT(150), MIN(10), MAX(2000), STEP(5),               \
+                    DEFAULT(500), MIN(10), MAX(2000), STEP(5),               \
                     BRIEF("Target filled mass per jar"),                    \
                     DETAIL("Final filled weight target for each jar (actual content, not including jar)"),      \
                     GROUP("Target + verification"), APP_PARAM_SCOPE_PRESET) \
@@ -33,12 +33,12 @@
                     DETAIL("Acceptable missing grams. If under target by this many grams, reopens gate"), \
                     GROUP("Target + verification"), APP_PARAM_SCOPE_PRESET) \
     APP_PARAM_U32(VAR(target_tol_high_g), LABEL("Tol above acceptable"), UNIT("g"),         \
-                    DEFAULT(10), MIN(0), MAX(200), STEP(1),                 \
+                    DEFAULT(20), MIN(0), MAX(200), STEP(1),                 \
                     BRIEF("ok Above target, else -> fault"),                         \
                     DETAIL("If over target by this many grams, stop and fault"), \
                     GROUP("Target + verification"), APP_PARAM_SCOPE_PRESET) \
     APP_PARAM_U32(VAR(fill_timeout_ms), LABEL("Fill timeout"), UNIT("ms"),  \
-                  DEFAULT(180e3), MIN(10e3), MAX(600e3), STEP(10e3),       \
+                  DEFAULT(600e3), MIN(10e3), MAX(600e3), STEP(10e3),       \
                   BRIEF("Max time FILLING before fault"),                   \
                   DETAIL("Safety timeout to prevent endless filling. e.g. empty bucket / hardware issue"),      \
                   GROUP("Target + verification"), APP_PARAM_SCOPE_PRESET)   \
@@ -60,7 +60,7 @@
                     DETAIL("Caps full-open position to reduce max flow (e.g. small glass or water)"),      \
                     GROUP("Honey flow tuning"), APP_PARAM_SCOPE_PRESET)     \
     APP_PARAM_U32(VAR(close_remaining_g), LABEL("Close remaining g"), UNIT("g"),       \
-                    DEFAULT(150), MIN(0), MAX(500), STEP(1),                 \
+                    DEFAULT(10), MIN(0), MAX(500), STEP(1),                 \
                     BRIEF("Close before target to compensate drips"),      \
                     DETAIL("Thick honey usually needs a larger value; thin honey needs less - equals estimated in-flight mass"), \
                     GROUP("Honey flow tuning"), APP_PARAM_SCOPE_PRESET)     \
@@ -85,19 +85,19 @@
                     DETAIL("Empty jar weight window; outside range skips slot"), \
                     GROUP("Glass detection"), APP_PARAM_SCOPE_MACHINE)      \
     APP_PARAM_U32(VAR(empty_glass_max_g), LABEL("Empty glass max"), UNIT("g"),     \
-                    DEFAULT(250), MIN(0), MAX(2000), STEP(10),               \
+                    DEFAULT(300), MIN(0), MAX(2000), STEP(10),               \
                     BRIEF("Above this -> jar not empty"),                  \
                     DETAIL("Empty jar weight window; outside range skips slot"), \
                     GROUP("Glass detection"), APP_PARAM_SCOPE_MACHINE)      \
                                                                           \
     /*=== Mechanics / motion ===*/                                        \
     APP_PARAM_U32(VAR(advance_timeout_ms), LABEL("Advance timeout"), UNIT("ms"), \
-                  DEFAULT(2000), MIN(200), MAX(10000), STEP(100),          \
+                  DEFAULT(4000), MIN(200), MAX(10000), STEP(100),          \
                   BRIEF("Max time to find position switch"),              \
                   DETAIL("Motor stop timeout while searching for slot (dont spin forever, catch motor fault / sensor fault)"),  \
                   GROUP("Mechanics / motion"), APP_PARAM_SCOPE_MACHINE)     \
     APP_PARAM_U32(VAR(find_ignore_ms), LABEL("Find ignore"), UNIT("ms"),   \
-                  DEFAULT(500), MIN(0), MAX(2000), STEP(100),               \
+                  DEFAULT(1000), MIN(0), MAX(2000), STEP(100),               \
                   BRIEF("Ignore POS switch after motor start"),           \
                   DETAIL("Prevents immediate stop when switch already low"), \
                   GROUP("Mechanics / motion"), APP_PARAM_SCOPE_MACHINE)     \

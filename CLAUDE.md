@@ -321,8 +321,12 @@ tuned: +4…+11 g); fill time still rises as the bucket drains but much less
 100 %); ~1 in-fill correction per normal session. Weakest case: dark thin honey
 (onset ~24 %) sd 3 g / max 9.9 g vs 1.6 / 3.7 g for a well-tuned preset. Default 25 s is deliberately slower than the
 tuned thin baseline (33 vs 12 s open); `auto_fill_time_s=12` → ~18 s.
-`APP_PARAMS_VERSION` 15→16: first boot after flashing resets presets/machine
-params/selected strategy to built-in defaults.
+`APP_PARAMS_VERSION` now 17 (any bump resets presets/machine params/selected
+strategy to built-in defaults on first boot). Defaults = production: target
+500 g, tol −10/+20 g, timeout 600 s, `close_remaining_g` 10 (was a junk 150),
+machine values synced from the logged sessions (empty jar max 300 g, advance
+timeout 4 s, find-ignore 1 s), default strategy `adaptive-gate`. Telemetry stays
+always on (non-blocking queue, UART output is harmless without a host).
 
 **Next:** flash + hardware test of `adaptive-gate` (thin dummy first, bucket
 draining; then real honey); check telemetry `used_/next_fast|slow_gate_pct`,

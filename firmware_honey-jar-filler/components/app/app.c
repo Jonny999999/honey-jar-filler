@@ -21,7 +21,7 @@
 #define APP_STRATEGY_STORE_VERSION 1u
 #define APP_PRESET_DEFAULT_ACTIVE 1u
 #define APP_PRESET_TEST_INDEX     3u
-#define APP_FILL_STRATEGY_DEFAULT APP_FILL_STRATEGY_HEURISTIC
+#define APP_FILL_STRATEGY_DEFAULT APP_FILL_STRATEGY_ADAPTIVE_GATE
 
 typedef struct {
     uint16_t version;
@@ -175,8 +175,8 @@ static void app_apply_builtin_preset_defaults(uint8_t index, app_params_t *p)
     switch (index) {
     case 0: // High viscosity
         p->target_grams = 500;
-        p->target_tol_low_g = 20;
-        p->target_tol_high_g = 50;
+        p->target_tol_low_g = 10;
+        p->target_tol_high_g = 20;
         p->fill_timeout_ms = 600000;
         p->slow_remaining_g = 30;
         p->slow_gate_pct = 35;
@@ -187,9 +187,9 @@ static void app_apply_builtin_preset_defaults(uint8_t index, app_params_t *p)
     case 1: // Medium viscosity
         break;
     case 2: // Low viscosity
-        p->target_grams = 480;
-        p->target_tol_low_g = 20;
-        p->target_tol_high_g = 52;
+        p->target_grams = 500;
+        p->target_tol_low_g = 10;
+        p->target_tol_high_g = 20;
         p->fill_timeout_ms = 600000;
         p->slow_remaining_g = 110;
         p->slow_gate_pct = 14;
