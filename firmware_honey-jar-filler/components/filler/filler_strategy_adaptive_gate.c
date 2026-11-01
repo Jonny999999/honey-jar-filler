@@ -134,6 +134,17 @@
 // rate is ~0. Never a state to stay in -> open further regardless of the
 // correction budget / direction lock.
 #define AG_ZERO_FLOW_GPS 0.5f
+// Fully open and still nothing flows for the no-response time -> the bucket ran
+// empty (mid-fill or during a refill): stop instead of waiting for the timeout.
+// Jar weight falling well below its maximum -> the jar was taken away: stop,
+// never "refill" or open further onto the carousel.
+#define AG_JAR_LOSS_MIN_G 25.0f
+#define AG_JAR_LOSS_TARGET_FRAC 0.05f
+// A GROSS deviation may reverse an in-fill correction once per fill (flow fell
+// to a fraction of the target after a cut, or surged after an opening).
+#define AG_GROSS_SLOW_FRAC 0.33f
+#define AG_GROSS_FAST_MULT 2.5f
+#define AG_FLOOR_DECAY_PCT 0.5f         // per fill without new no-flow evidence
 #define AG_ZERO_FLOW_TARGET_FRAC 0.10f
 #define AG_SLOW_STALL_FRAC 0.4f         // reduced phase below this x target = crawling
 #define AG_SLOW_STALL_BUMP_PCT 3.0f
@@ -260,6 +271,9 @@ typedef struct {
     float close_rate_meas;             // sliding rate at the close command
     uint8_t slow_cuts;
     float floor_evidence;              // highest reduced gate this fill that (nearly) did not flow
+    uint8_t reversals;                 // gross reversals used this fill
+    float peak_rel_g;                  // highest jar weight seen (jar-removed detection)
+    int64_t stall_since_us;            // fully open with no flow since
     int8_t dir_lock[PH_COUNT];         // in-fill corrections never reverse within a fill:
                                        // -1 = already cut (no opening), +1 = already opened (no cut)
     // last valid segment per phase (learning input)
@@ -934,9 +948,13 @@ static void publish_summary_and_learn(filler_strategy_runtime_t *rt, const fille
     // Gate learning also runs on faulted fills: a steady observation is
     // physically valid regardless of how the jar ended (a timeout says "open
     // more", an overfill "open less"). Not on stale scale / no response.
-    bool gate_learn = rt->response_detected && strcmp(reason ? reason : "", "scale_stale") != 0;
+    bool gate_learn = rt->response_detected && strcmp(reason ? reason : "", "scale_stale") != 0 &&
+                      strcmp(reason ? reason : "", "jar_removed") != 0 && strcmp(reason ? reason : "", "bucket_empty") != 0;
     float ratio_f = 1.0f, ratio_s = 1.0f;
     bool ch_f = false, ch_s = false;
+    if (gate_learn && s_fill.floor_evidence <= 0.0f && e->slow_floor_pct > 0.0f) {
+        e->slow_floor_pct = fmaxf(0.0f, e->slow_floor_pct - AG_FLOOR_DECAY_PCT);   // slowly forget
+    }
     if (gate_learn && s_fill.floor_evidence > e->slow_floor_pct) {
         e->slow_floor_pct = s_fill.floor_evidence;
         ESP_LOGI(TAG, "slow floor -> %.1f%% (reduced phase crawled below it)", (double)e->slow_floor_pct);
@@ -1149,7 +1167,6 @@ static bool inrun_correct_fast(filler_strategy_runtime_t *rt, const filler_strat
         command_phase_gate(rt, env, PH_FAST, g1, "no_flow", tick->now_us);
         return true;
     }
-    if (s_fill.corrections >= AG_INRUN_MAX_CORRECTIONS) return false;
     // too fast: the sliding window (sees a step, e.g. the bucket topped up
     // mid-fill); too slow: the cumulative AND the sliding rate must agree
     bool cum_fast = s_fill.seg_valid && s_fill.seg_rate > target * AG_INRUN_TOO_FAST;
@@ -1160,20 +1177,28 @@ static bool inrun_correct_fast(filler_strategy_runtime_t *rt, const filler_strat
     float next = g;
     const char *why = NULL;
     int8_t dir = 0;
-    if ((cum_fast || slide_fast) && s_fill.dir_lock[PH_FAST] <= 0) {
+    float r_now = s_fill.slide_valid ? s_fill.slide_rate : s_fill.seg_rate;
+    bool gross_fast = r_now > target * AG_GROSS_FAST_MULT && s_fill.seg_valid && s_fill.seg_rate > target * AG_INRUN_TOO_FAST;
+    bool gross_slow = s_fill.seg_valid && s_fill.slide_valid && r_slow < target * AG_GROSS_SLOW_FRAC;
+    bool may_reverse = s_fill.reversals < 1u;
+    if ((cum_fast || slide_fast) && (s_fill.dir_lock[PH_FAST] <= 0 || (gross_fast && may_reverse))) {
+        if (s_fill.dir_lock[PH_FAST] > 0) s_fill.reversals++;
         // size by the calmer cumulative rate unless only the step detector saw it
         r = cum_fast ? s_fill.seg_rate : s_fill.slide_rate;
         next = gate_for_ratio(g, clampf_local(target / r, AG_INRUN_DOWN_RATIO_MIN, 1.0f));
         why = "too_fast";
         dir = -1;
-    } else if (s_fill.dir_lock[PH_FAST] >= 0 && (r = r_slow) * AG_INRUN_TOO_SLOW < target && g < AG_GATE_CAP_PCT - 0.5f &&
+    } else if ((s_fill.dir_lock[PH_FAST] >= 0 || (gross_slow && may_reverse)) &&
+               (r = r_slow) * AG_INRUN_TOO_SLOW < target && g < AG_GATE_CAP_PCT - 0.5f &&
                remaining_g > (float)tick->params->target_grams * AG_INRUN_UP_MIN_REMAINING_FRAC) {
+        if (s_fill.dir_lock[PH_FAST] < 0) s_fill.reversals++;
         float ratio = (r > 0.2f) ? fminf(target / r, AG_INRUN_UP_RATIO_MAX) : AG_INRUN_UP_RATIO_MAX;
         next = fminf(gate_for_ratio(g, ratio), g + AG_INRUN_UP_STEP_MAX_PCT);
         why = "too_slow";
         dir = 1;
     }
     if (!why) return false;
+    if (s_fill.corrections >= AG_INRUN_MAX_CORRECTIONS && !(gross_fast || gross_slow)) return false;
     next = clampf_local(next, gate_min_pct(), AG_GATE_CAP_PCT);
     if (fabsf(next - g) < 0.5f) return false;
     s_fill.corrections++;
@@ -1325,6 +1350,33 @@ static filler_state_t ag_step(filler_strategy_runtime_t *rt, filler_state_t stat
             ESP_LOGE(TAG, "hard safety overweight: rel=%.1f g", (double)rel_g);
             return fault_out(rt, env, tick, "safety_close", FLT_WEIGHT_RANGE, "hard_overfill");
         }
+        // jar taken away: stop at once (never open further onto the carousel)
+        if (tick->new_sample) {
+            if (rel_g > s_fill.peak_rel_g) s_fill.peak_rel_g = rel_g;
+            float loss = fmaxf(AG_JAR_LOSS_MIN_G, (float)p->target_grams * AG_JAR_LOSS_TARGET_FRAC);
+            if (rel_g < s_fill.peak_rel_g - loss) {
+                ESP_LOGE(TAG, "jar weight fell %.1f g below its maximum -> jar removed?", (double)(s_fill.peak_rel_g - rel_g));
+                return fault_out(rt, env, tick, "jar_removed", FLT_NO_JAR, "jar_removed");
+            }
+        }
+        // fully open and nothing flows (bucket ran empty mid-fill / in a refill)
+        {
+            int ph = s_fill.reduced_latched ? PH_SLOW : PH_FAST;
+            bool open_full = s_fill.phase == ph && s_fill.seg_gate >= AG_GATE_CAP_PCT - 0.5f;
+            // recent window only: the cumulative rate still carries the flow from
+            // before the bucket ran dry; the timer below is the debounce
+            bool no_flow = s_fill.slide_valid && s_fill.slide_rate < AG_ZERO_FLOW_GPS;
+            if (open_full && no_flow) {
+                if (s_fill.stall_since_us == 0) s_fill.stall_since_us = tick->now_us;
+                if ((float)(tick->now_us - s_fill.stall_since_us) / 1e6f > no_response_limit_s(rt)) {
+                    ESP_LOGE(TAG, "fully open and no flow for %.0f s -> bucket empty?",
+                             (double)((tick->now_us - s_fill.stall_since_us) / 1e6f));
+                    return fault_out(rt, env, tick, "bucket_empty", FLT_EMPTY_HONEY, "bucket_empty");
+                }
+            } else {
+                s_fill.stall_since_us = 0;
+            }
+        }
         // nothing comes out: open more (a couple of times) before giving up
         if (!rt->response_detected && rt->refill_count == 0) {
             float since_bump_s = (float)(tick->now_us - s_fill.last_bump_us) / 1e6f;
@@ -1459,7 +1511,18 @@ static filler_state_t ag_step(filler_strategy_runtime_t *rt, filler_state_t stat
                 s_fill.corrections++;
                 s_fill.slow_bumps++;
                 s_fill.dir_lock[PH_SLOW] = 1;
+                bool zero = s_fill.seg_rate < AG_ZERO_FLOW_GPS;
                 float g = s_fill.seg_gate + AG_SLOW_STALL_BUMP_PCT;
+                if (zero) {
+                    // nothing flows: halfway towards the fast gate (known to flow
+                    // in this fill); already there -> keep opening towards the
+                    // cap, so an empty bucket still ends in the empty fault
+                    float fast = s_fill.gate_cmd[PH_FAST];
+                    float gap = fast - s_fill.seg_gate;
+                    g = (gap > 10.0f) ? s_fill.seg_gate + 0.5f * gap
+                      : (gap > 1.0f)  ? fast
+                                      : s_fill.seg_gate + AG_NOFLOW_BUMP_PCT;
+                }
                 ESP_LOGW(TAG, "reduced phase stalled (%.2f g/s) -> slow gate %.1f%% -> %.1f%%",
                          (double)s_fill.seg_rate, (double)s_fill.seg_gate, (double)g);
                 s_fill.obs_from_correction[PH_SLOW] = true;
@@ -1476,6 +1539,14 @@ static filler_state_t ag_step(filler_strategy_runtime_t *rt, filler_state_t stat
     case FILLER_DRIP_WAIT:
         update_rate_estimates(rt, tick);
         track_post_close_gain(rt, tick);
+        if (tick->new_sample) {
+            float rel = tick->latest->grams - rt->run_base_weight_g;
+            if (rel > s_fill.peak_rel_g) s_fill.peak_rel_g = rel;
+            if (rel < s_fill.peak_rel_g - fmaxf(AG_JAR_LOSS_MIN_G, (float)p->target_grams * AG_JAR_LOSS_TARGET_FRAC)) {
+                ESP_LOGE(TAG, "jar weight fell below its maximum during drip wait -> jar removed?");
+                return fault_out(rt, env, tick, "jar_removed", FLT_NO_JAR, "jar_removed");
+            }
+        }
         if ((tick->now_us - tick->state_enter_us) >= ((int64_t)rt->adapted_drip_wait_ms * 1000)) {
             ESP_LOGI(TAG, "drip wait complete waited=%.0f ms post_close_gain=%.1f g",
                      (double)rt->adapted_drip_wait_ms, (double)rt->measured_post_close_gain_g);
@@ -1495,6 +1566,11 @@ static filler_state_t ag_step(filler_strategy_runtime_t *rt, filler_state_t stat
         update_rate_estimates(rt, tick);
         track_post_close_gain(rt, tick);
         float rel_g = tick->latest->grams - rt->run_base_weight_g;
+        if (tick->new_sample && rel_g < s_fill.peak_rel_g - fmaxf(AG_JAR_LOSS_MIN_G, (float)p->target_grams * AG_JAR_LOSS_TARGET_FRAC)) {
+            // never "refill" a jar that is no longer there
+            ESP_LOGE(TAG, "jar weight fell below its maximum before verify -> jar removed?");
+            return fault_out(rt, env, tick, "jar_removed", FLT_NO_JAR, "jar_removed");
+        }
         if (tick->new_sample &&
             stable_count(rel_g >= (float)p->target_grams + (float)p->target_tol_high_g, &rt->cnt_over, VERIFY_CONFIRM_SAMPLES)) {
             ESP_LOGE(TAG, "overweight: rel=%.1f g", (double)rel_g);
