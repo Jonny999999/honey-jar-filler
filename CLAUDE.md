@@ -85,6 +85,13 @@ Registered in `app.h` (`app_fill_strategy_t`), `app.c` (`k_strategy_names`),
   fill's reduced gate by the same factor (honey switch). Reduced gate learns UP
   fast (clearly too slow → no confirmation, ≤10 pts) and DOWN cautiously (cliff).
   Reduced target = 25 % of target rate, ≤ ½ of the achieved fast rate.
+  Operator-like stops: jar weight falls >25 g below its max (fill/drip/verify)
+  → close + NO_JAR (never "refill" onto the carousel); fully open with ~0 flow
+  (sliding window) for 30 s → EMPTY_HONEY (bucket ran dry mid-fill/refill; a
+  clog >30 s ends the same way by design). Zero flow in the reduced phase steps
+  halfway to the fast gate, then on to 100 %. A gross deviation (<⅓ or >2.5×
+  target) may reverse an in-fill correction once. Floor decays 0.5 %/fill.
+  Adversarial regression: `tools/sim/adversarial.py`.
   First hardware test (2026-11-01, no honey, hand presses) showed the old 30 %
   start + max 2 bumps + inverted direction lock could sit too closed — fixed.
   Persisted in NVS (`fill_agate`) as a **reference only**:
