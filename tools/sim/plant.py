@@ -135,6 +135,8 @@ class Plant:
         self.hist: list[float] = []  # apparent mass for the scale averaging window
         self.dispensed_g = 0.0       # total mass that left the bucket
         self.ext_g = 0.0             # external force on the scale (hand press), apparent grams
+        self.jar_present = True      # False: jar taken away, honey lands on the carousel
+        self.spilled_g = 0.0         # honey that did not land in a jar
 
     # ------------------------------------------------------------------
     def head_factor(self) -> float:
@@ -160,7 +162,11 @@ class Plant:
     def add_to_bucket(self, grams: float):
         self.bucket_g += grams
 
+    def remove_jar(self):
+        self.jar_present = False
+
     def swap_jar(self, tare_g: float | None = None):
+        self.jar_present = True
         self.jar_tare = tare_g if tare_g is not None else 225.0 + 10.0 * self.rng_jar.random()
         self.jar_mass = 0.0
         self.pending = 0.0
@@ -230,6 +236,9 @@ class Plant:
             rel = min(self.pool_left, m.onset_pool_g * (dt / 0.2))
             self.pool_left -= rel
             arriving += rel
+        if not self.jar_present:
+            self.spilled_g += arriving
+            arriving = 0.0
         self.pending += arriving
         if jar_flow > m.breakup_rate_gps:
             self.jar_mass += self.pending
@@ -239,7 +248,8 @@ class Plant:
                 self.jar_mass += m.drop_mass_g
                 self.pending -= m.drop_mass_g
         self.impact *= math.exp(-dt / max(m.impact_tau_s, 1e-3))
-        self.hist.append(self.jar_tare + self.jar_mass + self.impact + self.ext_g)
+        on_scale = (self.jar_tare + self.jar_mass + self.impact) if self.jar_present else 0.0
+        self.hist.append(on_scale + self.ext_g)
         n = max(1, int(round((m.scale_avg_ms / 1000.0) / dt)))
         if len(self.hist) > n:
             del self.hist[: len(self.hist) - n]

@@ -169,6 +169,10 @@ def run_session(strategy: str, medium: str | Medium, n_fills: int, bucket_g: flo
                             midfill.append(Event(ev.fill, "release_midfill", None, at_s=ev.at_s + float(dur)))
                         elif ev.kind == "release_midfill":
                             plant.ext_g = 0.0
+                        elif ev.kind == "jar_removed_midfill":
+                            plant.remove_jar()
+                        elif ev.kind == "empty_midfill":
+                            plant.bucket_g = 0.0
                         elif ev.kind == "medium_midfill":
                             plant.set_medium(make_medium(ev.value) if isinstance(ev.value, str) else ev.value)
                         midfill.remove(ev)
@@ -242,6 +246,8 @@ def run_session(strategy: str, medium: str | Medium, n_fills: int, bucket_g: flo
                 "max_gate": max_gate,
                 "bucket_start_g": bucket_start,
                 "dispensed_g": plant.dispensed_g - disp_start,
+                "spilled_g": plant.spilled_g,
+                "max_gate_after_s": None,
                 "summary": summary or {},
             }
             results.append(res)
