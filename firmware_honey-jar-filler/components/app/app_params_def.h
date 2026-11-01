@@ -6,7 +6,7 @@
 #define APP_PARAMS_DEF_H
 
 // Bump APP_PARAMS_VERSION to force defaults reload.
-#define APP_PARAMS_VERSION 15
+#define APP_PARAMS_VERSION 16
 
 #define VAR(x)     x
 #define LABEL(x)   x
@@ -69,6 +69,13 @@
                   BRIEF("Wait after closing gate for drips before verifying"),              \
                   DETAIL("Let residual honey fall into jar before verifying the weight"),              \
                   GROUP("Honey flow tuning"), APP_PARAM_SCOPE_PRESET)       \
+                                                                          \
+    /*=== Auto gate (adaptive-gate strategy only) ===*/                   \
+    APP_PARAM_U32(VAR(auto_fill_time_s), LABEL("Auto fill time"), UNIT("s"), \
+                  DEFAULT(25), MIN(5), MAX(300), STEP(1),                  \
+                  BRIEF("adaptive-gate speed: lower = faster, less exact"), \
+                  DETAIL("adaptive-gate learns the gate openings so the fast phase runs at target_grams / this many seconds. Lower = faster jars but a bit more spread. Thick honey may not reach it: the gate then simply stays fully open"), \
+                  GROUP("Auto gate"), APP_PARAM_SCOPE_PRESET)              \
                                                                           \
     /*=== Machine-scoped shared settings ===*/                             \
     /*=== Glass detection ===*/                                           \

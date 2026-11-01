@@ -157,6 +157,18 @@ typedef struct {
     float next_gain_b_gps;
     float next_onset_gate_pct;
     float next_model_tau_s;
+    // adaptive-gate: learned openings this fill started with vs next fill, the
+    // phase target rates and this fill's steady rate observations.
+    float used_fast_gate_pct;
+    float used_slow_gate_pct;
+    float next_fast_gate_pct;
+    float next_slow_gate_pct;
+    float target_fast_rate_gps;
+    float target_slow_rate_gps;
+    float obs_fast_rate_gps;
+    float obs_slow_rate_gps;
+    uint32_t gate_corrections;     // in-fill gate corrections
+    uint32_t regime_change;        // 1 = bucket refilled / honey changed detected
     char reason[24];
 } filler_strategy_fill_summary_t;
 

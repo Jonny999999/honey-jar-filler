@@ -95,6 +95,16 @@ typedef struct {
     float next_gain_b_gps;
     float next_onset_gate_pct;
     float next_model_tau_s;
+    float used_fast_gate_pct;
+    float used_slow_gate_pct;
+    float next_fast_gate_pct;
+    float next_slow_gate_pct;
+    float target_fast_rate_gps;
+    float target_slow_rate_gps;
+    float obs_fast_rate_gps;
+    float obs_slow_rate_gps;
+    uint32_t gate_corrections;
+    uint32_t regime_change;
     float fill_error_g;
     float measured_post_close_gain_g;
     float measured_near_close_gain_g;

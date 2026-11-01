@@ -68,6 +68,7 @@ static const char *k_strategy_names[APP_FILL_STRATEGY_COUNT] = {
     "manual",
     "flow-cascade",
     "sequence",
+    "adaptive-gate",
 };
 
 // Centralized defaults for runtime parameters.

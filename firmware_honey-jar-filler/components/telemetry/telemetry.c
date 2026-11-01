@@ -444,6 +444,11 @@ static void telemetry_emit_record(const telemetry_record_t *rec)
                ",\"used_onset_gate_pct\":%.3f,\"used_model_tau_s\":%.3f"
                ",\"next_gate_gain_gps_per_pct\":%.4f,\"next_gain_b_gps\":%.3f"
                ",\"next_onset_gate_pct\":%.3f,\"next_model_tau_s\":%.3f"
+               ",\"used_fast_gate_pct\":%.2f,\"used_slow_gate_pct\":%.2f"
+               ",\"next_fast_gate_pct\":%.2f,\"next_slow_gate_pct\":%.2f"
+               ",\"target_fast_rate_gps\":%.3f,\"target_slow_rate_gps\":%.3f"
+               ",\"obs_fast_rate_gps\":%.3f,\"obs_slow_rate_gps\":%.3f"
+               ",\"gate_corrections\":%" PRIu32 ",\"regime_change\":%" PRIu32
                ",\"params\":{",
                rec->ts_us,
                rec->run_id,
@@ -490,7 +495,17 @@ static void telemetry_emit_record(const telemetry_record_t *rec)
                (double)rec->next_gate_gain_gps_per_pct,
                (double)rec->next_gain_b_gps,
                (double)rec->next_onset_gate_pct,
-               (double)rec->next_model_tau_s);
+               (double)rec->next_model_tau_s,
+               (double)rec->used_fast_gate_pct,
+               (double)rec->used_slow_gate_pct,
+               (double)rec->next_fast_gate_pct,
+               (double)rec->next_slow_gate_pct,
+               (double)rec->target_fast_rate_gps,
+               (double)rec->target_slow_rate_gps,
+               (double)rec->obs_fast_rate_gps,
+               (double)rec->obs_slow_rate_gps,
+               rec->gate_corrections,
+               rec->regime_change);
         telemetry_emit_params_json(&rec->params);
         printf("}}\n");
         break;
